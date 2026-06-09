@@ -813,6 +813,172 @@ fi
 echo "==================================="
 }
 
+fix_403_ws_status(){
+refresh_screen
+D="$(cat /etc/sultan/domain 2>/dev/null || echo sl.sultanmuhamad.xyz)"
+
+echo "==================================="
+echo "      FIX 403 / 101 / 200 WS"
+echo "==================================="
+echo "Domain: $D"
+echo ""
+
+apt update -y
+apt install -y nginx python3 openssh-server psmisc
+
+systemctl stop nginx haproxy sultan-ws 2>/dev/null || true
+systemctl disable haproxy 2>/dev/null || true
+fuser -k 80/tcp 2>/dev/null || true
+fuser -k 443/tcp 2>/dev/null || true
+fuser -k 8080/tcp 2>/dev/null || true
+
+cat >/usr/local/bin/sultan-ssh-ws <<'PYWS'
+#!/usr/bin/env python3
+import asyncio, base64, hashlib
+
+async def forward(r, w):
+    try:
+        while True:
+            data = await r.read(8192)
+            if not data:
+                break
+            w.write(data)
+            await w.drain()
+    except Exception:
+        pass
+    try:
+        w.close()
+    except Exception:
+        pass
+
+async def handle(cr, cw):
+    try:
+        header = await cr.readuntil(b"\r\n\r\n")
+        text = header.decode(errors="ignore")
+        key = ""
+        for line in text.split("\r\n"):
+            if line.lower().startswith("sec-websocket-key:"):
+                key = line.split(":", 1)[1].strip()
+
+        if key:
+            accept = base64.b64encode(
+                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+            cw.write((
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode())
+        else:
+            cw.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+
+        await cw.drain()
+
+        sr, sw = await asyncio.open_connection("127.0.0.1", 22)
+        await asyncio.gather(forward(cr, sw), forward(sr, cw))
+    except Exception:
+        try:
+            cw.close()
+        except Exception:
+            pass
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", 8080)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+PYWS
+
+chmod +x /usr/local/bin/sultan-ssh-ws
+
+cat >/etc/systemd/system/sultan-ws.service <<EOF
+[Unit]
+Description=SULTAN SSH WebSocket
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/sultan-ssh-ws
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable sultan-ws
+systemctl restart sultan-ws
+
+rm -f /etc/nginx/conf.d/*.conf
+rm -f /etc/nginx/sites-enabled/default
+
+cat >/etc/nginx/conf.d/sultan-status.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $D;
+
+    location / {
+        return 200 "SULTAN 200 OK";
+        add_header Content-Type text/plain;
+    }
+
+    location /block {
+        return 403 "SULTAN 403 FORBIDDEN";
+        add_header Content-Type text/plain;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $D;
+
+    ssl_certificate /etc/letsencrypt/live/$D/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$D/privkey.pem;
+
+    location /block {
+        return 403 "SULTAN 403 FORBIDDEN";
+        add_header Content-Type text/plain;
+    }
+
+    location / {
+        if (\$http_upgrade = "") {
+            return 200 "SULTAN 200 OK";
+        }
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+}
+EOF
+
+nginx -t && systemctl enable nginx && systemctl restart nginx
+
+echo ""
+echo "===== STATUS ====="
+echo -n "Nginx: "; systemctl is-active nginx
+echo -n "WebSocket: "; systemctl is-active sultan-ws
+echo -n "SSH: "; systemctl is-active ssh || systemctl is-active sshd
+
+echo ""
+echo "===== TEST ====="
+curl -k -i https://$D/ | head -n 1
+curl -k -i https://$D/block | head -n 1
+curl -k -i https://$D/ -H "Upgrade: websocket" -H "Connection: Upgrade" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Sec-WebSocket-Version: 13" | head -n 1
+
+echo ""
+echo "===== PORTS ====="
+ss -tulpn | grep -E ':22|:80|:443|:8080'
+}
+
 setting_menu(){
 refresh_screen
 echo "==================================="
@@ -859,6 +1025,7 @@ echo "[26] Reinstall Speedtest"
 echo "[27] Remove Speedtest"
 echo ""
 echo "[28] VPS Information"
+echo "[29] Fix 403 / 101 / 200 WebSocket"
 echo ""
 echo -e "${YELLOW}[50] TROUBLESHOOTING${NC}"
 echo ""
@@ -894,6 +1061,7 @@ case "$s" in
 26) reinstall_speedtest ;;
 27) refresh_screen; apt remove -y speedtest-cli; echo "Speedtest Removed" ;;
 28) vps_info ;;
+29) fix_403_ws_status ;;
 50) troubleshooting_menu ;;
 0) main_menu ;;
 *) setting_menu ;;
@@ -1355,7 +1523,7 @@ echo "          ABOUT SULTAN"
 echo "==================================="
 echo "SULTAN VIP 👑"
 echo "Developer : SULTAN VIP 👑"
-echo "Version   : SULTAN VIP 👑 Final"
+echo "Version   : SULTAN VIP 👑 FIX403"
 echo "==================================="
 pause
 main_menu
