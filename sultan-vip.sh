@@ -270,6 +270,21 @@ reinstall_speedtest(){
     echo -e "Speedtest CLI : ${GREEN}[ INSTALLED ]${NC}"
 }
 
+fix_xray_service_root(){
+    echo "[FIX] Xray SSL permission: set service user/group to root..."
+    systemctl stop xray 2>/dev/null || true
+
+    if [ -f /etc/systemd/system/xray.service ]; then
+        sed -i 's/^User=.*/User=root/' /etc/systemd/system/xray.service
+        sed -i 's/^Group=.*/Group=root/' /etc/systemd/system/xray.service
+
+        grep -q '^User=' /etc/systemd/system/xray.service || sed -i '/^\[Service\]/a User=root' /etc/systemd/system/xray.service
+        grep -q '^Group=' /etc/systemd/system/xray.service || sed -i '/^\[Service\]/a Group=root' /etc/systemd/system/xray.service
+    fi
+
+    systemctl daemon-reload
+}
+
 main_menu(){
 refresh_screen
 DOMAIN="$(get_domain)"
@@ -556,10 +571,16 @@ refresh_screen
 echo "==================================="
 echo "        INSTALL / REINSTALL XRAY"
 echo "==================================="
+
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+fix_xray_service_root
+
 mkdir -p "$XDB"
 systemctl enable xray
 systemctl restart xray
+
+systemctl status xray --no-pager -n 20
 verify_service xray
 }
 
@@ -576,7 +597,9 @@ cat >/usr/local/etc/xray/config.json <<EOF
 {"log":{"loglevel":"warning"},"inbounds":[{"tag":"vless-xhttp","listen":"0.0.0.0","port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/xhttp"},"tlsSettings":{"serverName":"$DOMAIN","certificates":[{"certificateFile":"/etc/letsencrypt/live/$DOMAIN/fullchain.pem","keyFile":"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}]}}},{"tag":"vmess-ws","listen":"127.0.0.1","port":10085,"protocol":"vmess","settings":{"clients":[]},"streamSettings":{"network":"ws","wsSettings":{"path":"/vmess"}}},{"tag":"trojan-ws","listen":"127.0.0.1","port":10086,"protocol":"trojan","settings":{"clients":[]},"streamSettings":{"network":"ws","wsSettings":{"path":"/trojan"}}}],"outbounds":[{"protocol":"freedom"}]}
 EOF
 
+fix_xray_service_root
 systemctl restart xray 2>/dev/null || true
+systemctl status xray --no-pager -n 20
 verify_service xray
 }
 
@@ -595,7 +618,7 @@ read -p "Select: " x
 case "$x" in
 1) install_xray ;;
 2) create_xray_config ;;
-3) refresh_screen; systemctl restart xray; verify_service xray ;;
+3) refresh_screen; fix_xray_service_root; systemctl restart xray; systemctl status xray --no-pager -n 20; verify_service xray ;;
 4) refresh_screen; systemctl status xray --no-pager ;;
 0) main_menu ;;
 *) xray_menu ;;
@@ -864,7 +887,7 @@ case "$s" in
 19) restart_ssh_safe ;;
 20) refresh_screen; systemctl restart nginx; verify_service nginx ;;
 21) refresh_screen; systemctl restart haproxy; verify_service haproxy ;;
-22) refresh_screen; systemctl restart xray; verify_service xray ;;
+22) refresh_screen; fix_xray_service_root; systemctl restart xray; systemctl status xray --no-pager -n 20; verify_service xray ;;
 23) restart_all_services ;;
 24) change_domain ;;
 25) renew_ssl ;;
@@ -991,6 +1014,7 @@ refresh_screen
 echo "==================================="
 echo "        RESTART ALL SERVICES"
 echo "==================================="
+fix_xray_service_root
 systemctl restart ssh nginx haproxy sultan-ws udp-custom xray fail2ban 2>/dev/null || true
 verify_service ssh
 verify_service nginx
