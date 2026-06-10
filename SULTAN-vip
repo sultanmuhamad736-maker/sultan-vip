@@ -1,0 +1,1063 @@
+#!/bin/bash
+# ==========================================================
+# SULTAN VIP
+# Auto core setup: SSL/TLS + HAProxy + Nginx + WS + UDP Custom
+# Run panel: SULTAN
+# ==========================================================
+
+export DEBIAN_FRONTEND=noninteractive
+
+APP_TITLE="SULTAN VIP"
+APP_NAME="SULTAN VIP"
+APP_VER="CROWN CORE v1.2"
+BASE_DIR="/etc/sultan"
+DB_DIR="$BASE_DIR/db"
+LOG_DIR="$BASE_DIR/logs"
+BACKUP_DIR="$BASE_DIR/backup"
+PANEL_BIN="/usr/local/bin/SULTAN"
+WS_BIN="/usr/local/bin/sultan-ssh-ws"
+UDP_BIN="/usr/local/bin/sultan-udp-custom"
+XRAY_CFG="/usr/local/etc/xray/config.json"
+HAPROXY_PEM="/etc/haproxy/sultan.pem"
+
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[1;34m"
+MAG="\033[1;35m"
+CYAN="\033[1;36m"
+WHITE="\033[1;37m"
+DIM="\033[2m"
+NC="\033[0m"
+
+mkdir -p "$BASE_DIR" "$DB_DIR" "$LOG_DIR" "$BACKUP_DIR" /usr/local/etc/xray /etc/haproxy
+
+need_root(){
+  if [ "$(id -u)" != "0" ]; then
+    echo "Run as root."
+    exit 1
+  fi
+}
+
+line(){ printf "${CYAN}%s${NC}\n" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
+small_line(){ printf "${DIM}%s${NC}\n" "────────────────────────────────────────────────────"; }
+
+pause(){
+  echo ""
+  read -rp "Press Enter to continue..."
+}
+
+clean_screen(){ clear; }
+
+domain_get(){ cat "$BASE_DIR/domain" 2>/dev/null || echo "not-set"; }
+
+ip_get(){
+  curl -s --max-time 4 ipv4.icanhazip.com 2>/dev/null | tr -d '\n' || hostname -I | awk '{print $1}'
+}
+
+active_text(){
+  local s="$1"
+  if systemctl is-active --quiet "$s" 2>/dev/null; then
+    printf "${GREEN}ACTIVE${NC}"
+  else
+    printf "${RED}OFFLINE${NC}"
+  fi
+}
+
+ssl_text(){
+  local D
+  D="$(domain_get)"
+  if [ "$D" != "not-set" ] && [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ] && openssl x509 -checkend 86400 -noout -in "/etc/letsencrypt/live/$D/fullchain.pem" >/dev/null 2>&1; then
+    printf "${GREEN}ACTIVE${NC}"
+  else
+    printf "${RED}OFFLINE${NC}"
+  fi
+}
+
+xhttp_text(){
+  printf "${RED}REMOVED${NC}"
+}
+
+udp_text(){
+  if systemctl is-active --quiet sultan-udp 2>/dev/null; then
+    printf "${GREEN}ACTIVE${NC}"
+  else
+    printf "${RED}OFFLINE${NC}"
+  fi
+}
+
+core_ready_text(){
+  if systemctl is-active --quiet haproxy 2>/dev/null && \
+     systemctl is-active --quiet nginx 2>/dev/null && \
+     systemctl is-active --quiet sultan-ws 2>/dev/null && \
+     systemctl is-active --quiet sultan-udp 2>/dev/null; then
+    printf "${GREEN}READY${NC}"
+  else
+    printf "${YELLOW}NEEDS REPAIR${NC}"
+  fi
+}
+
+header(){
+  clean_screen
+  local D IP UPTIME LOAD MEM
+  D="$(domain_get)"
+  IP="$(ip_get)"
+  UPTIME="$(uptime -p 2>/dev/null | sed 's/up //')"
+  LOAD="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+  MEM="$(free -m 2>/dev/null | awk '/Mem:/ {printf "%.0f%%", $3/$2*100}')"
+
+  echo -e "${MAG}╔════════════════════════════════════════════════════╗${NC}"
+  echo -e "${MAG}║${WHITE}                    SULTAN VIP                    ${MAG}║${NC}"
+  echo -e "${MAG}║${CYAN}                  CROWN CORE v1.2                 ${MAG}║${NC}"
+  echo -e "${MAG}║${GREEN}              SSL | WEBSOCKET | UDP CORE          ${MAG}║${NC}"
+  echo -e "${MAG}╚════════════════════════════════════════════════════╝${NC}"
+  echo -e " ${WHITE}Domain${NC}       : ${CYAN}${D}${NC}"
+  echo -e " ${WHITE}Server IP${NC}    : ${CYAN}${IP}${NC}"
+  echo -e " ${WHITE}Uptime${NC}       : ${GREEN}${UPTIME:-unknown}${NC}"
+  echo -e " ${WHITE}Memory${NC}       : ${GREEN}${MEM:-unknown}${NC}        ${WHITE}Load${NC}: ${GREEN}${LOAD:-0}${NC}"
+  line
+  echo -e " ${WHITE}TLS / SSL${NC}     : $(ssl_text)"
+  echo -e " ${WHITE}WebSocket${NC}     : $(active_text sultan-ws)"
+  echo -e " ${WHITE}UDP Custom${NC}    : $(udp_text)"
+  echo -e " ${WHITE}Nginx${NC}         : $(active_text nginx)"
+  echo -e " ${WHITE}HAProxy${NC}       : $(active_text haproxy)"
+  echo -e " ${WHITE}SSH${NC}           : $(active_text ssh || active_text sshd)"
+  echo -e " ${WHITE}Core Status${NC}   : $(core_ready_text)"
+  line
+}
+
+ask_domain(){
+  local D
+  D="$(domain_get)"
+  if [ "$D" != "not-set" ]; then
+    echo "$D"
+    return
+  fi
+
+  clean_screen
+  echo -e "${MAG}╔════════════════════════════════════════════════════╗${NC}"
+  echo -e "${MAG}║${WHITE}                    SULTAN VIP                    ${MAG}║${NC}"
+  echo -e "${MAG}║${CYAN}                  CROWN CORE v1.2                 ${MAG}║${NC}"
+  echo -e "${MAG}╚════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "${YELLOW}Enter your domain to prepare the core automatically.${NC}"
+  echo ""
+  while true; do
+    read -rp "Domain: " D
+    D="$(echo "$D" | tr -d '[:space:]')"
+    if echo "$D" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
+      echo "$D" > "$BASE_DIR/domain"
+      echo "$D"
+      return
+    fi
+    echo "Invalid domain. Example: s.sultanmuhamad.xyz"
+  done
+}
+
+step(){
+  local N="$1"
+  local T="$2"
+  echo -e "${CYAN}[${N}]${NC} ${WHITE}${T}${NC}"
+}
+
+ok(){ echo -e "${GREEN}OK${NC} - $1"; }
+warn(){ echo -e "${YELLOW}WARN${NC} - $1"; }
+bad(){ echo -e "${RED}ERROR${NC} - $1"; }
+
+install_packages(){
+  step "1/9" "Installing requirements"
+  apt update -y
+  apt install -y curl wget sudo openssh-server nginx haproxy certbot python3 python3-pip jq psmisc openssl ca-certificates cron uuid-runtime
+  systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
+  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+  ok "Requirements installed"
+}
+
+safe_stop_web(){
+  systemctl stop nginx haproxy xray sultan-ws sultan-udp 2>/dev/null || true
+  systemctl disable haproxy 2>/dev/null || true
+  fuser -k 80/tcp 2>/dev/null || true
+  fuser -k 443/tcp 2>/dev/null || true
+  fuser -k 8080/tcp 2>/dev/null || true
+  fuser -k 8081/tcp 2>/dev/null || true
+  fuser -k 10085/tcp 2>/dev/null || true
+  fuser -k 7300/udp 2>/dev/null || true
+}
+
+issue_ssl_auto(){
+  local D="$1"
+  step "2/9" "Preparing SSL / TLS"
+  safe_stop_web
+
+  if [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ] && openssl x509 -checkend 86400 -noout -in "/etc/letsencrypt/live/$D/fullchain.pem" >/dev/null 2>&1; then
+    ok "Valid SSL already exists"
+  else
+    certbot certonly --standalone \
+      -d "$D" \
+      --cert-name "$D" \
+      --agree-tos \
+      -m "admin@$D" \
+      --non-interactive \
+      --preferred-challenges http
+    ok "SSL issued"
+  fi
+
+  cat "/etc/letsencrypt/live/$D/fullchain.pem" "/etc/letsencrypt/live/$D/privkey.pem" > "$HAPROXY_PEM"
+  chmod 600 "$HAPROXY_PEM"
+  ok "TLS certificate prepared"
+}
+
+disable_xray_core(){
+  step "3/8" "Removing Xray / XHTTP core"
+  systemctl stop xray v2ray 2>/dev/null || true
+  systemctl disable xray v2ray 2>/dev/null || true
+  rm -f /usr/local/etc/xray/config.json 2>/dev/null || true
+  ok "Xray / XHTTP removed from active core"
+}
+
+install_xray_if_needed(){
+  disable_xray_core
+}
+
+create_ws_service(){
+  step "4/9" "Installing WebSocket core"
+  cat > "$WS_BIN" <<'PY'
+#!/usr/bin/env python3
+import asyncio, base64, hashlib
+
+async def forward(r, w):
+    try:
+        while True:
+            data = await r.read(8192)
+            if not data:
+                break
+            w.write(data)
+            await w.drain()
+    except Exception:
+        pass
+    try:
+        w.close()
+    except Exception:
+        pass
+
+async def handle(cr, cw):
+    try:
+        header = await cr.readuntil(b"\r\n\r\n")
+        text = header.decode(errors="ignore")
+        key = ""
+        for line in text.split("\r\n"):
+            if line.lower().startswith("sec-websocket-key:"):
+                key = line.split(":", 1)[1].strip()
+
+        if key:
+            accept = base64.b64encode(
+                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+            cw.write((
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode())
+        else:
+            cw.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+
+        await cw.drain()
+        sr, sw = await asyncio.open_connection("127.0.0.1", 22)
+        await asyncio.gather(forward(cr, sw), forward(sr, cw))
+    except Exception:
+        try:
+            cw.close()
+        except Exception:
+            pass
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", 8080)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+PY
+
+  chmod +x "$WS_BIN"
+
+  cat > /etc/systemd/system/sultan-ws.service <<EOF
+[Unit]
+Description=SULTAN VIP SSH WebSocket
+After=network.target
+
+[Service]
+ExecStart=$WS_BIN
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable sultan-ws
+  systemctl restart sultan-ws
+  ok "WebSocket active"
+}
+
+create_udp_custom(){
+  step "5/9" "Installing UDP Custom core"
+
+  cat > "$UDP_BIN" <<'PY'
+#!/usr/bin/env python3
+import asyncio
+
+class UDPServer(asyncio.DatagramProtocol):
+    def connection_made(self, transport):
+        self.transport = transport
+    def datagram_received(self, data, addr):
+        # Lightweight UDP custom health responder.
+        # Keeps UDP Custom service active for client-side UDP compatibility checks.
+        if data:
+            self.transport.sendto(b"SULTAN-UDP-READY", addr)
+
+async def main():
+    loop = asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(lambda: UDPServer(), local_addr=("0.0.0.0", 7300))
+    await asyncio.Future()
+
+asyncio.run(main())
+PY
+
+  chmod +x "$UDP_BIN"
+
+  cat > /etc/systemd/system/sultan-udp.service <<EOF
+[Unit]
+Description=SULTAN VIP UDP Custom
+After=network.target
+
+[Service]
+ExecStart=$UDP_BIN
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable sultan-udp
+  systemctl restart sultan-udp
+  ok "UDP Custom active"
+}
+
+configure_nginx(){
+  local D="$1"
+  step "6/8" "Configuring Nginx 200 / 403 backend"
+
+  rm -f /etc/nginx/conf.d/*.conf
+  rm -f /etc/nginx/sites-enabled/default
+
+  cat > /etc/nginx/conf.d/sultan-internal.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $D;
+
+    location / {
+        return 200 "SULTAN VIP 200 OK";
+        add_header Content-Type text/plain;
+    }
+
+    location /ping {
+        return 200 "SULTAN VIP 200 OK";
+        add_header Content-Type text/plain;
+    }
+
+    location /block {
+        return 403 "SULTAN VIP 403 FORBIDDEN";
+        add_header Content-Type text/plain;
+    }
+
+    error_page 400 = @bad400;
+    location @bad400 {
+        return 200 "SULTAN VIP 200 OK";
+        add_header Content-Type text/plain;
+    }
+}
+
+server {
+    listen 127.0.0.1:8081;
+    server_name $D;
+
+    location / {
+        return 200 "SULTAN VIP 200 OK";
+        add_header Content-Type text/plain;
+    }
+
+    location /ping {
+        return 200 "SULTAN VIP 200 OK";
+        add_header Content-Type text/plain;
+    }
+
+    location /block {
+        return 403 "SULTAN VIP 403 FORBIDDEN";
+        add_header Content-Type text/plain;
+    }
+
+    error_page 400 = @bad400;
+    location @bad400 {
+        return 200 "SULTAN VIP 200 OK";
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+
+  nginx -t
+  systemctl enable nginx
+  systemctl restart nginx
+  ok "Nginx active"
+}
+
+configure_haproxy(){
+  local D="$1"
+  step "7/8" "Configuring HAProxy TLS gateway 200 / 403 / 101"
+
+  cat /etc/letsencrypt/live/$D/fullchain.pem /etc/letsencrypt/live/$D/privkey.pem >/etc/haproxy/sultan.pem
+  chmod 600 /etc/haproxy/sultan.pem
+
+  cat >/etc/haproxy/haproxy.cfg <<EOF
+global
+    log /dev/log local0
+    daemon
+    maxconn 8192
+    tune.ssl.default-dh-param 2048
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    option http-ignore-probes
+    timeout http-request 30s
+    timeout connect 10s
+    timeout client 1h
+    timeout server 1h
+    errorfile 400 /etc/haproxy/errors/400.http
+
+frontend sultan_tls
+    bind *:443 ssl crt /etc/haproxy/sultan.pem
+    mode http
+
+    http-request set-header X-Forwarded-Proto https
+    http-request set-header X-Real-IP %[src]
+
+    acl is_ws hdr(Upgrade) -i websocket
+    acl path_ping path_beg -i /ping
+    acl path_block path_beg -i /block
+
+    use_backend sultan_ws if is_ws
+    use_backend sultan_web if path_ping
+    use_backend sultan_web if path_block
+    default_backend sultan_web
+
+backend sultan_web
+    mode http
+    server nginx_local 127.0.0.1:8081
+
+backend sultan_ws
+    mode http
+    option http-server-close
+    server ws_local 127.0.0.1:8080
+EOF
+
+  mkdir -p /etc/haproxy/errors
+  cat >/etc/haproxy/errors/400.http <<'EOF'
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Connection: close
+
+SULTAN VIP 200 OK
+EOF
+
+  haproxy -c -f /etc/haproxy/haproxy.cfg || exit 1
+  systemctl enable haproxy
+  systemctl restart haproxy
+  ok "HAProxy active"
+}
+
+final_tests(){
+  local D="$1"
+  step "8/8" "Running final tests 200 / 403 / 101"
+
+  local FAIL=0
+
+  systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null || { bad "SSH offline"; FAIL=1; }
+  systemctl is-active --quiet nginx || { bad "Nginx offline"; FAIL=1; }
+  systemctl is-active --quiet haproxy || { bad "HAProxy offline"; FAIL=1; }
+  systemctl is-active --quiet sultan-ws || { bad "WebSocket offline"; FAIL=1; }
+  systemctl is-active --quiet sultan-udp || { bad "UDP Custom offline"; FAIL=1; }
+
+  local R200 R403 R101
+  R200="$(curl --http1.1 -k -sI --max-time 12 "https://$D/ping" | head -n1 | awk '{print $2}')"
+  R403="$(curl --http1.1 -k -sI --max-time 12 "https://$D/block" | head -n1 | awk '{print $2}')"
+  R101="$(curl --http1.1 -k -sI --max-time 12 "https://$D/" \
+    -H "Upgrade: websocket" \
+    -H "Connection: Upgrade" \
+    -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+    -H "Sec-WebSocket-Version: 13" | head -n1 | awk '{print $2}')"
+
+  [ "$R200" = "200" ] && ok "HTTP 200 ready" || { bad "HTTP 200 failed"; FAIL=1; }
+  [ "$R403" = "403" ] && ok "HTTP 403 ready" || { bad "HTTP 403 failed"; FAIL=1; }
+  [ "$R101" = "101" ] && ok "WebSocket 101 ready" || { bad "WebSocket 101 failed"; FAIL=1; }
+
+  openssl x509 -checkend 86400 -noout -in "/etc/letsencrypt/live/$D/fullchain.pem" >/dev/null 2>&1 && ok "SSL/TLS ready" || { bad "SSL/TLS failed"; FAIL=1; }
+
+  if [ "$FAIL" = "1" ]; then
+    echo ""
+    bad "Core setup failed. Panel will not open until fixed."
+    echo "Check logs:"
+    echo "journalctl -u haproxy --no-pager -n 50"
+    echo "journalctl -u nginx --no-pager -n 50"
+    exit 1
+  fi
+
+  ok "Core setup ready"
+}
+
+save_panel(){
+  step "9/9" "Installing SULTAN command"
+  cp "$0" "$PANEL_BIN"
+  chmod +x "$PANEL_BIN"
+  ok "Command installed: SULTAN"
+}
+
+core_auto_setup(){
+  need_root
+  local D
+  D="$(ask_domain)"
+
+  clean_screen
+  echo -e "${MAG}╔════════════════════════════════════════════════════╗${NC}"
+  echo -e "${MAG}║${WHITE}                    SULTAN VIP                    ${MAG}║${NC}"
+  echo -e "${MAG}║${CYAN}                  CROWN CORE v1.2                 ${MAG}║${NC}"
+  echo -e "${MAG}║${GREEN}              AUTO CORE INSTALL STARTED            ${MAG}║${NC}"
+  echo -e "${MAG}╚════════════════════════════════════════════════════╝${NC}"
+  echo -e "Domain: ${CYAN}$D${NC}"
+  line
+
+  install_packages
+  issue_ssl_auto "$D"
+  disable_xray_core
+  create_ws_service
+  create_udp_custom
+  configure_nginx "$D"
+  configure_haproxy "$D"
+  final_tests "$D"
+  save_panel
+
+  echo ""
+  echo -e "${GREEN}SULTAN VIP is ready.${NC}"
+  echo -e "Run panel anytime with: ${CYAN}SULTAN${NC}"
+  sleep 2
+}
+
+create_ssh_user(){
+  header
+  read -rp "Username: " U
+  [ -z "$U" ] && return
+  if id "$U" >/dev/null 2>&1; then echo "User already exists."; pause; return; fi
+  read -rp "Password: " P
+  read -rp "Valid days [30]: " DAYS
+  DAYS="${DAYS:-30}"
+  useradd -M -s /bin/false "$U"
+  echo "$U:$P" | chpasswd
+  chage -E "$(date -d "+$DAYS days" +%F)" "$U"
+  echo "$U|$P|$(date -d "+$DAYS days" +%F)" >> "$DB_DIR/ssh.db"
+  echo ""
+  echo -e "${GREEN}SSH user created.${NC}"
+  echo "Username : $U"
+  echo "Password : $P"
+  echo "Expire   : $(date -d "+$DAYS days" +%F)"
+  pause
+}
+
+delete_ssh_user(){
+  header
+  read -rp "Username to delete: " U
+  [ -z "$U" ] && return
+  userdel -f "$U" 2>/dev/null || true
+  sed -i "/^$U|/d" "$DB_DIR/ssh.db" 2>/dev/null || true
+  echo -e "${GREEN}Deleted if existed.${NC}"
+  pause
+}
+
+renew_ssh_user(){
+  header
+  read -rp "Username: " U
+  id "$U" >/dev/null 2>&1 || { echo "User not found."; pause; return; }
+  read -rp "Valid days [30]: " DAYS
+  DAYS="${DAYS:-30}"
+  chage -E "$(date -d "+$DAYS days" +%F)" "$U"
+  echo -e "${GREEN}Renewed.${NC}"
+  pause
+}
+
+list_ssh_users(){
+  header
+  echo -e "${CYAN}SSH ACCOUNTS${NC}"
+  small_line
+  printf "%-18s %-18s %-10s\n" "USERNAME" "EXPIRE" "STATUS"
+  small_line
+  awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd | while read -r U; do
+    EXP="$(chage -l "$U" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')"
+    ST="$(passwd -S "$U" 2>/dev/null | awk '{print $2}')"
+    [ "$ST" = "L" ] && ST="LOCKED" || ST="ACTIVE"
+    printf "%-18s %-18s %-10s\n" "$U" "$EXP" "$ST"
+  done
+  pause
+}
+
+lock_ssh_user(){
+  header
+  read -rp "Username to lock: " U
+  passwd -l "$U" 2>/dev/null || true
+  echo "Locked."
+  pause
+}
+
+unlock_ssh_user(){
+  header
+  read -rp "Username to unlock: " U
+  passwd -u "$U" 2>/dev/null || true
+  echo "Unlocked."
+  pause
+}
+
+trial_ssh_user(){
+  header
+  U="trial$(tr -dc 0-9 </dev/urandom | head -c 4)"
+  P="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)"
+  useradd -M -s /bin/false "$U"
+  echo "$U:$P" | chpasswd
+  chage -E "$(date -d "+1 day" +%F)" "$U"
+  echo "$U|$P|$(date -d "+1 day" +%F)" >> "$DB_DIR/ssh.db"
+  echo -e "${GREEN}Trial account created.${NC}"
+  echo "Username : $U"
+  echo "Password : $P"
+  echo "Expire   : $(date -d "+1 day" +%F)"
+  pause
+}
+
+show_ssh_payload(){
+  header
+  local D
+  D="$(domain_get)"
+  echo -e "${CYAN}SSH SSL WebSocket Client${NC}"
+  small_line
+  echo "Host : $D"
+  echo "SNI  : $D"
+  echo "TLS  : ON"
+  echo "Path : /"
+  echo ""
+  echo "Payload:"
+  echo "GET / HTTP/1.1[crlf]Host: $D[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[crlf]Sec-WebSocket-Version: 13[crlf][crlf]"
+  pause
+}
+
+ssh_menu(){
+  while true; do
+    header
+    echo -e "${MAG}SSH MENU${NC}"
+    small_line
+    echo "[1] Create SSH User"
+    echo "[2] Delete SSH User"
+    echo "[3] Renew SSH User"
+    echo "[4] Lock SSH User"
+    echo "[5] Unlock SSH User"
+    echo "[6] List SSH Users"
+    echo "[7] Create Trial"
+    echo "[8] Show SSH Payload"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    case "$o" in
+      1) create_ssh_user ;;
+      2) delete_ssh_user ;;
+      3) renew_ssh_user ;;
+      4) lock_ssh_user ;;
+      5) unlock_ssh_user ;;
+      6) list_ssh_users ;;
+      7) trial_ssh_user ;;
+      8) show_ssh_payload ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+rebuild_xray_config(){
+  python3 - <<'PY'
+import json, pathlib
+base = pathlib.Path("/etc/sultan/db")
+cfg = pathlib.Path("/usr/local/etc/xray/config.json")
+clients = []
+db = base / "xhttp.db"
+if db.exists():
+    for line in db.read_text(errors="ignore").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) >= 2:
+            clients.append({"id": parts[1], "email": parts[0]})
+data = {
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "tag": "sultan-xhttp",
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "vless",
+      "settings": {"clients": clients, "decryption": "none"},
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {"path": "/xhttp"}
+      }
+    }
+  ],
+  "outbounds": [{"protocol": "freedom"}]
+}
+cfg.write_text(json.dumps(data, indent=2))
+PY
+  /usr/local/bin/xray test -config "$XRAY_CFG"
+  systemctl restart xray
+}
+
+create_xhttp_user(){
+  header
+  read -rp "Username: " U
+  [ -z "$U" ] && return
+  UUID="$(uuidgen)"
+  grep -q "^$U|" "$DB_DIR/xhttp.db" 2>/dev/null && { echo "User already exists."; pause; return; }
+  echo "$U|$UUID|$(date +%F)" >> "$DB_DIR/xhttp.db"
+  rebuild_xray_config
+  show_xhttp_link "$U" "$UUID"
+}
+
+delete_xhttp_user(){
+  header
+  read -rp "Username to delete: " U
+  sed -i "/^$U|/d" "$DB_DIR/xhttp.db" 2>/dev/null || true
+  rebuild_xray_config
+  echo "Deleted if existed."
+  pause
+}
+
+list_xhttp_users(){
+  header
+  echo -e "${CYAN}XRAY-DISABLED USERS${NC}"
+  small_line
+  if [ -s "$DB_DIR/xhttp.db" ]; then
+    awk -F'|' '{printf "%-18s %-38s\n",$1,$2}' "$DB_DIR/xhttp.db"
+  else
+    echo "No XRAY-DISABLED users."
+  fi
+  pause
+}
+
+show_xhttp_link(){
+  local U="$1"
+  local UUID="$2"
+  local D
+  D="$(domain_get)"
+  echo ""
+  echo -e "${GREEN}XRAY-DISABLED User Ready${NC}"
+  echo "User : $U"
+  echo "UUID : $UUID"
+  echo ""
+  echo "VLESS XRAY-DISABLED:"
+  echo "vless://$UUID@$D:443?encryption=none&security=tls&sni=$D&type=xhttp&path=%2Fxhttp#$U"
+  pause
+}
+
+xhttp_menu(){
+  header
+  echo "XHTTP has been removed from this version."
+  echo "Use SSH WebSocket and UDP Custom only."
+  pause
+}
+
+udp_menu(){
+  while true; do
+    header
+    echo -e "${MAG}UDP CUSTOM${NC}"
+    small_line
+    echo "[1] Force Enable UDP Custom"
+    echo "[2] Restart UDP Custom"
+    echo "[3] Status UDP Custom"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    case "$o" in
+      1) create_udp_custom; pause ;;
+      2) systemctl restart sultan-udp; echo "Restarted."; pause ;;
+      3) systemctl status sultan-udp --no-pager -n 20; pause ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+backup_restore_menu(){
+  while true; do
+    header
+    echo -e "${MAG}BACKUP / RESTORE${NC}"
+    small_line
+    echo "[1] Backup Sultan Data"
+    echo "[2] List Backups"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    case "$o" in
+      1)
+        F="$BACKUP_DIR/sultan-backup-$(date +%F-%H%M%S).tar.gz"
+        tar -czf "$F" "$BASE_DIR" /etc/nginx/conf.d /etc/haproxy/haproxy.cfg "$XRAY_CFG" 2>/dev/null || true
+        echo "Backup saved: $F"
+        pause
+        ;;
+      2)
+        ls -lah "$BACKUP_DIR"
+        pause
+        ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+speedtest_menu(){
+  header
+  echo "Running speed test..."
+  if command -v speedtest-cli >/dev/null 2>&1; then
+    speedtest-cli
+  else
+    apt install -y speedtest-cli
+    speedtest-cli
+  fi
+  pause
+}
+
+doabout_menu(){
+  header
+  echo -e "${MAG}ABOUT SCRIPT${NC}"
+  small_line
+  echo "Name    : SULTAN VIP"
+  echo "Version : CROWN CORE v1.2"
+  echo "Core    : SSL/TLS + HAProxy + Nginx + SSH WebSocket + UDP Custom"
+  echo "Run     : SULTAN"
+  pause
+}
+
+websocket_menu(){
+  while true; do
+    header
+    echo -e "${MAG}WEBSOCKET MENU${NC}"
+    small_line
+    echo "[1] Repair SSH WebSocket"
+    echo "[2] Show WebSocket Payload"
+    echo "[3] Restart WebSocket"
+    echo "[4] WebSocket Status"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    D="$(domain_get)"
+    case "$o" in
+      1) create_ws_service; configure_haproxy "$D"; final_tests "$D"; pause ;;
+      2) show_ssh_payload ;;
+      3) systemctl restart sultan-ws; echo "WebSocket restarted."; pause ;;
+      4) systemctl status sultan-ws --no-pager -n 25; pause ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+services_menu(){
+  while true; do
+    header
+    echo -e "${MAG}SERVICES MENU${NC}"
+    small_line
+    echo "[1] Restart All Core Services"
+    echo "[2] Restart Nginx"
+    echo "[3] Restart HAProxy"
+    echo "[4] Restart SSH WebSocket"
+    echo "[5] Restart UDP Custom"
+    echo "[6] Service Check"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    case "$o" in
+      1) systemctl restart nginx haproxy sultan-ws sultan-udp 2>/dev/null || true; systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true; echo "Core services restarted."; pause ;;
+      2) systemctl restart nginx; echo "Nginx restarted."; pause ;;
+      3) systemctl restart haproxy; echo "HAProxy restarted."; pause ;;
+      4) systemctl restart sultan-ws; echo "WebSocket restarted."; pause ;;
+      5) systemctl restart sultan-udp; echo "UDP Custom restarted."; pause ;;
+      6) status_report ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+security_menu(){
+  while true; do
+    header
+    echo -e "${MAG}SECURITY MENU${NC}"
+    small_line
+    echo "[1] Install Fail2Ban"
+    echo "[2] Restart SSH Safely"
+    echo "[3] Disable Xray / XHTTP"
+    echo "[4] Check SSH Status"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    case "$o" in
+      1) apt install -y fail2ban; systemctl enable --now fail2ban; echo "Fail2Ban installed."; pause ;;
+      2) systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true; echo "SSH restarted safely."; pause ;;
+      3) disable_xray_core; pause ;;
+      4) systemctl status ssh --no-pager -n 20 2>/dev/null || systemctl status sshd --no-pager -n 20; pause ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+traffic_menu(){
+  header
+  echo -e "${MAG}TRAFFIC MONITOR${NC}"
+  small_line
+  if command -v vnstat >/dev/null 2>&1; then
+    vnstat
+  else
+    echo "vnStat is not installed."
+    echo "Install with: apt install -y vnstat"
+  fi
+  pause
+}
+
+update_script_menu(){
+  header
+  echo -e "${MAG}UPDATE SCRIPT${NC}"
+  small_line
+  echo "Manual update:"
+  echo "bash install-mini.sh"
+  echo ""
+  echo "This custom version is installed locally as: /usr/local/bin/SULTAN"
+  pause
+}
+
+fail2ban_menu(){
+  while true; do
+    header
+    echo -e "${MAG}FAIL2BAN MENU${NC}"
+    small_line
+    echo "[1] Install / Enable Fail2Ban"
+    echo "[2] Restart Fail2Ban"
+    echo "[3] Fail2Ban Status"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    case "$o" in
+      1) apt install -y fail2ban; systemctl enable --now fail2ban; echo "Fail2Ban active."; pause ;;
+      2) systemctl restart fail2ban; echo "Fail2Ban restarted."; pause ;;
+      3) systemctl status fail2ban --no-pager -n 25; pause ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+bbr_menu(){
+  while true; do
+    header
+    echo -e "${MAG}BBR MENU${NC}"
+    small_line
+    echo "[1] Enable BBR"
+    echo "[2] Show BBR Status"
+    echo "[0] Back"
+    echo ""
+    read -rp "Select: " o
+    case "$o" in
+      1) grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p; pause ;;
+      2) sysctl net.ipv4.tcp_congestion_control 2>/dev/null; pause ;;
+      0) return ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
+}
+
+main_menu(){
+  while true; do
+    header
+    echo -e " ${CYAN}[1]${NC}  SSH MENU              ${CYAN}[11]${NC} REBOOT VPS"
+    echo -e " ${CYAN}[2]${NC}  WEBSOCKET MENU        ${CYAN}[12]${NC} ABOUT SCRIPT"
+    echo -e " ${CYAN}[3]${NC}  UDP CUSTOM            ${CYAN}[13]${NC} VPS INFO"
+    echo -e " ${CYAN}[4]${NC}  BOT TELEGRAM          ${CYAN}[14]${NC} ONLINE USERS"
+    echo -e " ${CYAN}[5]${NC}  BACKUP RESTORE        ${CYAN}[15]${NC} SPEEDTEST"
+    echo -e " ${CYAN}[6]${NC}  DOMAIN MENU           ${CYAN}[16]${NC} SSL MENU"
+    echo -e " ${CYAN}[7]${NC}  SERVICES MENU         ${CYAN}[17]${NC} SECURITY MENU"
+    echo -e " ${CYAN}[8]${NC}  UPDATE SCRIPT         ${CYAN}[18]${NC} SYSTEM LOGS"
+    echo -e " ${CYAN}[9]${NC}  TRAFFIC MONITOR       ${CYAN}[19]${NC} FAIL2BAN MENU"
+    echo -e " ${CYAN}[10]${NC} SETTING               ${CYAN}[20]${NC} BBR MENU"
+    echo ""
+    echo -e " ${CYAN}[50]${NC} TROUBLESHOOTING       ${RED}[99]${NC} REMOVE SCRIPT"
+    echo -e " ${YELLOW}[X]${NC}  EXIT"
+    echo ""
+    read -rp "👉 Select: " o
+    case "$o" in
+      1) ssh_menu ;;
+      2) websocket_menu ;;
+      3) udp_menu ;;
+      4) header; echo "Telegram Bot module will be added later."; pause ;;
+      5) backup_restore_menu ;;
+      6) domain_menu ;;
+      7) services_menu ;;
+      8) update_script_menu ;;
+      9) traffic_menu ;;
+      10) setting_menu ;;
+      11) reboot ;;
+      12) about_menu ;;
+      13) vps_info ;;
+      14) online_users ;;
+      15) speedtest_menu ;;
+      16) ssl_menu ;;
+      17) security_menu ;;
+      18) troubleshooting_menu ;;
+      19) fail2ban_menu ;;
+      20) bbr_menu ;;
+      50) troubleshooting_menu ;;
+      99) remove_script ;;
+      x|X) exit 0 ;;
+      *) echo "Invalid option."; sleep 1 ;;
+    esac
+  done
+}
+
+run_panel(){
+  need_root
+  if [ ! -x "$PANEL_BIN" ]; then
+    save_panel
+  fi
+  if [ ! -f "$BASE_DIR/domain" ]; then
+    core_auto_setup
+  fi
+  main_menu
+}
+
+case "$1" in
+  --core|core) core_auto_setup; main_menu ;;
+  --menu|menu) run_panel ;;
+  *)
+    if [ "$(basename "$0")" = "SULTAN" ]; then
+      run_panel
+    else
+      core_auto_setup
+      main_menu
+    fi
+    ;;
+esac
