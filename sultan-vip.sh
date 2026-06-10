@@ -1,11 +1,11 @@
 #!/bin/bash
 # ==========================================================
 # SULTAN VIP FULL PURPLE INSTALL
-# Full installer + full panel
+# Full installer + full panel + ready SSL/TLS/SNI/WS/XHTTP
 # Same menu structure:
 # Main 1-20 + 50 + 99 + X
 # Setting 1-29 + 50 + 0
-# No nano, no GitHub for the panel file.
+# No nano, no GitHub for the panel file. Xray core uses official Xray installer.
 # ==========================================================
 
 set -e
@@ -121,9 +121,9 @@ get_isp(){ curl -s --max-time 4 ipinfo.io/org 2>/dev/null | cut -d' ' -f2- || ec
 
 count_lines(){ [ -f "$1" ] && wc -l < "$1" || echo 0; }
 count_ssh(){ count_lines "$DB"; }
-count_vmess(){ count_lines "$XDB/vmess.db"; }
-count_vless(){ count_lines "$XDB/vless.db"; }
-count_trojan(){ count_lines "$XDB/trojan.db"; }
+count_vmess(){ count_lines "$XDB/vmess-xhttp.db"; }
+count_vless(){ count_lines "$XDB/vless-xhttp.db"; }
+count_trojan(){ count_lines "$XDB/trojan-xhttp.db"; }
 
 tls_status(){
     local D
@@ -584,17 +584,18 @@ pause
 create_xray_config(){
 refresh_screen
 echo "==================================="
-echo "        CREATE XRAY BASE CONFIG"
+echo "        CREATE XRAY XHTTP CONFIG"
 echo "==================================="
 DOMAIN=$(get_domain)
 [ "$DOMAIN" = "Not Set" ] && read -p "Domain: " DOMAIN && echo "$DOMAIN" > "$DOMAIN_FILE"
 
 mkdir -p /usr/local/etc/xray
 cat >/usr/local/etc/xray/config.json <<EOF
-{"log":{"loglevel":"warning"},"inbounds":[{"tag":"vless-xhttp","listen":"0.0.0.0","port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/xhttp"},"tlsSettings":{"serverName":"$DOMAIN","certificates":[{"certificateFile":"/etc/letsencrypt/live/$DOMAIN/fullchain.pem","keyFile":"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}]}}},{"tag":"vmess-ws","listen":"127.0.0.1","port":10085,"protocol":"vmess","settings":{"clients":[]},"streamSettings":{"network":"ws","wsSettings":{"path":"/vmess"}}},{"tag":"trojan-ws","listen":"127.0.0.1","port":10086,"protocol":"trojan","settings":{"clients":[]},"streamSettings":{"network":"ws","wsSettings":{"path":"/trojan"}}}],"outbounds":[{"protocol":"freedom"}]}
+{"log":{"loglevel":"warning"},"inbounds":[{"tag":"vless-xhttp","listen":"127.0.0.1","port":10000,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/vless-xhttp"}}},{"tag":"vmess-xhttp","listen":"127.0.0.1","port":10085,"protocol":"vmess","settings":{"clients":[]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/vmess-xhttp"}}},{"tag":"trojan-xhttp","listen":"127.0.0.1","port":10086,"protocol":"trojan","settings":{"clients":[]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/trojan-xhttp"}}}],"outbounds":[{"protocol":"freedom"}]}
 EOF
 
 fix_xray_service_root
+systemctl enable xray 2>/dev/null || true
 systemctl restart xray 2>/dev/null || true
 systemctl status xray --no-pager -n 20 || true
 verify_service xray
@@ -611,6 +612,7 @@ echo "[1] Install/Reinstall Xray"
 echo "[2] Create Base Config"
 echo "[3] Restart Xray"
 echo "[4] Xray Status"
+echo "[5] Show Payload / SNI"
 echo "[0] Back"
 echo "==================================="
 read -p "Select: " x
@@ -619,6 +621,7 @@ case "$x" in
 2) create_xray_config ;;
 3) refresh_screen; fix_xray_service_root; systemctl restart xray 2>/dev/null || true; systemctl status xray --no-pager -n 20 || true; verify_service xray; pause ;;
 4) refresh_screen; systemctl status xray --no-pager || true; pause ;;
+5) show_payloads ;;
 0) main_menu ;;
 *) xray_menu ;;
 esac
@@ -658,12 +661,12 @@ read -p "Select: " v
 case "$v" in
 1)
 ensure_xray_config || continue
-create_xray_user_screen "VLESS"
+create_xray_user_screen "VLESS XHTTP"
 read -p "Username: " USER
 UUID=$(uuidgen)
 DOMAIN=$(get_domain)
 mkdir -p "$XDB"
-echo "$USER|$UUID|vless|xhttp|$DOMAIN|/xhttp" >> "$XDB/vless.db"
+echo "$USER|$UUID|vless|xhttp|$DOMAIN|/vless-xhttp" >> "$XDB/vless-xhttp.db"
 jq --arg id "$UUID" --arg email "$USER" '(.inbounds[] | select(.tag=="vless-xhttp") | .settings.clients) += [{"id":$id,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
 systemctl restart xray 2>/dev/null || true
 refresh_screen
@@ -674,12 +677,14 @@ box "Username" "$USER"
 box "UUID" "$UUID"
 box "Domain" "$DOMAIN"
 box "Port" "443"
-box "Path" "/xhttp"
-echo "vless://$UUID@$DOMAIN:443?type=xhttp&security=tls&path=%2Fxhttp#$USER"
+box "SNI" "$DOMAIN"
+box "Type" "XHTTP"
+box "Path" "/vless-xhttp"
+echo "vless://$UUID@$DOMAIN:443?type=xhttp&security=tls&sni=$DOMAIN&host=$DOMAIN&path=%2Fvless-xhttp#$USER"
 stats_small
 pause
 ;;
-2) refresh_screen; cat "$XDB/vless.db" 2>/dev/null || echo "No VLESS users"; pause ;;
+2) refresh_screen; cat "$XDB/vless-xhttp.db" 2>/dev/null || echo "No VLESS users"; pause ;;
 3) delete_xray_user "vless" "vless-xhttp" "id" ;;
 4) xray_user_traffic "vless" ;;
 0) main_menu ;;
@@ -694,7 +699,7 @@ refresh_screen
 echo "==================================="
 echo "            VMESS MENU"
 echo "==================================="
-echo "[1] Create VMESS WS"
+echo "[1] Create VMESS XHTTP"
 echo "[2] List VMESS Users"
 echo "[3] Delete VMESS User"
 echo "[4] User Traffic"
@@ -704,27 +709,36 @@ read -p "Select: " v
 case "$v" in
 1)
 ensure_xray_config || continue
-create_xray_user_screen "VMESS"
+create_xray_user_screen "VMESS XHTTP"
 read -p "Username: " USER
 UUID=$(uuidgen)
 DOMAIN=$(get_domain)
 mkdir -p "$XDB"
-echo "$USER|$UUID|vmess|ws|$DOMAIN|/vmess" >> "$XDB/vmess.db"
-jq --arg id "$UUID" --arg email "$USER" '(.inbounds[] | select(.tag=="vmess-ws") | .settings.clients) += [{"id":$id,"alterId":0,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
+echo "$USER|$UUID|vmess|xhttp|$DOMAIN|/vmess-xhttp" >> "$XDB/vmess-xhttp.db"
+jq --arg id "$UUID" --arg email "$USER" '(.inbounds[] | select(.tag=="vmess-xhttp") | .settings.clients) += [{"id":$id,"alterId":0,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
 systemctl restart xray 2>/dev/null || true
+VMESS_JSON=$(cat <<EOF
+{"v":"2","ps":"$USER","add":"$DOMAIN","port":"443","id":"$UUID","aid":"0","scy":"auto","net":"xhttp","type":"none","host":"$DOMAIN","path":"/vmess-xhttp","tls":"tls","sni":"$DOMAIN"}
+EOF
+)
+VMESS_LINK="$(echo -n "$VMESS_JSON" | base64 -w 0 2>/dev/null || echo -n "$VMESS_JSON" | base64 | tr -d '\n')"
 refresh_screen
 echo "==================================="
-echo "          VMESS CREATED"
+echo "        VMESS XHTTP CREATED"
 echo "==================================="
 box "Username" "$USER"
 box "UUID" "$UUID"
 box "Domain" "$DOMAIN"
-box "Path" "/vmess"
+box "Port" "443"
+box "SNI" "$DOMAIN"
+box "Type" "XHTTP"
+box "Path" "/vmess-xhttp"
+echo "vmess://$VMESS_LINK"
 stats_small
 pause
 ;;
-2) refresh_screen; cat "$XDB/vmess.db" 2>/dev/null || echo "No VMESS users"; pause ;;
-3) delete_xray_user "vmess" "vmess-ws" "id" ;;
+2) refresh_screen; cat "$XDB/vmess-xhttp.db" 2>/dev/null || echo "No VMESS users"; pause ;;
+3) delete_xray_user "vmess" "vmess-xhttp" "id" ;;
 4) xray_user_traffic "vmess" ;;
 0) main_menu ;;
 *) vmess_menu ;;
@@ -738,7 +752,7 @@ refresh_screen
 echo "==================================="
 echo "            TROJAN MENU"
 echo "==================================="
-echo "[1] Create TROJAN WS"
+echo "[1] Create TROJAN XHTTP"
 echo "[2] List TROJAN Users"
 echo "[3] Delete TROJAN User"
 echo "[4] User Traffic"
@@ -748,28 +762,31 @@ read -p "Select: " t
 case "$t" in
 1)
 ensure_xray_config || continue
-create_xray_user_screen "TROJAN"
+create_xray_user_screen "TROJAN XHTTP"
 read -p "Username: " USER
 PASS=$(openssl rand -hex 8)
 DOMAIN=$(get_domain)
 mkdir -p "$XDB"
-echo "$USER|$PASS|trojan|ws|$DOMAIN|/trojan" >> "$XDB/trojan.db"
-jq --arg password "$PASS" --arg email "$USER" '(.inbounds[] | select(.tag=="trojan-ws") | .settings.clients) += [{"password":$password,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
+echo "$USER|$PASS|trojan|xhttp|$DOMAIN|/trojan-xhttp" >> "$XDB/trojan-xhttp.db"
+jq --arg password "$PASS" --arg email "$USER" '(.inbounds[] | select(.tag=="trojan-xhttp") | .settings.clients) += [{"password":$password,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
 systemctl restart xray 2>/dev/null || true
 refresh_screen
 echo "==================================="
-echo "          TROJAN CREATED"
+echo "        TROJAN XHTTP CREATED"
 echo "==================================="
 box "Username" "$USER"
 box "Password" "$PASS"
 box "Domain" "$DOMAIN"
-box "Path" "/trojan"
-echo "trojan://$PASS@$DOMAIN:443?type=ws&security=tls&path=%2Ftrojan#$USER"
+box "Port" "443"
+box "SNI" "$DOMAIN"
+box "Type" "XHTTP"
+box "Path" "/trojan-xhttp"
+echo "trojan://$PASS@$DOMAIN:443?type=xhttp&security=tls&sni=$DOMAIN&host=$DOMAIN&path=%2Ftrojan-xhttp#$USER"
 stats_small
 pause
 ;;
-2) refresh_screen; cat "$XDB/trojan.db" 2>/dev/null || echo "No TROJAN users"; pause ;;
-3) delete_xray_user "trojan" "trojan-ws" "password" ;;
+2) refresh_screen; cat "$XDB/trojan-xhttp.db" 2>/dev/null || echo "No TROJAN users"; pause ;;
+3) delete_xray_user "trojan" "trojan-xhttp" "password" ;;
 4) xray_user_traffic "trojan" ;;
 0) main_menu ;;
 *) trojan_menu ;;
@@ -1059,7 +1076,7 @@ case "$s" in
 26) reinstall_speedtest ;;
 27) refresh_screen; apt remove -y speedtest-cli; echo "Speedtest Removed" ;;
 28) vps_info ;;
-29) fix_403_ws_status ;;
+29) setup_ready_ssl_ws_xhttp ;;
 50) troubleshooting_menu ;;
 0) main_menu ;;
 *) setting_menu ;;
@@ -1118,41 +1135,342 @@ echo "BBR removed from sysctl config. Reboot recommended."
 pause
 }
 
-setup_domain_ssl_xhttp(){
-refresh_screen
-echo "==================================="
-echo "      SETUP DOMAIN SSL XHTTP"
-echo "==================================="
-read -p "Domain: " DOMAIN
-echo "$DOMAIN" > "$DOMAIN_FILE"
 
-SERVER_IP=$(get_ip)
-DOMAIN_IP=$(getent ahostsv4 "$DOMAIN" | awk '{print $1; exit}')
-
-box "Server IP" "$SERVER_IP"
-box "Domain IP" "$DOMAIN_IP"
-
-if [ -z "$DOMAIN_IP" ] || [ "$SERVER_IP" != "$DOMAIN_IP" ]; then
-    echo -e "${RED}DNS mismatch. Point domain to this VPS first.${NC}"
-    pause
-    return
-fi
-
-apt install -y nginx certbot python3-certbot-nginx
-ufw allow 80/tcp 2>/dev/null || true
-ufw allow 443/tcp 2>/dev/null || true
-systemctl enable nginx
-systemctl restart nginx
-
-certbot --nginx -d "$DOMAIN" --agree-tos -m admin@$DOMAIN --non-interactive --redirect || true
-
-if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-    echo -e "TLS Status : ${GREEN}[ ACTIVE ]${NC}"
-else
-    echo -e "TLS Status : ${RED}[ FAILED ]${NC}"
-fi
-pause
+install_xray_core_auto(){
+    if command -v xray >/dev/null 2>&1; then
+        return
+    fi
+    echo "Installing Xray core..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install || true
 }
+
+create_self_signed_cert(){
+    local D="$1"
+    mkdir -p "/etc/sultan/selfsigned/$D"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+        -keyout "/etc/sultan/selfsigned/$D/privkey.pem" \
+        -out "/etc/sultan/selfsigned/$D/fullchain.pem" \
+        -subj "/CN=$D" >/dev/null 2>&1 || true
+}
+
+cert_file_for_domain(){
+    local D="$1"
+    if [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ]; then
+        echo "/etc/letsencrypt/live/$D/fullchain.pem"
+    else
+        echo "/etc/sultan/selfsigned/$D/fullchain.pem"
+    fi
+}
+
+key_file_for_domain(){
+    local D="$1"
+    if [ -f "/etc/letsencrypt/live/$D/privkey.pem" ]; then
+        echo "/etc/letsencrypt/live/$D/privkey.pem"
+    else
+        echo "/etc/sultan/selfsigned/$D/privkey.pem"
+    fi
+}
+
+install_sultan_ws_core(){
+cat >/usr/local/bin/sultan-ssh-ws <<'PYWS'
+#!/usr/bin/env python3
+import asyncio, base64, hashlib
+
+async def forward(r, w):
+    try:
+        while True:
+            data = await r.read(8192)
+            if not data:
+                break
+            w.write(data)
+            await w.drain()
+    except Exception:
+        pass
+    try:
+        w.close()
+    except Exception:
+        pass
+
+async def handle(cr, cw):
+    try:
+        header = await cr.readuntil(b"\r\n\r\n")
+        text = header.decode(errors="ignore")
+        key = ""
+        for line in text.split("\r\n"):
+            if line.lower().startswith("sec-websocket-key:"):
+                key = line.split(":", 1)[1].strip()
+        if key:
+            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            cw.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
+        else:
+            cw.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        await cw.drain()
+        sr, sw = await asyncio.open_connection("127.0.0.1", 22)
+        await asyncio.gather(forward(cr, sw), forward(sr, cw))
+    except Exception:
+        try:
+            cw.close()
+        except Exception:
+            pass
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", 8080)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+PYWS
+
+chmod +x /usr/local/bin/sultan-ssh-ws
+cat >/etc/systemd/system/sultan-ws.service <<EOF
+[Unit]
+Description=SULTAN SSH WebSocket Ready
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/sultan-ssh-ws
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable sultan-ws
+systemctl restart sultan-ws
+}
+
+write_ready_xray_config(){
+    local D="$1"
+    mkdir -p /usr/local/etc/xray
+    cat >/usr/local/etc/xray/config.json <<EOF
+{"log":{"loglevel":"warning"},"inbounds":[{"tag":"vless-xhttp","listen":"127.0.0.1","port":10000,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/vless-xhttp"}}},{"tag":"vmess-xhttp","listen":"127.0.0.1","port":10085,"protocol":"vmess","settings":{"clients":[]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/vmess-xhttp"}}},{"tag":"trojan-xhttp","listen":"127.0.0.1","port":10086,"protocol":"trojan","settings":{"clients":[]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/trojan-xhttp"}}}],"outbounds":[{"protocol":"freedom"}]}
+EOF
+    fix_xray_service_root
+    systemctl enable xray 2>/dev/null || true
+    systemctl restart xray 2>/dev/null || true
+}
+
+write_ready_nginx_haproxy(){
+    local D="$1"
+    local CERT KEY
+    CERT="$(cert_file_for_domain "$D")"
+    KEY="$(key_file_for_domain "$D")"
+
+    rm -f /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/default
+    cat >/etc/nginx/conf.d/sultan-ready.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $D;
+
+    location / {
+        return 200 "SULTAN 200 OK";
+        add_header Content-Type text/plain;
+    }
+
+    location /block {
+        return 403 "SULTAN 403 FORBIDDEN";
+        add_header Content-Type text/plain;
+    }
+}
+
+server {
+    listen 127.0.0.1:8443 ssl http2;
+    server_name $D;
+
+    ssl_certificate $CERT;
+    ssl_certificate_key $KEY;
+
+    location /block {
+        return 403 "SULTAN 403 FORBIDDEN";
+        add_header Content-Type text/plain;
+    }
+
+    location /vless-xhttp {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10000;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        client_max_body_size 0;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+    location /vmess-xhttp {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10085;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        client_max_body_size 0;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+    location /trojan-xhttp {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10086;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        client_max_body_size 0;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+    location / {
+        if (\$http_upgrade = "") {
+            return 200 "SULTAN 200 OK";
+        }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+}
+EOF
+
+    cat >/etc/haproxy/haproxy.cfg <<EOF
+global
+    daemon
+    maxconn 4096
+
+defaults
+    mode tcp
+    timeout connect 10s
+    timeout client 1m
+    timeout server 1m
+
+frontend sultan_tls_443
+    bind *:443
+    default_backend sultan_nginx_tls
+
+backend sultan_nginx_tls
+    server nginx_tls 127.0.0.1:8443 check
+EOF
+
+    nginx -t
+    systemctl enable nginx haproxy
+    systemctl restart nginx
+    systemctl restart haproxy
+}
+
+show_payloads(){
+    local D
+    D="$(get_domain)"
+    [ "$D" = "Not Set" ] && D="$(get_ip)"
+    refresh_screen
+    echo "==================================="
+    echo "        SNI / PAYLOAD / PORTS"
+    echo "==================================="
+    box "SNI" "$D"
+    box "Port TLS" "443"
+    box "SSH WS Path" "/"
+    box "VLESS XHTTP" "/vless-xhttp"
+    box "VMESS XHTTP" "/vmess-xhttp"
+    box "TROJAN XHTTP" "/trojan-xhttp"
+    echo ""
+    echo "SSH WebSocket Payload:"
+    echo "GET / HTTP/1.1[crlf]Host: $D[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[crlf]Sec-WebSocket-Version: 13[crlf][crlf]"
+    echo ""
+    echo "VLESS  XHTTP: $D:443  TLS ON  SNI $D  Path /vless-xhttp"
+    echo "VMESS  XHTTP: $D:443  TLS ON  SNI $D  Path /vmess-xhttp"
+    echo "TROJAN XHTTP: $D:443  TLS ON  SNI $D  Path /trojan-xhttp"
+    echo "==================================="
+    pause
+}
+
+setup_ready_ssl_ws_xhttp(){
+    refresh_screen
+    echo "==================================="
+    echo "   READY SSL/TLS + SNI + WS + XHTTP"
+    echo "==================================="
+    local D SERVER_IP DOMAIN_IP CERTOK
+    D="$(get_domain)"
+    if [ "$D" = "Not Set" ] || [ -z "$D" ]; then
+        read -p "Enter domain for SSL/SNI: " D
+    else
+        read -p "Domain [$D]: " ND
+        [ -n "$ND" ] && D="$ND"
+    fi
+    if [ -z "$D" ]; then
+        echo "Domain is required."
+        pause
+        return
+    fi
+    echo "$D" > "$DOMAIN_FILE"
+
+    SERVER_IP="$(get_ip)"
+    DOMAIN_IP="$(getent ahostsv4 "$D" | awk '{print $1; exit}')"
+    box "Server IP" "$SERVER_IP"
+    box "Domain IP" "${DOMAIN_IP:-EMPTY}"
+
+    apt update -y
+    apt install -y curl wget nginx haproxy openssh-server python3 certbot ufw socat jq uuid-runtime psmisc openssl ca-certificates dnsutils
+
+    ufw allow 22/tcp 2>/dev/null || true
+    ufw allow 80/tcp 2>/dev/null || true
+    ufw allow 443/tcp 2>/dev/null || true
+    ufw allow 7300/udp 2>/dev/null || true
+    ufw --force enable 2>/dev/null || true
+
+    systemctl stop nginx haproxy 2>/dev/null || true
+    fuser -k 80/tcp 2>/dev/null || true
+    fuser -k 443/tcp 2>/dev/null || true
+    fuser -k 8443/tcp 2>/dev/null || true
+
+    CERTOK=0
+    if [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ]; then
+        CERTOK=1
+    elif [ -n "$DOMAIN_IP" ] && [ "$SERVER_IP" = "$DOMAIN_IP" ]; then
+        certbot certonly --standalone -d "$D" --cert-name "$D" --agree-tos -m "admin@$D" --non-interactive --preferred-challenges http && CERTOK=1 || CERTOK=0
+    fi
+
+    if [ "$CERTOK" != "1" ]; then
+        echo -e "${YELLOW}Valid Let's Encrypt SSL not issued. Creating self-signed fallback so services can start.${NC}"
+        create_self_signed_cert "$D"
+    fi
+
+    install_sultan_ws_core
+    install_xray_core_auto
+    write_ready_xray_config "$D"
+    reinstall_udp
+    write_ready_nginx_haproxy "$D"
+
+    echo ""
+    echo "===== STATUS ====="
+    echo -n "Port 443: "; ss -tulpn | grep ':443' || true
+    echo -n "Nginx: "; systemctl is-active nginx || true
+    echo -n "HAProxy: "; systemctl is-active haproxy || true
+    echo -n "WebSocket: "; systemctl is-active sultan-ws || true
+    echo -n "Xray: "; systemctl is-active xray || true
+    echo -n "UDP: "; systemctl is-active udp-custom || true
+    echo ""
+    show_payloads
+}
+
+
+setup_domain_ssl_xhttp(){
+setup_ready_ssl_ws_xhttp
+}
+
 
 remove_ssl(){
 refresh_screen
@@ -1315,7 +1633,7 @@ box "Xray Service" "$(svc xray)"
 box "Domain" "$DOMAIN"
 box "TLS Status" "$( [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ] && echo ACTIVE || echo FAILED )"
 box "Port" "$(ss -tulpn | grep -q ':443' && echo OPEN || echo CLOSED)"
-box "XHTTP Path" "/xhttp"
+box "XHTTP Path" "/vless-xhttp"
 echo "==================================="
 pause
 }
@@ -1532,11 +1850,20 @@ echo "==================================="
 echo "          ABOUT SULTAN"
 echo "==================================="
 echo "SULTAN VIP 👑"
-echo "Version   : CROWN CORE v1.2"
+echo "Version   : CROWN CORE v1.2 READY"
 echo "Design    : Purple VIP"
+echo "Ready     : SSL/TLS + SNI + WS + ALL XHTTP"
 echo "==================================="
-pause
+echo ""
+echo "[1] Show Payload / SNI Info"
+echo "[0] Back"
+read -p "Select: " A
+case "$A" in
+1) show_payloads ;;
+*) main_menu ;;
+esac
 }
+
 
 remove_script(){
 refresh_screen
@@ -1566,19 +1893,29 @@ else
 fi
 }
 
+case "$1" in
+  --ready-install) setup_ready_ssl_ws_xhttp; exit 0 ;;
+  --payload) show_payloads; exit 0 ;;
+esac
+
 main_menu
 PANEL
 
 echo "[3/4] Setting permissions..."
 chmod +x "$PANEL"
 
-echo "[4/4] Enabling base services..."
+echo "[4/5] Enabling base services..."
 systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
 systemctl enable nginx haproxy vnstat fail2ban 2>/dev/null || true
 systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-systemctl restart nginx haproxy vnstat fail2ban 2>/dev/null || true
+systemctl restart vnstat fail2ban 2>/dev/null || true
+
+echo "[5/5] Ready setup: SSL/TLS + SNI + WebSocket + ALL XHTTP + Nginx + HAProxy + 443"
+echo "You will be asked for your domain. Make sure DNS A record points to this VPS."
+"$PANEL" --ready-install || true
 
 echo ""
 echo "==========================================="
 echo "Done. Type: SULTAN"
+echo "Port 443 is handled by HAProxy -> Nginx TLS."
 echo "==========================================="
