@@ -1,19 +1,39 @@
 #!/bin/bash
-# SULTAN VIP AUTOSCRIPT
-# Clean screen menus + one-button reinstall/verify services.
-# SSH is protected: restart/check only, never purge/reinstall.
+# ==========================================================
+# SULTAN VIP FULL PURPLE INSTALL
+# Full installer + full panel
+# Same menu structure:
+# Main 1-20 + 50 + 99 + X
+# Setting 1-29 + 50 + 0
+# No nano, no GitHub for the panel file.
+# ==========================================================
 
 set -e
+export DEBIAN_FRONTEND=noninteractive
 
 if [ "$(id -u)" != "0" ]; then
   echo "Run as root."
   exit 1
 fi
 
-apt update -y
-apt install -y curl wget nginx haproxy openssh-server python3-websockify certbot python3-certbot-nginx ufw socat lsb-release bc jq uuid-runtime vnstat fail2ban openssl speedtest-cli dnsutils iproute2
+BASE="/etc/sultan"
+XDB="$BASE/xray"
+DB="$BASE/users.db"
+DOMAIN_FILE="$BASE/domain"
+PANEL="/usr/local/bin/SULTAN"
 
-cat >/usr/local/bin/SULTAN <<'PANEL'
+mkdir -p "$BASE" "$XDB"
+
+echo "==========================================="
+echo "        SULTAN VIP FULL PURPLE INSTALL"
+echo "==========================================="
+echo "[1/4] Installing required packages..."
+apt update -y
+apt install -y curl wget nginx haproxy openssh-server python3 python3-websockify certbot python3-certbot-nginx ufw socat lsb-release bc jq uuid-runtime vnstat fail2ban openssl speedtest-cli dnsutils iproute2 tar gzip ca-certificates psmisc
+
+echo "[2/4] Writing SULTAN panel..."
+
+cat > "$PANEL" <<'PANEL'
 #!/bin/bash
 
 BASE="/etc/sultan"
@@ -21,12 +41,17 @@ DB="$BASE/users.db"
 DOMAIN_FILE="$BASE/domain"
 XDB="$BASE/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+
 mkdir -p "$BASE" "$XDB"
 
 RED="\e[31m"
 GREEN="\e[32m"
 YELLOW="\e[33m"
 BLUE="\e[34m"
+MAG="\e[35m"
+CYAN="\e[36m"
+WHITE="\e[97m"
+DIM="\e[2m"
 NC="\e[0m"
 
 refresh_screen(){
@@ -44,19 +69,28 @@ box(){
     printf "%-16s :      [ %s ]\n" "$1" "$2"
 }
 
-menu_row(){
-    printf "%-22s %s\n" "$1" "$2"
+svc(){
+    systemctl is-active --quiet "$1" 2>/dev/null && echo "ACTIVE" || echo "OFFLINE"
 }
 
-svc(){
-    systemctl is-active --quiet "$1" && echo "ACTIVE" || echo "OFFLINE"
+badge(){
+    local V="$1"
+    if [ "$V" = "ACTIVE" ] || [ "$V" = "READY" ] || [ "$V" = "OK" ]; then
+        echo -e "${GREEN}${V}${NC}"
+    elif [ "$V" = "OFFLINE" ] || [ "$V" = "FAILED" ] || [ "$V" = "MISSING" ]; then
+        echo -e "${RED}${V}${NC}"
+    else
+        echo -e "${YELLOW}${V}${NC}"
+    fi
 }
+
+svc_badge(){ badge "$(svc "$1")"; }
 
 verify_service(){
     local SERVICE="$1"
     echo ""
     echo "==================================="
-    if systemctl is-active --quiet "$SERVICE"; then
+    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
         echo -e "$SERVICE Status : ${GREEN}[ ACTIVE ]${NC}"
     else
         echo -e "$SERVICE Status : ${RED}[ FAILED ]${NC}"
@@ -67,54 +101,57 @@ verify_service(){
     echo "==================================="
 }
 
-get_domain(){
-    cat "$DOMAIN_FILE" 2>/dev/null || echo "Not Set"
-}
+get_domain(){ cat "$DOMAIN_FILE" 2>/dev/null || echo "Not Set"; }
 
 get_ip(){
-    curl -s ipv4.icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}'
+    local IP
+    IP="$(curl -s --max-time 4 ipv4.icanhazip.com 2>/dev/null | tr -d '\n')"
+    [ -n "$IP" ] && echo "$IP" || hostname -I | awk '{print $1}'
 }
 
-get_os(){
-    lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"'
-}
+get_os(){ lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"'; }
+get_cpu(){ top -bn1 | awk '/Cpu/ {print $2"%"}' 2>/dev/null || echo N/A; }
+get_ram(){ free -m | awk '/Mem:/ {print $3"MB / "$2"MB"}'; }
+get_mem_percent(){ free -m 2>/dev/null | awk '/Mem:/ {printf "%.0f%%", $3/$2*100}'; }
+get_disk(){ df -h / | awk 'NR==2 {print $3" / "$2}'; }
+get_uptime(){ uptime -p 2>/dev/null | sed 's/up //' || echo unknown; }
+get_kernel(){ uname -r; }
+get_country(){ curl -s --max-time 4 ipinfo.io/country 2>/dev/null || echo "Unknown"; }
+get_isp(){ curl -s --max-time 4 ipinfo.io/org 2>/dev/null | cut -d' ' -f2- || echo "Unknown"; }
 
-get_cpu(){
-    top -bn1 | awk '/Cpu/ {print $2"%"}' 2>/dev/null || echo N/A
-}
-
-get_ram(){
-    free -m | awk '/Mem:/ {print $3"MB / "$2"MB"}'
-}
-
-get_disk(){
-    df -h / | awk 'NR==2 {print $3" / "$2}'
-}
-
-get_uptime(){
-    uptime -p | sed 's/up //'
-}
-
-get_kernel(){
-    uname -r
-}
-
-get_country(){
-    curl -s ipinfo.io/country 2>/dev/null || echo "Unknown"
-}
-
-get_isp(){
-    curl -s ipinfo.io/org 2>/dev/null | cut -d' ' -f2- || echo "Unknown"
-}
-
-count_lines(){
-    [ -f "$1" ] && wc -l < "$1" || echo 0
-}
-
+count_lines(){ [ -f "$1" ] && wc -l < "$1" || echo 0; }
 count_ssh(){ count_lines "$DB"; }
 count_vmess(){ count_lines "$XDB/vmess.db"; }
 count_vless(){ count_lines "$XDB/vless.db"; }
 count_trojan(){ count_lines "$XDB/trojan.db"; }
+
+tls_status(){
+    local D
+    D="$(get_domain)"
+    if [ -d "/etc/letsencrypt/live/$D" ] || [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ]; then
+        echo ACTIVE
+    else
+        echo OFFLINE
+    fi
+}
+
+bbr_status(){
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        echo ACTIVE
+    else
+        echo OFFLINE
+    fi
+}
+
+core_status(){
+    if systemctl is-active --quiet nginx 2>/dev/null && systemctl is-active --quiet sultan-ws 2>/dev/null; then
+        echo READY
+    else
+        echo "NEEDS CHECK"
+    fi
+}
+
+purple_line(){ echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
 
 stats_small(){
     echo "-----------------------------------"
@@ -126,234 +163,61 @@ stats_small(){
     echo "-----------------------------------"
 }
 
-reinstall_package_service(){
-    local SERVICE="$1"
-    local PACKAGE="$2"
-
-    refresh_screen
-    echo "==================================="
-    echo "        REINSTALL $SERVICE"
-    echo "==================================="
-    echo "[1/6] Stop service..."
-    systemctl stop "$SERVICE" 2>/dev/null || true
-
-    echo "[2/6] Disable service..."
-    systemctl disable "$SERVICE" 2>/dev/null || true
-
-    echo "[3/6] Purge old package/config..."
-    apt purge -y "$PACKAGE" 2>/dev/null || true
-    apt autoremove -y 2>/dev/null || true
-
-    echo "[4/6] Update packages..."
-    apt update -y
-
-    echo "[5/6] Install package..."
-    apt install -y "$PACKAGE"
-
-    echo "[6/6] Enable and start..."
-    systemctl enable "$SERVICE" 2>/dev/null || true
-    systemctl restart "$SERVICE" 2>/dev/null || true
-
-    verify_service "$SERVICE"
-}
-
-restart_ssh_safe(){
-    refresh_screen
-    echo "==================================="
-    echo "          RESTART SSH ONLY"
-    echo "==================================="
-    echo "SSH will NOT be removed or reinstalled."
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-
-    if systemctl is-active --quiet ssh; then
-        echo -e "SSH Status : ${GREEN}[ ACTIVE ]${NC}"
-    elif systemctl is-active --quiet sshd; then
-        echo -e "SSHD Status: ${GREEN}[ ACTIVE ]${NC}"
-    else
-        echo -e "SSH Status : ${RED}[ FAILED ]${NC}"
-        journalctl -u ssh --no-pager -n 25 2>/dev/null || journalctl -u sshd --no-pager -n 25 2>/dev/null || true
-    fi
-}
-
-reinstall_websocket(){
-    refresh_screen
-    echo "==================================="
-    echo "        REINSTALL WEBSOCKET"
-    echo "==================================="
-
-    echo "[1/5] Remove old service..."
-    systemctl stop sultan-ws 2>/dev/null || true
-    systemctl disable sultan-ws 2>/dev/null || true
-    rm -f /etc/systemd/system/sultan-ws.service
-
-    echo "[2/5] Install websockify..."
-    apt update -y
-    apt install -y python3-websockify
-
-    echo "[3/5] Create service..."
-    cat >/etc/systemd/system/sultan-ws.service <<EOL
-[Unit]
-Description=SULTAN SSH WebSocket
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/websockify 127.0.0.1:8080 127.0.0.1:22
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOL
-
-    echo "[4/5] Reload systemd..."
-    systemctl daemon-reload
-
-    echo "[5/5] Start service..."
-    systemctl enable sultan-ws
-    systemctl restart sultan-ws
-
-    verify_service sultan-ws
-}
-
-reinstall_udp(){
-    refresh_screen
-    echo "==================================="
-    echo "        REINSTALL UDP CUSTOM"
-    echo "==================================="
-
-    echo "[1/5] Remove old service..."
-    systemctl stop udp-custom 2>/dev/null || true
-    systemctl disable udp-custom 2>/dev/null || true
-    rm -f /etc/systemd/system/udp-custom.service
-
-    echo "[2/5] Install socat..."
-    apt update -y
-    apt install -y socat
-
-    echo "[3/5] Create service..."
-    cat >/etc/systemd/system/udp-custom.service <<EOL
-[Unit]
-Description=UDP Custom 7300
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/socat UDP-LISTEN:7300,fork UDP:127.0.0.1:7300
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOL
-
-    echo "[4/5] Reload systemd..."
-    systemctl daemon-reload
-
-    echo "[5/5] Start service..."
-    systemctl enable udp-custom
-    systemctl restart udp-custom
-    ufw allow 7300/udp 2>/dev/null || true
-
-    verify_service udp-custom
-}
-
-reinstall_fail2ban(){
-    reinstall_package_service fail2ban fail2ban
-}
-
-reinstall_speedtest(){
-    refresh_screen
-    echo "==================================="
-    echo "        REINSTALL SPEEDTEST"
-    echo "==================================="
-    apt purge -y speedtest-cli 2>/dev/null || true
-    apt update -y
-    apt install -y speedtest-cli
-    echo -e "Speedtest CLI : ${GREEN}[ INSTALLED ]${NC}"
-}
-
-fix_xray_service_root(){
-    echo "[FIX] Xray SSL permission: set service user/group to root..."
-    systemctl stop xray 2>/dev/null || true
-
-    if [ -f /etc/systemd/system/xray.service ]; then
-        sed -i 's/^User=.*/User=root/' /etc/systemd/system/xray.service
-        sed -i 's/^Group=.*/Group=root/' /etc/systemd/system/xray.service
-
-        grep -q '^User=' /etc/systemd/system/xray.service || sed -i '/^\[Service\]/a User=root' /etc/systemd/system/xray.service
-        grep -q '^Group=' /etc/systemd/system/xray.service || sed -i '/^\[Service\]/a Group=root' /etc/systemd/system/xray.service
-    fi
-
-    systemctl daemon-reload
-}
-
 main_menu(){
+while true; do
 refresh_screen
 DOMAIN="$(get_domain)"
-D="$DOMAIN"
+IP="$(get_ip)"
+UPTIME="$(get_uptime)"
+LOAD="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+MEM="$(get_mem_percent)"
 
-echo "==========================================="
-echo "              SULTAN VIP 👑"
-echo "==========================================="
+echo -e "${MAG}╔════════════════════════════════════════════════════╗${NC}"
+echo -e "${MAG}║${WHITE}                    SULTAN VIP                    ${MAG}║${NC}"
+echo -e "${MAG}║${CYAN}                  CROWN CORE v1.2                 ${MAG}║${NC}"
+echo -e "${MAG}║${GREEN}              SSL | WEBSOCKET | UDP CORE          ${MAG}║${NC}"
+echo -e "${MAG}╚════════════════════════════════════════════════════╝${NC}"
+echo -e " ${WHITE}Domain${NC}       : ${CYAN}${DOMAIN}${NC}"
+echo -e " ${WHITE}Server IP${NC}    : ${CYAN}${IP}${NC}"
+echo -e " ${WHITE}Uptime${NC}       : ${GREEN}${UPTIME:-unknown}${NC}"
+echo -e " ${WHITE}Memory${NC}       : ${GREEN}${MEM:-unknown}${NC}        ${WHITE}Load${NC}: ${GREEN}${LOAD:-0}${NC}"
+purple_line
+echo -e " ${WHITE}TLS / SSL${NC}     : $(badge "$(tls_status)")"
+echo -e " ${WHITE}WebSocket${NC}     : $(svc_badge sultan-ws)"
+echo -e " ${WHITE}XHTTP${NC}         : $(svc_badge xray)"
+echo -e " ${WHITE}VMESS${NC}         : $(svc_badge xray)"
+echo -e " ${WHITE}VLESS${NC}         : $(svc_badge xray)"
+echo -e " ${WHITE}TROJAN${NC}        : $(svc_badge xray)"
+echo -e " ${WHITE}UDP Custom${NC}    : $(svc_badge udp-custom)"
+echo -e " ${WHITE}Nginx${NC}         : $(svc_badge nginx)"
+echo -e " ${WHITE}HAProxy${NC}       : $(svc_badge haproxy)"
+echo -e " ${WHITE}SSH${NC}           : $(svc_badge ssh)"
+echo -e " ${WHITE}Fail2Ban${NC}      : $(svc_badge fail2ban)"
+echo -e " ${WHITE}BBR${NC}           : $(badge "$(bbr_status)")"
+echo -e " ${WHITE}Core Status${NC}   : $(badge "$(core_status)")"
+purple_line
+echo -e " ${CYAN}[1]${NC}  SSH MENU              ${CYAN}[11]${NC} REBOOT VPS"
+echo -e " ${CYAN}[2]${NC}  VMESS MENU            ${CYAN}[12]${NC} ABOUT SCRIPT"
+echo -e " ${CYAN}[3]${NC}  VLESS MENU            ${CYAN}[13]${NC} VPS INFO"
+echo -e " ${CYAN}[4]${NC}  TROJAN MENU           ${CYAN}[14]${NC} ONLINE USERS"
+echo -e " ${CYAN}[5]${NC}  SSR MENU              ${CYAN}[15]${NC} SPEEDTEST"
+echo -e " ${CYAN}[6]${NC}  UDP CUSTOM            ${CYAN}[16]${NC} DOMAIN MENU"
+echo -e " ${CYAN}[7]${NC}  BOT TELEGRAM          ${CYAN}[17]${NC} SSL MENU"
+echo -e " ${CYAN}[8]${NC}  UPDATE SCRIPT         ${CYAN}[18]${NC} XRAY MENU"
+echo -e " ${CYAN}[9]${NC}  BACKUP RESTORE        ${CYAN}[19]${NC} FAIL2BAN MENU"
+echo -e " ${CYAN}[10]${NC} SETTING               ${CYAN}[20]${NC} BBR MENU"
 echo ""
-box "TLS Status" "$( [ -d "/etc/letsencrypt/live/$D" ] && echo ACTIVE || echo OFFLINE )"
-box "SSL Status" "$( [ -d "/etc/letsencrypt/live/$D" ] && echo ACTIVE || echo OFFLINE )"
-box "SSH Status" "$(svc ssh)"
-box "WebSocket" "$(svc sultan-ws)"
-box "XHTTP" "$(svc xray)"
-box "VMESS" "$(svc xray)"
-box "VLESS" "$(svc xray)"
-box "TROJAN" "$(svc xray)"
-box "UDP Custom" "$(svc udp-custom)"
-box "HAProxy" "$(svc haproxy)"
-box "Nginx" "$(svc nginx)"
-box "Xray" "$(svc xray)"
-box "UFW Firewall" "$(svc ufw)"
-box "Fail2Ban" "$(svc fail2ban)"
-box "BBR" "$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && echo ACTIVE || echo OFFLINE)"
+echo -e " ${CYAN}[50]${NC} TROUBLESHOOTING       ${RED}[99]${NC} REMOVE SCRIPT"
+echo -e " ${YELLOW}[X]${NC}  EXIT"
 echo ""
-echo "-------------------------------------------"
-echo ""
-box "Port SSH" "22"
-box "Port TLS" "443"
-box "Port HTTP" "80"
-box "Port UDPGW" "7300"
-echo ""
-echo "==========================================="
-menu_row "[1] SSH MENU" "[11] REBOOT VPS"
-menu_row "[2] VMESS MENU" "[12] ABOUT SCRIPT"
-menu_row "[3] VLESS MENU" "[13] VPS INFO"
-menu_row "[4] TROJAN MENU" "[14] ONLINE USERS"
-menu_row "[5] SSR MENU" "[15] SPEEDTEST"
-menu_row "[6] UDP CUSTOM" "[16] DOMAIN MENU"
-menu_row "[7] BOT TELEGRAM" "[17] SSL MENU"
-menu_row "[8] UPDATE SCRIPT" "[18] XRAY MENU"
-menu_row "[9] BACKUP RESTORE" "[19] FAIL2BAN MENU"
-menu_row "[10] SETTING" "[20] BBR MENU"
-echo ""
-echo "-------------------------------------------"
-echo ""
-box "Total SSH Users" "$(count_ssh)"
-box "Total VMESS Users" "$(count_vmess)"
-box "Total VLESS Users" "$(count_vless)"
-box "Total TROJAN Users" "$(count_trojan)"
-echo ""
-box "Online Users" "$(who | wc -l)"
-box "Bandwidth Today" "$(vnstat --oneline 2>/dev/null | awk -F';' '{print $6}' || echo N/A)"
-box "Bandwidth Month" "$(vnstat --oneline 2>/dev/null | awk -F';' '{print $11}' || echo N/A)"
-echo ""
-echo "-------------------------------------------"
-echo ""
-echo -e "${YELLOW}[50] TROUBLESHOOTING${NC}"
-echo -e "${RED}[99] REMOVE SCRIPT${NC}"
-echo "[X] EXIT"
-echo ""
-echo "==========================================="
-read -p "Select option: " opt
-[ -z "$opt" ] && main_menu
+read -p "👉 Select: " opt
+[ -z "$opt" ] && continue
 case "$opt" in
 1) ssh_menu ;;
 2) vmess_menu ;;
 3) vless_menu ;;
 4) trojan_menu ;;
+5) ssr_menu ;;
 6) udp_menu ;;
 7) bot_menu ;;
 8) update_script_menu ;;
@@ -374,8 +238,133 @@ case "$opt" in
 x|X) exit ;;
 *) main_menu ;;
 esac
+done
 }
+
+reinstall_package_service(){
+    local SERVICE="$1"
+    local PACKAGE="$2"
+    refresh_screen
+    echo "==================================="
+    echo "        REINSTALL $SERVICE"
+    echo "==================================="
+    systemctl stop "$SERVICE" 2>/dev/null || true
+    systemctl disable "$SERVICE" 2>/dev/null || true
+    apt purge -y "$PACKAGE" 2>/dev/null || true
+    apt autoremove -y 2>/dev/null || true
+    apt update -y
+    apt install -y "$PACKAGE"
+    systemctl enable "$SERVICE" 2>/dev/null || true
+    systemctl restart "$SERVICE" 2>/dev/null || true
+    verify_service "$SERVICE"
+}
+
+restart_ssh_safe(){
+    refresh_screen
+    echo "==================================="
+    echo "          RESTART SSH ONLY"
+    echo "==================================="
+    echo "SSH will NOT be removed or reinstalled."
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    if systemctl is-active --quiet ssh 2>/dev/null; then
+        echo -e "SSH Status : ${GREEN}[ ACTIVE ]${NC}"
+    elif systemctl is-active --quiet sshd 2>/dev/null; then
+        echo -e "SSHD Status: ${GREEN}[ ACTIVE ]${NC}"
+    else
+        echo -e "SSH Status : ${RED}[ FAILED ]${NC}"
+    fi
+}
+
+reinstall_websocket(){
+    refresh_screen
+    echo "==================================="
+    echo "        REINSTALL WEBSOCKET"
+    echo "==================================="
+    systemctl stop sultan-ws 2>/dev/null || true
+    systemctl disable sultan-ws 2>/dev/null || true
+    rm -f /etc/systemd/system/sultan-ws.service
+
+    apt update -y
+    apt install -y python3-websockify openssh-server
+
+    cat >/etc/systemd/system/sultan-ws.service <<EOL
+[Unit]
+Description=SULTAN SSH WebSocket
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/websockify 127.0.0.1:8080 127.0.0.1:22
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+    systemctl daemon-reload
+    systemctl enable sultan-ws
+    systemctl restart sultan-ws
+    verify_service sultan-ws
+}
+
+reinstall_udp(){
+    refresh_screen
+    echo "==================================="
+    echo "        REINSTALL UDP CUSTOM"
+    echo "==================================="
+    systemctl stop udp-custom 2>/dev/null || true
+    systemctl disable udp-custom 2>/dev/null || true
+    rm -f /etc/systemd/system/udp-custom.service
+
+    apt update -y
+    apt install -y socat
+
+    cat >/etc/systemd/system/udp-custom.service <<EOL
+[Unit]
+Description=UDP Custom 7300
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/socat UDP-LISTEN:7300,fork UDP:127.0.0.1:7300
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+    systemctl daemon-reload
+    systemctl enable udp-custom
+    systemctl restart udp-custom
+    ufw allow 7300/udp 2>/dev/null || true
+    verify_service udp-custom
+}
+
+reinstall_fail2ban(){ reinstall_package_service fail2ban fail2ban; }
+
+reinstall_speedtest(){
+    refresh_screen
+    echo "==================================="
+    echo "        REINSTALL SPEEDTEST"
+    echo "==================================="
+    apt purge -y speedtest-cli 2>/dev/null || true
+    apt update -y
+    apt install -y speedtest-cli
+    echo -e "Speedtest CLI : ${GREEN}[ INSTALLED ]${NC}"
+}
+
+fix_xray_service_root(){
+    systemctl stop xray 2>/dev/null || true
+    if [ -f /etc/systemd/system/xray.service ]; then
+        sed -i 's/^User=.*/User=root/' /etc/systemd/system/xray.service
+        sed -i 's/^Group=.*/Group=root/' /etc/systemd/system/xray.service
+        grep -q '^User=' /etc/systemd/system/xray.service || sed -i '/^\[Service\]/a User=root' /etc/systemd/system/xray.service
+        grep -q '^Group=' /etc/systemd/system/xray.service || sed -i '/^\[Service\]/a Group=root' /etc/systemd/system/xray.service
+    fi
+    systemctl daemon-reload
+}
+
 ssh_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "             SSH MENU"
@@ -400,15 +389,14 @@ case "$s" in
 4) extend_ssh_user ;;
 5) ssh_user_info ;;
 6) ssh_user_traffic ;;
-7) refresh_screen; who ;;
+7) refresh_screen; who; pause ;;
 8) change_ssh_password ;;
 9) change_ssh_quota ;;
 10) change_ssh_login ;;
 0) main_menu ;;
 *) ssh_menu ;;
 esac
-pause
-ssh_menu
+done
 }
 
 create_ssh_user(){
@@ -424,7 +412,7 @@ read -p "Days (0 = Infinite): " DAYS
 read -p "GB Limit (0 = Infinite): " GB
 read -p "Max Login Users (0 = Infinite): " MAXLOGIN
 
-id "$USER" &>/dev/null && { echo "User already exists"; return; }
+id "$USER" &>/dev/null && { echo "User already exists"; pause; return; }
 
 useradd -m -s /bin/bash "$USER"
 echo "$USER:$PASS" | chpasswd
@@ -440,7 +428,7 @@ fi
 [ "$GB" = "0" ] && GB_TEXT="Infinite" || GB_TEXT="${GB}GB"
 [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="Infinite" || LOGIN_TEXT="$MAXLOGIN"
 
-grep -v "^$USER|" "$DB" 2>/dev/null > /tmp/sultan.db
+grep -v "^$USER|" "$DB" 2>/dev/null > /tmp/sultan.db || true
 mv /tmp/sultan.db "$DB" 2>/dev/null || true
 echo "$USER|$PASS|$EXP|$GB_TEXT|$LOGIN_TEXT" >> "$DB"
 
@@ -454,6 +442,7 @@ box "Expire" "$EXP"
 box "Quota" "$GB_TEXT"
 box "Login Limit" "$LOGIN_TEXT"
 stats_small
+pause
 }
 
 list_ssh_users(){
@@ -463,6 +452,7 @@ echo "          SSH USERS LIST"
 echo "==================================="
 cat "$DB" 2>/dev/null || echo "No users found"
 echo "==================================="
+pause
 }
 
 delete_ssh_user(){
@@ -472,10 +462,11 @@ echo "        DELETE SSH USER"
 echo "==================================="
 read -p "Username: " USER
 userdel -r "$USER" 2>/dev/null || true
-grep -v "^$USER|" "$DB" 2>/dev/null > /tmp/sultan.db
+grep -v "^$USER|" "$DB" 2>/dev/null > /tmp/sultan.db || true
 mv /tmp/sultan.db "$DB" 2>/dev/null || true
 echo "Deleted: $USER"
 stats_small
+pause
 }
 
 extend_ssh_user(){
@@ -493,6 +484,7 @@ else
     chage -E "$EXP" "$USER"
     echo "Extended until $EXP"
 fi
+pause
 }
 
 ssh_user_info(){
@@ -501,7 +493,7 @@ echo "==================================="
 echo "        USER INFORMATION"
 echo "==================================="
 read -p "Username: " USER
-INFO=$(grep "^$USER|" "$DB" 2>/dev/null)
+INFO=$(grep "^$USER|" "$DB" 2>/dev/null || true)
 if [ -n "$INFO" ]; then
     IFS='|' read -r U P E Q L <<< "$INFO"
     box "Username" "$U"
@@ -513,6 +505,7 @@ else
     echo "User not found"
 fi
 echo "==================================="
+pause
 }
 
 ssh_user_traffic(){
@@ -521,13 +514,14 @@ echo "==================================="
 echo "        SSH USER BANDWIDTH"
 echo "==================================="
 if [ -f "$DB" ]; then
-    cut -d'|' -f1 "$DB" | while read u; do
+    cut -d'|' -f1 "$DB" | while read -r u; do
         printf "%-14s :      [ %s ]\n" "$u" "N/A"
     done
 else
     echo "No users found"
 fi
 echo "==================================="
+pause
 }
 
 change_ssh_password(){
@@ -540,6 +534,7 @@ read -s -p "New Password: " PASS
 echo ""
 echo "$USER:$PASS" | chpasswd
 echo "Password changed"
+pause
 }
 
 change_ssh_quota(){
@@ -552,6 +547,7 @@ read -p "New GB Limit (0 = Infinite): " GB
 [ "$GB" = "0" ] && GB_TEXT="Infinite" || GB_TEXT="${GB}GB"
 awk -F'|' -v u="$USER" -v q="$GB_TEXT" 'BEGIN{OFS="|"} $1==u{$4=q} {print}' "$DB" > /tmp/sultan.db && mv /tmp/sultan.db "$DB"
 echo "Quota changed"
+pause
 }
 
 change_ssh_login(){
@@ -564,6 +560,7 @@ read -p "New Login Limit (0 = Infinite): " MAXLOGIN
 [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="Infinite" || LOGIN_TEXT="$MAXLOGIN"
 awk -F'|' -v u="$USER" -v l="$LOGIN_TEXT" 'BEGIN{OFS="|"} $1==u{$5=l} {print}' "$DB" > /tmp/sultan.db && mv /tmp/sultan.db "$DB"
 echo "Login limit changed"
+pause
 }
 
 install_xray(){
@@ -571,17 +568,17 @@ refresh_screen
 echo "==================================="
 echo "        INSTALL / REINSTALL XRAY"
 echo "==================================="
-
+echo "This option installs Xray from official XTLS installer."
+read -p "Continue? [y/N]: " A
+[[ "$A" =~ ^[Yy]$ ]] || return
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-
 fix_xray_service_root
-
 mkdir -p "$XDB"
 systemctl enable xray
 systemctl restart xray
-
-systemctl status xray --no-pager -n 20
+systemctl status xray --no-pager -n 20 || true
 verify_service xray
+pause
 }
 
 create_xray_config(){
@@ -599,11 +596,13 @@ EOF
 
 fix_xray_service_root
 systemctl restart xray 2>/dev/null || true
-systemctl status xray --no-pager -n 20
+systemctl status xray --no-pager -n 20 || true
 verify_service xray
+pause
 }
 
 xray_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "             XRAY MENU"
@@ -618,13 +617,12 @@ read -p "Select: " x
 case "$x" in
 1) install_xray ;;
 2) create_xray_config ;;
-3) refresh_screen; fix_xray_service_root; systemctl restart xray; systemctl status xray --no-pager -n 20; verify_service xray ;;
-4) refresh_screen; systemctl status xray --no-pager ;;
+3) refresh_screen; fix_xray_service_root; systemctl restart xray 2>/dev/null || true; systemctl status xray --no-pager -n 20 || true; verify_service xray; pause ;;
+4) refresh_screen; systemctl status xray --no-pager || true; pause ;;
 0) main_menu ;;
 *) xray_menu ;;
 esac
-pause
-xray_menu
+done
 }
 
 create_xray_user_screen(){
@@ -636,7 +634,16 @@ create_xray_user_screen(){
     stats_small
 }
 
+ensure_xray_config(){
+    if [ ! -f "$XRAY_CONFIG" ]; then
+        echo "Xray config not found. Create Base Config first."
+        pause
+        return 1
+    fi
+}
+
 vless_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "            VLESS MENU"
@@ -650,6 +657,7 @@ echo "==================================="
 read -p "Select: " v
 case "$v" in
 1)
+ensure_xray_config || continue
 create_xray_user_screen "VLESS"
 read -p "Username: " USER
 UUID=$(uuidgen)
@@ -657,7 +665,7 @@ DOMAIN=$(get_domain)
 mkdir -p "$XDB"
 echo "$USER|$UUID|vless|xhttp|$DOMAIN|/xhttp" >> "$XDB/vless.db"
 jq --arg id "$UUID" --arg email "$USER" '(.inbounds[] | select(.tag=="vless-xhttp") | .settings.clients) += [{"id":$id,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
-systemctl restart xray
+systemctl restart xray 2>/dev/null || true
 refresh_screen
 echo "==================================="
 echo "        VLESS XHTTP CREATED"
@@ -669,18 +677,19 @@ box "Port" "443"
 box "Path" "/xhttp"
 echo "vless://$UUID@$DOMAIN:443?type=xhttp&security=tls&path=%2Fxhttp#$USER"
 stats_small
+pause
 ;;
-2) refresh_screen; cat "$XDB/vless.db" 2>/dev/null || echo "No VLESS users" ;;
+2) refresh_screen; cat "$XDB/vless.db" 2>/dev/null || echo "No VLESS users"; pause ;;
 3) delete_xray_user "vless" "vless-xhttp" "id" ;;
 4) xray_user_traffic "vless" ;;
 0) main_menu ;;
 *) vless_menu ;;
 esac
-pause
-vless_menu
+done
 }
 
 vmess_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "            VMESS MENU"
@@ -694,6 +703,7 @@ echo "==================================="
 read -p "Select: " v
 case "$v" in
 1)
+ensure_xray_config || continue
 create_xray_user_screen "VMESS"
 read -p "Username: " USER
 UUID=$(uuidgen)
@@ -701,7 +711,7 @@ DOMAIN=$(get_domain)
 mkdir -p "$XDB"
 echo "$USER|$UUID|vmess|ws|$DOMAIN|/vmess" >> "$XDB/vmess.db"
 jq --arg id "$UUID" --arg email "$USER" '(.inbounds[] | select(.tag=="vmess-ws") | .settings.clients) += [{"id":$id,"alterId":0,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
-systemctl restart xray
+systemctl restart xray 2>/dev/null || true
 refresh_screen
 echo "==================================="
 echo "          VMESS CREATED"
@@ -711,18 +721,19 @@ box "UUID" "$UUID"
 box "Domain" "$DOMAIN"
 box "Path" "/vmess"
 stats_small
+pause
 ;;
-2) refresh_screen; cat "$XDB/vmess.db" 2>/dev/null || echo "No VMESS users" ;;
+2) refresh_screen; cat "$XDB/vmess.db" 2>/dev/null || echo "No VMESS users"; pause ;;
 3) delete_xray_user "vmess" "vmess-ws" "id" ;;
 4) xray_user_traffic "vmess" ;;
 0) main_menu ;;
 *) vmess_menu ;;
 esac
-pause
-vmess_menu
+done
 }
 
 trojan_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "            TROJAN MENU"
@@ -736,6 +747,7 @@ echo "==================================="
 read -p "Select: " t
 case "$t" in
 1)
+ensure_xray_config || continue
 create_xray_user_screen "TROJAN"
 read -p "Username: " USER
 PASS=$(openssl rand -hex 8)
@@ -743,7 +755,7 @@ DOMAIN=$(get_domain)
 mkdir -p "$XDB"
 echo "$USER|$PASS|trojan|ws|$DOMAIN|/trojan" >> "$XDB/trojan.db"
 jq --arg password "$PASS" --arg email "$USER" '(.inbounds[] | select(.tag=="trojan-ws") | .settings.clients) += [{"password":$password,"email":$email}]' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
-systemctl restart xray
+systemctl restart xray 2>/dev/null || true
 refresh_screen
 echo "==================================="
 echo "          TROJAN CREATED"
@@ -754,15 +766,15 @@ box "Domain" "$DOMAIN"
 box "Path" "/trojan"
 echo "trojan://$PASS@$DOMAIN:443?type=ws&security=tls&path=%2Ftrojan#$USER"
 stats_small
+pause
 ;;
-2) refresh_screen; cat "$XDB/trojan.db" 2>/dev/null || echo "No TROJAN users" ;;
+2) refresh_screen; cat "$XDB/trojan.db" 2>/dev/null || echo "No TROJAN users"; pause ;;
 3) delete_xray_user "trojan" "trojan-ws" "password" ;;
 4) xray_user_traffic "trojan" ;;
 0) main_menu ;;
 *) trojan_menu ;;
 esac
-pause
-trojan_menu
+done
 }
 
 delete_xray_user(){
@@ -771,29 +783,29 @@ PROTO="$1"
 TAG="$2"
 FIELD="$3"
 DBF="$XDB/$PROTO.db"
-
 echo "==================================="
 echo "        DELETE ${PROTO^^} USER"
 echo "==================================="
 read -p "Username: " USER
-VALUE=$(grep "^$USER|" "$DBF" 2>/dev/null | cut -d'|' -f2)
-
+VALUE=$(grep "^$USER|" "$DBF" 2>/dev/null | cut -d'|' -f2 || true)
 if [ -z "$VALUE" ]; then
     echo "User not found"
+    pause
     return
 fi
-
+if [ -f "$XRAY_CONFIG" ]; then
 if [ "$FIELD" = "password" ]; then
     jq --arg value "$VALUE" --arg tag "$TAG" '(.inbounds[] | select(.tag==$tag) | .settings.clients) |= map(select(.password != $value))' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
 else
     jq --arg value "$VALUE" --arg tag "$TAG" '(.inbounds[] | select(.tag==$tag) | .settings.clients) |= map(select(.id != $value))' "$XRAY_CONFIG" > /tmp/xray.json && mv /tmp/xray.json "$XRAY_CONFIG"
 fi
-
-grep -v "^$USER|" "$DBF" > /tmp/xray_user.db
+fi
+grep -v "^$USER|" "$DBF" > /tmp/xray_user.db || true
 mv /tmp/xray_user.db "$DBF"
-systemctl restart xray
+systemctl restart xray 2>/dev/null || true
 echo "Deleted: $USER"
 stats_small
+pause
 }
 
 xray_user_traffic(){
@@ -804,13 +816,25 @@ echo "==================================="
 echo "        ${PROTO^^} USER BANDWIDTH"
 echo "==================================="
 if [ -f "$DBF" ]; then
-    cut -d'|' -f1 "$DBF" | while read u; do
+    cut -d'|' -f1 "$DBF" | while read -r u; do
         printf "%-14s :      [ %s ]\n" "$u" "N/A"
     done
 else
     echo "No users found"
 fi
 echo "==================================="
+pause
+}
+
+ssr_menu(){
+refresh_screen
+echo "==================================="
+echo "             SSR MENU"
+echo "==================================="
+echo "SSR core is not installed in this autoscript."
+echo "Use VMESS / VLESS / TROJAN / SSH instead."
+echo "==================================="
+pause
 }
 
 fix_403_ws_status(){
@@ -874,7 +898,6 @@ async def handle(cr, cw):
             cw.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 
         await cw.drain()
-
         sr, sw = await asyncio.open_connection("127.0.0.1", 22)
         await asyncio.gather(forward(cr, sw), forward(sr, cw))
     except Exception:
@@ -964,74 +987,49 @@ nginx -t && systemctl enable nginx && systemctl restart nginx
 
 echo ""
 echo "===== STATUS ====="
-echo -n "Nginx: "; systemctl is-active nginx
-echo -n "WebSocket: "; systemctl is-active sultan-ws
-echo -n "SSH: "; systemctl is-active ssh || systemctl is-active sshd
+echo -n "Nginx: "; systemctl is-active nginx || true
+echo -n "WebSocket: "; systemctl is-active sultan-ws || true
+echo -n "SSH: "; systemctl is-active ssh || systemctl is-active sshd || true
 
 echo ""
 echo "===== TEST ====="
-curl -k -i https://$D/ | head -n 1
-curl -k -i https://$D/block | head -n 1
-curl -k -i https://$D/ -H "Upgrade: websocket" -H "Connection: Upgrade" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Sec-WebSocket-Version: 13" | head -n 1
+curl -k -i https://$D/ --max-time 8 2>/dev/null | head -n 1 || true
+curl -k -i https://$D/block --max-time 8 2>/dev/null | head -n 1 || true
+curl -k -i https://$D/ --max-time 8 -H "Upgrade: websocket" -H "Connection: Upgrade" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Sec-WebSocket-Version: 13" 2>/dev/null | head -n 1 || true
 
 echo ""
 echo "===== PORTS ====="
-ss -tulpn | grep -E ':22|:80|:443|:8080'
+ss -tulpn | grep -E ':22|:80|:443|:8080' || true
+pause
 }
 
 setting_menu(){
+while true; do
 refresh_screen
-echo "==================================="
-echo "          SETTING MENU"
-echo "==================================="
-echo "[1] Reinstall Nginx"
-echo "[2] Disable Nginx"
+echo -e "${MAG}╔════════════════════════════════════════════════════╗${NC}"
+echo -e "${MAG}║${WHITE}                    SETTING MENU                  ${MAG}║${NC}"
+echo -e "${MAG}╚════════════════════════════════════════════════════╝${NC}"
+echo -e " ${CYAN}[1]${NC}  Reinstall Nginx              ${CYAN}[16]${NC} Disable Fail2Ban"
+echo -e " ${CYAN}[2]${NC}  Disable Nginx                ${CYAN}[17]${NC} Enable BBR"
+echo -e " ${CYAN}[3]${NC}  Reinstall HAProxy            ${CYAN}[18]${NC} Disable BBR"
+echo -e " ${CYAN}[4]${NC}  Disable HAProxy              ${CYAN}[19]${NC} Restart SSH Only"
+echo -e " ${CYAN}[5]${NC}  Reinstall WebSocket          ${CYAN}[20]${NC} Restart Nginx"
+echo -e " ${CYAN}[6]${NC}  Disable WebSocket            ${CYAN}[21]${NC} Restart HAProxy"
+echo -e " ${CYAN}[7]${NC}  Setup Domain + SSL + XHTTP   ${CYAN}[22]${NC} Restart Xray"
+echo -e " ${CYAN}[8]${NC}  Remove SSL/TLS               ${CYAN}[23]${NC} Restart All Services"
+echo -e " ${CYAN}[9]${NC}  Reinstall UDP Custom         ${CYAN}[24]${NC} Change Domain"
+echo -e " ${CYAN}[10]${NC} Disable UDP Custom           ${CYAN}[25]${NC} Renew SSL"
+echo -e " ${CYAN}[11]${NC} Enable UFW                   ${CYAN}[26]${NC} Reinstall Speedtest"
+echo -e " ${CYAN}[12]${NC} Disable UFW                  ${CYAN}[27]${NC} Remove Speedtest"
+echo -e " ${CYAN}[13]${NC} Open Ports                   ${CYAN}[28]${NC} VPS Information"
+echo -e " ${CYAN}[14]${NC} Close Ports                  ${CYAN}[29]${NC} Fix 403 / 101 / 200 WebSocket"
+echo -e " ${CYAN}[15]${NC} Reinstall Fail2Ban"
 echo ""
-echo "[3] Reinstall HAProxy"
-echo "[4] Disable HAProxy"
-echo ""
-echo "[5] Reinstall WebSocket"
-echo "[6] Disable WebSocket"
-echo ""
-echo "[7] Setup Domain + SSL + XHTTP"
-echo "[8] Remove SSL/TLS"
-echo ""
-echo "[9] Reinstall UDP Custom"
-echo "[10] Disable UDP Custom"
-echo ""
-echo "[11] Enable UFW"
-echo "[12] Disable UFW"
-echo ""
-echo "[13] Open Ports"
-echo "[14] Close Ports"
-echo ""
-echo "[15] Reinstall Fail2Ban"
-echo "[16] Disable Fail2Ban"
-echo ""
-echo "[17] Enable BBR"
-echo "[18] Disable BBR"
-echo ""
-echo "[19] Restart SSH Only"
-echo "[20] Restart Nginx"
-echo "[21] Restart HAProxy"
-echo "[22] Restart Xray"
-echo ""
-echo "[23] Restart All Services"
-echo ""
-echo "[24] Change Domain"
-echo "[25] Renew SSL"
-echo ""
-echo "[26] Reinstall Speedtest"
-echo "[27] Remove Speedtest"
-echo ""
-echo "[28] VPS Information"
-echo "[29] Fix 403 / 101 / 200 WebSocket"
-echo ""
-echo -e "${YELLOW}[50] TROUBLESHOOTING${NC}"
-echo ""
-echo "[0] Back"
-echo "==================================="
+echo -e " ${YELLOW}[50]${NC} TROUBLESHOOTING"
+echo -e " ${YELLOW}[0]${NC}  Back"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 read -p "Select: " s
+
 case "$s" in
 1) reinstall_package_service nginx nginx ;;
 2) refresh_screen; systemctl stop nginx 2>/dev/null || true; systemctl disable nginx 2>/dev/null || true; echo "Nginx Disabled" ;;
@@ -1052,9 +1050,9 @@ case "$s" in
 17) enable_bbr ;;
 18) disable_bbr ;;
 19) restart_ssh_safe ;;
-20) refresh_screen; systemctl restart nginx; verify_service nginx ;;
-21) refresh_screen; systemctl restart haproxy; verify_service haproxy ;;
-22) refresh_screen; fix_xray_service_root; systemctl restart xray; systemctl status xray --no-pager -n 20; verify_service xray ;;
+20) refresh_screen; systemctl restart nginx 2>/dev/null || true; verify_service nginx ;;
+21) refresh_screen; systemctl restart haproxy 2>/dev/null || true; verify_service haproxy ;;
+22) refresh_screen; fix_xray_service_root; systemctl restart xray 2>/dev/null || true; systemctl status xray --no-pager -n 20 || true; verify_service xray ;;
 23) restart_all_services ;;
 24) change_domain ;;
 25) renew_ssl ;;
@@ -1067,7 +1065,7 @@ case "$s" in
 *) setting_menu ;;
 esac
 pause
-setting_menu
+done
 }
 
 open_ports(){
@@ -1081,6 +1079,7 @@ ufw allow 443/tcp
 ufw allow 7300/udp
 ufw --force enable
 ufw status
+pause
 }
 
 close_ports(){
@@ -1093,6 +1092,7 @@ ufw delete allow 80/tcp 2>/dev/null || true
 ufw delete allow 443/tcp 2>/dev/null || true
 ufw delete allow 7300/udp 2>/dev/null || true
 ufw status
+pause
 }
 
 enable_bbr(){
@@ -1102,8 +1102,9 @@ echo "             ENABLE BBR"
 echo "==================================="
 grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
 grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-sysctl -p
+sysctl -p || true
 box "BBR" "$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')"
+pause
 }
 
 disable_bbr(){
@@ -1112,8 +1113,9 @@ echo "==================================="
 echo "             DISABLE BBR"
 echo "==================================="
 sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-sysctl -p
+sysctl -p || true
 echo "BBR removed from sysctl config. Reboot recommended."
+pause
 }
 
 setup_domain_ssl_xhttp(){
@@ -1130,8 +1132,9 @@ DOMAIN_IP=$(getent ahostsv4 "$DOMAIN" | awk '{print $1; exit}')
 box "Server IP" "$SERVER_IP"
 box "Domain IP" "$DOMAIN_IP"
 
-if [ "$SERVER_IP" != "$DOMAIN_IP" ]; then
+if [ -z "$DOMAIN_IP" ] || [ "$SERVER_IP" != "$DOMAIN_IP" ]; then
     echo -e "${RED}DNS mismatch. Point domain to this VPS first.${NC}"
+    pause
     return
 fi
 
@@ -1141,13 +1144,14 @@ ufw allow 443/tcp 2>/dev/null || true
 systemctl enable nginx
 systemctl restart nginx
 
-certbot --nginx -d "$DOMAIN" --agree-tos -m admin@$DOMAIN --non-interactive --redirect
+certbot --nginx -d "$DOMAIN" --agree-tos -m admin@$DOMAIN --non-interactive --redirect || true
 
 if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
     echo -e "TLS Status : ${GREEN}[ ACTIVE ]${NC}"
 else
     echo -e "TLS Status : ${RED}[ FAILED ]${NC}"
 fi
+pause
 }
 
 remove_ssl(){
@@ -1156,7 +1160,8 @@ echo "==================================="
 echo "           REMOVE SSL/TLS"
 echo "==================================="
 read -p "Domain: " DOMAIN
-certbot delete --cert-name "$DOMAIN"
+certbot delete --cert-name "$DOMAIN" || true
+pause
 }
 
 renew_ssl(){
@@ -1164,7 +1169,8 @@ refresh_screen
 echo "==================================="
 echo "             RENEW SSL"
 echo "==================================="
-certbot renew
+certbot renew || true
+pause
 }
 
 change_domain(){
@@ -1175,6 +1181,7 @@ echo "==================================="
 read -p "New domain: " DOMAIN
 echo "$DOMAIN" > "$DOMAIN_FILE"
 box "Domain" "$DOMAIN"
+pause
 }
 
 restart_all_services(){
@@ -1191,9 +1198,11 @@ verify_service sultan-ws
 verify_service udp-custom
 verify_service xray
 verify_service fail2ban
+pause
 }
 
 udp_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "           UDP CUSTOM"
@@ -1205,15 +1214,15 @@ echo "==================================="
 read -p "Select: " u
 case "$u" in
 1) reinstall_udp ;;
-2) refresh_screen; systemctl stop udp-custom 2>/dev/null || true; systemctl disable udp-custom 2>/dev/null || true; rm -f /etc/systemd/system/udp-custom.service; systemctl daemon-reload; echo "UDP Custom Disabled" ;;
+2) refresh_screen; systemctl stop udp-custom 2>/dev/null || true; systemctl disable udp-custom 2>/dev/null || true; rm -f /etc/systemd/system/udp-custom.service; systemctl daemon-reload; echo "UDP Custom Disabled"; pause ;;
 0) main_menu ;;
 *) udp_menu ;;
 esac
-pause
-udp_menu
+done
 }
 
 troubleshooting_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "       TROUBLESHOOTING CENTER"
@@ -1239,14 +1248,13 @@ case "$t" in
 5) check_dns ;;
 6) check_service sultan-ws ;;
 7) check_service udp-custom ;;
-8) refresh_screen; ufw status ;;
+8) refresh_screen; ufw status; pause ;;
 9) check_xhttp ;;
 10) check_all ;;
 0) setting_menu ;;
 *) troubleshooting_menu ;;
 esac
-pause
-troubleshooting_menu
+done
 }
 
 check_service(){
@@ -1255,9 +1263,10 @@ S="$1"
 echo "==================================="
 echo "        CHECK $S"
 echo "==================================="
-box "Service" "$(svc $S)"
-systemctl status "$S" --no-pager 2>/dev/null | head -25
+box "Service" "$(svc "$S")"
+systemctl status "$S" --no-pager 2>/dev/null | head -25 || true
 echo "==================================="
+pause
 }
 
 check_ssl(){
@@ -1277,6 +1286,7 @@ else
     box "Status" "FAILED"
 fi
 echo "==================================="
+pause
 }
 
 check_dns(){
@@ -1289,9 +1299,10 @@ echo "          DOMAIN DNS CHECK"
 echo "==================================="
 box "Domain" "$DOMAIN"
 box "Server IP" "$SERVER_IP"
-box "Domain IP" "$DOMAIN_IP"
+box "Domain IP" "${DOMAIN_IP:-EMPTY}"
 [ "$SERVER_IP" = "$DOMAIN_IP" ] && box "Result" "OK" || box "Result" "MISMATCH"
 echo "==================================="
+pause
 }
 
 check_xhttp(){
@@ -1306,20 +1317,21 @@ box "TLS Status" "$( [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ] && echo 
 box "Port" "$(ss -tulpn | grep -q ':443' && echo OPEN || echo CLOSED)"
 box "XHTTP Path" "/xhttp"
 echo "==================================="
+pause
 }
 
 check_all(){
 refresh_screen
-check_service nginx
-check_service haproxy
-check_service sultan-ws
-check_service udp-custom
-check_service xray
-check_ssl
-check_dns
+for S in nginx haproxy sultan-ws udp-custom xray fail2ban; do
+    echo "$S: $(svc "$S")"
+done
+echo "TLS: $(tls_status)"
+echo "BBR: $(bbr_status)"
+pause
 }
 
 domain_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "           DOMAIN MENU"
@@ -1331,17 +1343,17 @@ echo "[0] Back"
 echo "==================================="
 read -p "Select: " d
 case "$d" in
-1) refresh_screen; box "Domain" "$(get_domain)" ;;
+1) refresh_screen; box "Domain" "$(get_domain)"; pause ;;
 2) change_domain ;;
 3) check_dns ;;
 0) main_menu ;;
 *) domain_menu ;;
 esac
-pause
-domain_menu
+done
 }
 
 ssl_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "             SSL MENU"
@@ -1361,11 +1373,11 @@ case "$s" in
 0) main_menu ;;
 *) ssl_menu ;;
 esac
-pause
-ssl_menu
+done
 }
 
 fail2ban_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "           FAIL2BAN MENU"
@@ -1378,16 +1390,16 @@ echo "==================================="
 read -p "Select: " f
 case "$f" in
 1) reinstall_fail2ban ;;
-2) refresh_screen; systemctl stop fail2ban 2>/dev/null || true; systemctl disable fail2ban 2>/dev/null || true; echo "Fail2Ban Disabled" ;;
-3) refresh_screen; systemctl status fail2ban --no-pager ;;
+2) refresh_screen; systemctl stop fail2ban 2>/dev/null || true; systemctl disable fail2ban 2>/dev/null || true; echo "Fail2Ban Disabled"; pause ;;
+3) refresh_screen; systemctl status fail2ban --no-pager || true; pause ;;
 0) main_menu ;;
 *) fail2ban_menu ;;
 esac
-pause
-fail2ban_menu
+done
 }
 
 bbr_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "             BBR MENU"
@@ -1401,12 +1413,11 @@ read -p "Select: " b
 case "$b" in
 1) enable_bbr ;;
 2) disable_bbr ;;
-3) refresh_screen; sysctl net.ipv4.tcp_congestion_control ;;
+3) refresh_screen; sysctl net.ipv4.tcp_congestion_control || true; pause ;;
 0) main_menu ;;
 *) bbr_menu ;;
 esac
-pause
-bbr_menu
+done
 }
 
 vps_info(){
@@ -1425,7 +1436,6 @@ box "ISP" "$(get_isp)"
 box "Country" "$(get_country)"
 echo "==================================="
 pause
-main_menu
 }
 
 speedtest_menu(){
@@ -1433,9 +1443,8 @@ refresh_screen
 echo "==================================="
 echo "             SPEEDTEST"
 echo "==================================="
-speedtest-cli
+speedtest-cli || true
 pause
-main_menu
 }
 
 online_users_menu(){
@@ -1449,10 +1458,10 @@ echo "Active SSH connections:"
 ss -tnp | grep ':22' || echo "No SSH connections"
 echo "==================================="
 pause
-main_menu
 }
 
 backup_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "        BACKUP & RESTORE"
@@ -1466,8 +1475,9 @@ case "$b" in
 1)
 refresh_screen
 mkdir -p /root/sultan-backup
-tar -czf /root/sultan-backup/sultan-backup-$(date +%F-%H%M).tar.gz /etc/sultan /usr/local/etc/xray /usr/local/bin/SULTAN 2>/dev/null
+tar -czf /root/sultan-backup/sultan-backup-$(date +%F-%H%M).tar.gz /etc/sultan /usr/local/etc/xray /usr/local/bin/SULTAN 2>/dev/null || true
 echo "Backup saved in /root/sultan-backup/"
+pause
 ;;
 2)
 refresh_screen
@@ -1475,15 +1485,16 @@ read -p "Backup path: " BP
 tar -xzf "$BP" -C /
 systemctl restart xray 2>/dev/null || true
 echo "Restored"
+pause
 ;;
 0) main_menu ;;
 *) backup_menu ;;
 esac
-pause
-backup_menu
+done
 }
 
 bot_menu(){
+while true; do
 refresh_screen
 echo "==================================="
 echo "          TELEGRAM BOT"
@@ -1495,14 +1506,13 @@ echo "[0] Back"
 echo "==================================="
 read -p "Select: " b
 case "$b" in
-1) refresh_screen; read -p "Bot Token: " TOKEN; echo "$TOKEN" > "$BASE/bot_token" ;;
-2) refresh_screen; read -p "Chat ID: " CHAT; echo "$CHAT" > "$BASE/chat_id" ;;
-3) refresh_screen; TOKEN=$(cat "$BASE/bot_token" 2>/dev/null); CHAT=$(cat "$BASE/chat_id" 2>/dev/null); curl -s "https://api.telegram.org/bot$TOKEN/sendMessage" -d chat_id="$CHAT" -d text="SULTAN Panel Test Message"; echo "Sent" ;;
+1) refresh_screen; read -p "Bot Token: " TOKEN; echo "$TOKEN" > "$BASE/bot_token"; pause ;;
+2) refresh_screen; read -p "Chat ID: " CHAT; echo "$CHAT" > "$BASE/chat_id"; pause ;;
+3) refresh_screen; TOKEN=$(cat "$BASE/bot_token" 2>/dev/null); CHAT=$(cat "$BASE/chat_id" 2>/dev/null); curl -s "https://api.telegram.org/bot$TOKEN/sendMessage" -d chat_id="$CHAT" -d text="SULTAN Panel Test Message"; echo "Sent"; pause ;;
 0) main_menu ;;
 *) bot_menu ;;
 esac
-pause
-bot_menu
+done
 }
 
 update_script_menu(){
@@ -1510,10 +1520,10 @@ refresh_screen
 echo "==================================="
 echo "          UPDATE SCRIPT"
 echo "==================================="
+echo "Local full installer build."
 echo "No remote update source configured."
 echo "==================================="
 pause
-main_menu
 }
 
 about_menu(){
@@ -1522,11 +1532,10 @@ echo "==================================="
 echo "          ABOUT SULTAN"
 echo "==================================="
 echo "SULTAN VIP 👑"
-echo "Developer : SULTAN VIP 👑"
-echo "Version   : SULTAN VIP 👑 FIX403"
+echo "Version   : CROWN CORE v1.2"
+echo "Design    : Purple VIP"
 echo "==================================="
 pause
-main_menu
 }
 
 remove_script(){
@@ -1541,7 +1550,6 @@ echo " - UDP Custom Service"
 echo " - SULTAN Database"
 echo "======================================${NC}"
 read -p "Type YES to remove: " CONFIRM
-
 if [ "$CONFIRM" = "YES" ]; then
     systemctl stop sultan-ws udp-custom 2>/dev/null || true
     systemctl disable sultan-ws udp-custom 2>/dev/null || true
@@ -1555,15 +1563,22 @@ if [ "$CONFIRM" = "YES" ]; then
 else
     echo "Cancelled."
     pause
-    main_menu
 fi
 }
 
 main_menu
 PANEL
 
-chmod +x /usr/local/bin/SULTAN
-systemctl enable ssh nginx haproxy vnstat 2>/dev/null || true
-systemctl restart ssh nginx haproxy vnstat 2>/dev/null || true
+echo "[3/4] Setting permissions..."
+chmod +x "$PANEL"
 
+echo "[4/4] Enabling base services..."
+systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
+systemctl enable nginx haproxy vnstat fail2ban 2>/dev/null || true
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+systemctl restart nginx haproxy vnstat fail2ban 2>/dev/null || true
+
+echo ""
+echo "==========================================="
 echo "Done. Type: SULTAN"
+echo "==========================================="
