@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================
-# SULTAN VIP FULL PURPLE INSTALL
+# SULTAN VIP FULL PURPLE MENU INSTALL
 # Full installer + full panel + ready SSL/TLS/SNI/WS/XHTTP
 # Same menu structure:
 # Main 1-20 + 50 + 99 + X
@@ -20,18 +20,18 @@ BASE="/etc/sultan"
 XDB="$BASE/xray"
 DB="$BASE/users.db"
 DOMAIN_FILE="$BASE/domain"
-PANEL="/usr/local/bin/SULTAN"
+PANEL="/usr/local/bin/menu"
 
 mkdir -p "$BASE" "$XDB"
 
 echo "==========================================="
-echo "        SULTAN VIP FULL PURPLE INSTALL"
+echo "        SULTAN VIP FULL PURPLE MENU INSTALL"
 echo "==========================================="
 echo "[1/4] Installing required packages..."
 apt update -y
 apt install -y curl wget nginx haproxy openssh-server python3 python3-websockify certbot python3-certbot-nginx ufw socat lsb-release bc jq uuid-runtime vnstat fail2ban openssl speedtest-cli dnsutils iproute2 tar gzip ca-certificates psmisc
 
-echo "[2/4] Writing SULTAN panel..."
+echo "[2/4] Writing menu panel..."
 
 cat > "$PANEL" <<'PANEL'
 #!/bin/bash
@@ -1793,7 +1793,7 @@ case "$b" in
 1)
 refresh_screen
 mkdir -p /root/sultan-backup
-tar -czf /root/sultan-backup/sultan-backup-$(date +%F-%H%M).tar.gz /etc/sultan /usr/local/etc/xray /usr/local/bin/SULTAN 2>/dev/null || true
+tar -czf /root/sultan-backup/sultan-backup-$(date +%F-%H%M).tar.gz /etc/sultan /usr/local/etc/xray /usr/local/bin/menu 2>/dev/null || true
 echo "Backup saved in /root/sultan-backup/"
 pause
 ;;
@@ -1883,7 +1883,7 @@ if [ "$CONFIRM" = "YES" ]; then
     rm -f /etc/systemd/system/sultan-ws.service
     rm -f /etc/systemd/system/udp-custom.service
     rm -rf /etc/sultan
-    rm -f /usr/local/bin/SULTAN
+    rm -f /usr/local/bin/menu
     systemctl daemon-reload
     echo "SULTAN removed successfully."
     exit
@@ -1916,6 +1916,6 @@ echo "You will be asked for your domain. Make sure DNS A record points to this V
 
 echo ""
 echo "==========================================="
-echo "Done. Type: SULTAN"
+echo "Done. Type: menu"
 echo "Port 443 is handled by HAProxy -> Nginx TLS."
 echo "==========================================="
