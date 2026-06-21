@@ -1,217 +1,141 @@
 #!/usr/bin/env bash
-# ==========================================================
-# SULTAN VIP - V2RAY + DNS
-# V2Ray TCP/TLS + DNS فقط
-# بدون WebSocket / بدون XHTTP
-# رقم 10 = Setting
-# لا يوجد Auto Setup عند تشغيل السكربت
-# ==========================================================
+# SULTAN VIP SERVER - V2RAY + DNS + OPTIONAL WEBSOCKET
+# GitHub-ready mini installer
+# Core: V2Ray + DNS
+# Optional: WebSocket + HAProxy 443 + Nginx 80 from Setting menu
 
 set +e
 
-APP_NAME="SULTAN VIP"
-APP_VER="V2RAY + DNS"
 BASE="/etc/sultan"
 DOMAIN_FILE="$BASE/domain"
 XDB="$BASE/xray"
-DNS_DIR="$BASE/dns"
-RECORDS_DB="$DNS_DIR/records.db"
+DNSDB="$BASE/dns/records.db"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-DNSMASQ_CONF="/etc/dnsmasq.d/sultan-v2ray-dns.conf"
+DNSCONF="/etc/dnsmasq.d/sultan-v2ray-dns.conf"
 
-VLESS_PORT="443"
-VMESS_PORT="8443"
-TROJAN_PORT="2083"
+VLESS_TCP_PORT=443
+VMESS_TCP_PORT=8443
+TROJAN_TCP_PORT=2083
 
-RED='\033[1;31m'
-GREEN='\033[1;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[1;34m'
-CYAN='\033[1;36m'
-WHITE='\033[1;37m'
-PURPLE='\033[1;35m'
-NC='\033[0m'
+VLESS_WS_PORT=10000
+VMESS_WS_PORT=10085
+TROJAN_WS_PORT=10086
 
-mkdir -p "$BASE" "$XDB" "$DNS_DIR"
-touch "$RECORDS_DB"
+VLESS_WS_PATH="/vless-ws"
+VMESS_WS_PATH="/vmess-ws"
+TROJAN_WS_PATH="/trojan-ws"
 
-pause(){ echo ""; read -rp "Press Enter..." _; }
-clearx(){ clear 2>/dev/null || true; }
+R='\033[1;31m'
+G='\033[1;32m'
+Y='\033[1;33m'
+B='\033[1;34m'
+C='\033[1;36m'
+P='\033[1;35m'
+W='\033[1;37m'
+N='\033[0m'
 
-get_ip(){
-  curl -4 -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'
+mkdir -p "$BASE" "$XDB" "$(dirname "$DNSDB")"
+touch "$DNSDB"
+
+pause(){ echo; read -rp "Enter..." _; }
+ip(){ curl -4 -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'; }
+domain(){ [ -s "$DOMAIN_FILE" ] && cat "$DOMAIN_FILE" || echo "Not Set"; }
+svc(){ systemctl is-active "$1" 2>/dev/null || echo "off"; }
+
+headx(){
+  clear 2>/dev/null
+  echo -e "${P}╔════════════════════════════════════════════╗${N}"
+  echo -e "${P}║${W}              SULTAN VIP SERVER             ${P}║${N}"
+  echo -e "${P}║${W}          V2RAY + DNS + WEBSOCKET        ${P}║${N}"
+  echo -e "${P}║${W}        DNS CORE | WS OPTIONAL | TLS     ${P}║${N}"
+  echo -e "${P}╚════════════════════════════════════════════╝${N}"
+  printf "${B}Domain${N}: ${W}%s${N}\n" "$(domain)"
+  printf "${B}IP${N}: ${W}%s${N}\n" "$(ip)"
+  printf "${B}Xray${N}: ${W}%s${N} | ${B}DNS${N}: ${W}%s${N} | ${B}HAProxy${N}: ${W}%s${N} | ${B}Nginx${N}: ${W}%s${N}\n" "$(svc xray)" "$(svc dnsmasq)" "$(svc haproxy)" "$(svc nginx)"
+  echo -e "${P}────────────────────────────────────────────${N}"
 }
 
-get_domain(){
-  if [ -s "$DOMAIN_FILE" ]; then
-    cat "$DOMAIN_FILE"
-  else
-    echo "Not Set"
-  fi
-}
-
-svc(){
-  systemctl is-active "$1" 2>/dev/null || echo "inactive"
-}
-
-box(){
-  printf "${BLUE}%-18s${NC}: ${WHITE}%s${NC}\n" "$1" "$2"
-}
-
-header(){
-  clearx
-  DOMAIN="$(get_domain)"
-  IP="$(get_ip)"
-  echo -e "${PURPLE}╔════════════════════════════════════════════════════╗${NC}"
-  echo -e "${PURPLE}║${WHITE}                    SULTAN VIP                     ${PURPLE}║${NC}"
-  echo -e "${PURPLE}║${WHITE}                    V2RAY + DNS                   ${PURPLE}║${NC}"
-  echo -e "${PURPLE}║${WHITE}               TCP/TLS | DNS | XRAY               ${PURPLE}║${NC}"
-  echo -e "${PURPLE}╚════════════════════════════════════════════════════╝${NC}"
-  box "Domain" "$DOMAIN"
-  box "Server IP" "$IP"
-  box "Xray" "$(svc xray)"
-  box "DNS" "$(svc dnsmasq)"
-  box "Nginx 80" "$(svc nginx)"
-  box "Port 443" "$(ss -tulpn 2>/dev/null | grep -q ':443 ' && echo OPEN || echo CLOSED)"
-  box "Port 53" "$(ss -tulpn 2>/dev/null | grep -q ':53 ' && echo OPEN || echo CLOSED)"
-  echo -e "${PURPLE}────────────────────────────────────────────────────${NC}"
-}
-
-install_menu_command(){
+install_menu_cmd(){
   cp "$0" /usr/local/bin/menu 2>/dev/null || true
   chmod +x /usr/local/bin/menu 2>/dev/null || true
 }
 
-install_base(){
-  header
-  echo -e "${YELLOW}Installing base packages...${NC}"
+install_deps(){
+  headx
+  echo -e "${Y}Installing packages...${N}"
   apt update -y
-  apt install -y curl wget socat cron jq uuid-runtime openssl ca-certificates \
-    nginx openssh-server dnsmasq dnsutils ufw psmisc iproute2 net-tools lsof \
-    qrencode unzip certbot
-  systemctl enable nginx dnsmasq ssh 2>/dev/null || true
-  echo -e "${GREEN}Base packages installed.${NC}"
+  apt install -y curl wget unzip jq uuid-runtime openssl ca-certificates certbot \
+    dnsmasq dnsutils nginx haproxy ufw psmisc iproute2 lsof
+  systemctl enable dnsmasq nginx 2>/dev/null || true
+  echo -e "${G}Packages installed.${N}"
   pause
 }
 
 install_xray(){
-  header
-  echo -e "${YELLOW}Installing / repairing Xray core...${NC}"
+  headx
+  echo -e "${Y}Installing Xray...${N}"
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-  mkdir -p /usr/local/etc/xray "$XDB"
   systemctl enable xray 2>/dev/null || true
-  echo -e "${GREEN}Xray installed.${NC}"
+  echo -e "${G}Xray installed.${N}"
   pause
 }
 
 set_domain(){
-  header
-  read -rp "Enter domain: " D
-  [ -z "$D" ] && echo -e "${RED}Empty domain.${NC}" && pause && return
-  echo "$D" > "$DOMAIN_FILE"
-  echo -e "${GREEN}Domain saved: $D${NC}"
+  headx
+  read -rp "Domain: " d
+  [ -z "$d" ] && return
+  echo "$d" > "$DOMAIN_FILE"
+  echo -e "${G}Saved: $d${N}"
   pause
 }
 
-issue_ssl(){
-  header
-  D="$(get_domain)"
-  [ "$D" = "Not Set" ] && echo "Set domain first." && pause && return
-
-  systemctl stop nginx xray haproxy 2>/dev/null || true
+ssl_issue(){
+  headx
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && echo "Set domain first." && pause && return
+  systemctl stop nginx haproxy xray 2>/dev/null || true
   fuser -k 80/tcp 2>/dev/null || true
-
-  certbot certonly --standalone \
-    -d "$D" \
-    --cert-name "$D" \
-    --agree-tos \
-    -m "admin@$D" \
-    --non-interactive \
-    --preferred-challenges http
-
+  certbot certonly --standalone -d "$d" --cert-name "$d" --agree-tos -m "admin@$d" --non-interactive --preferred-challenges http
   systemctl restart nginx 2>/dev/null || true
-  systemctl restart xray 2>/dev/null || true
   pause
 }
 
-cert_file(){
-  D="$(get_domain)"
-  if [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ]; then
-    echo "/etc/letsencrypt/live/$D/fullchain.pem"
+cert(){
+  d="$(domain)"
+  if [ -f "/etc/letsencrypt/live/$d/fullchain.pem" ]; then
+    echo "/etc/letsencrypt/live/$d/fullchain.pem"
   else
-    echo "/etc/sultan/fallback-$D.crt"
+    echo "/etc/sultan/$d.crt"
   fi
 }
 
-key_file(){
-  D="$(get_domain)"
-  if [ -f "/etc/letsencrypt/live/$D/privkey.pem" ]; then
-    echo "/etc/letsencrypt/live/$D/privkey.pem"
+key(){
+  d="$(domain)"
+  if [ -f "/etc/letsencrypt/live/$d/privkey.pem" ]; then
+    echo "/etc/letsencrypt/live/$d/privkey.pem"
   else
-    echo "/etc/sultan/fallback-$D.key"
+    echo "/etc/sultan/$d.key"
   fi
 }
 
 ensure_cert(){
-  D="$(get_domain)"
-  [ "$D" = "Not Set" ] && D="$(get_ip)"
-  CERT="$(cert_file)"
-  KEY="$(key_file)"
-
-  if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && d="$(ip)"
+  c="$(cert)"
+  k="$(key)"
+  if [ ! -f "$c" ] || [ ! -f "$k" ]; then
     mkdir -p /etc/sultan
-    openssl req -x509 -nodes -newkey rsa:2048 \
-      -keyout "$KEY" \
-      -out "$CERT" \
-      -days 3650 \
-      -subj "/CN=$D" >/dev/null 2>&1
+    openssl req -x509 -nodes -newkey rsa:2048 -keyout "$k" -out "$c" -days 3650 -subj "/CN=$d" >/dev/null 2>&1
   fi
 }
 
-configure_nginx_80(){
-  header
-  D="$(get_domain)"
-  [ "$D" = "Not Set" ] && D="_"
+dns_apply(){
+  headx
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && d="local.sultan"
+  myip="$(ip)"
 
-  systemctl stop nginx 2>/dev/null || true
-  rm -f /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*
-
-  cat >/etc/nginx/conf.d/sultan-nginx-80.conf <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $D;
-
-    location / {
-        return 200 "SULTAN V2RAY DNS OK";
-        add_header Content-Type text/plain;
-    }
-
-    location /ok {
-        return 200 "SULTAN 200 OK";
-        add_header Content-Type text/plain;
-    }
-
-    location /block {
-        return 403 "SULTAN 403";
-        add_header Content-Type text/plain;
-    }
-}
-EOF
-
-  nginx -t && systemctl enable nginx >/dev/null 2>&1 && systemctl restart nginx
-  echo -e "${GREEN}Nginx configured on port 80 only.${NC}"
-  pause
-}
-
-configure_dns(){
-  header
-  D="$(get_domain)"
-  IP="$(get_ip)"
-  [ "$D" = "Not Set" ] && D="local.sultan"
-
-  cat >"$DNSMASQ_CONF" <<EOF
-# SULTAN VIP V2RAY + DNS
+  cat >"$DNSCONF" <<EOF
 port=53
 domain-needed
 bogus-priv
@@ -220,512 +144,449 @@ server=1.1.1.1
 server=8.8.8.8
 server=9.9.9.9
 cache-size=10000
-log-queries
-log-facility=/var/log/sultan-dns.log
-
-# Main domain
-address=/$D/$IP
+address=/$d/$myip
 EOF
 
-  while IFS='|' read -r TYPE NAME VALUE; do
-    [ -z "$TYPE" ] && continue
-    [ -z "$NAME" ] && continue
-    [ -z "$VALUE" ] && continue
-
-    if [ "$NAME" = "@" ]; then
-      FQDN="$D"
-    elif [ "$NAME" = "*" ]; then
-      FQDN="$D"
-    elif echo "$NAME" | grep -q '\.'; then
-      FQDN="$NAME"
+  while IFS='|' read -r type name val; do
+    [ -z "$type" ] && continue
+    if [ "$name" = "@" ]; then
+      fqdn="$d"
+    elif [ "$name" = "*" ]; then
+      fqdn="$d"
+    elif echo "$name" | grep -q '\.'; then
+      fqdn="$name"
     else
-      FQDN="$NAME.$D"
+      fqdn="$name.$d"
     fi
 
-    case "$TYPE" in
-      A)
-        if [ "$NAME" = "*" ]; then
-          echo "address=/$D/$VALUE" >> "$DNSMASQ_CONF"
-        else
-          echo "address=/$FQDN/$VALUE" >> "$DNSMASQ_CONF"
-        fi
-      ;;
-      CNAME)
-        echo "cname=$FQDN,$VALUE" >> "$DNSMASQ_CONF"
-      ;;
-    esac
-  done < "$RECORDS_DB"
+    if [ "$type" = "A" ]; then
+      [ "$name" = "*" ] && echo "address=/$d/$val" >>"$DNSCONF" || echo "address=/$fqdn/$val" >>"$DNSCONF"
+    fi
+
+    if [ "$type" = "CNAME" ]; then
+      echo "cname=$fqdn,$val" >>"$DNSCONF"
+    fi
+  done < "$DNSDB"
 
   systemctl stop systemd-resolved 2>/dev/null || true
   systemctl disable systemd-resolved 2>/dev/null || true
-
-  rm -f /etc/resolv.conf
-  cat >/etc/resolv.conf <<EOF
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
+  echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" >/etc/resolv.conf
 
   fuser -k 53/tcp 2>/dev/null || true
   fuser -k 53/udp 2>/dev/null || true
 
-  dnsmasq --test --conf-file="$DNSMASQ_CONF"
-  systemctl enable dnsmasq 2>/dev/null || true
-  systemctl restart dnsmasq
+  dnsmasq --test --conf-file="$DNSCONF" && systemctl enable dnsmasq >/dev/null 2>&1 && systemctl restart dnsmasq
 
   ufw allow 53/tcp 2>/dev/null || true
   ufw allow 53/udp 2>/dev/null || true
 
-  echo -e "${GREEN}DNS configured on port 53.${NC}"
+  echo -e "${G}DNS applied on port 53.${N}"
   pause
 }
 
-add_dns_record(){
-  header
-  echo "[1] A Record"
-  echo "[2] CNAME Record"
-  echo "[3] Wildcard A Record"
-  read -rp "Select: " T
-  case "$T" in
-    1)
-      TYPE="A"
-      read -rp "Name, example @ or app: " NAME
-      read -rp "IPv4: " VALUE
-    ;;
-    2)
-      TYPE="CNAME"
-      read -rp "Name, example www: " NAME
-      read -rp "Target domain: " VALUE
-    ;;
-    3)
-      TYPE="A"
-      NAME="*"
-      read -rp "Wildcard IPv4: " VALUE
-    ;;
-    *)
-      return
-    ;;
+dns_record(){
+  headx
+  echo "[1] A"
+  echo "[2] CNAME"
+  echo "[3] Wildcard A"
+  read -rp "Type: " t
+  case "$t" in
+    1) type=A; read -rp "Name (@/sub): " name; read -rp "IP: " val ;;
+    2) type=CNAME; read -rp "Name: " name; read -rp "Target: " val ;;
+    3) type=A; name="*"; read -rp "IP: " val ;;
+    *) return ;;
   esac
-  [ -z "$NAME" ] && pause && return
-  [ -z "$VALUE" ] && pause && return
-  echo "$TYPE|$NAME|$VALUE" >> "$RECORDS_DB"
-  echo -e "${GREEN}DNS record added.${NC}"
-  pause
+  [ -n "$name" ] && [ -n "$val" ] && echo "$type|$name|$val" >> "$DNSDB"
+  dns_apply
 }
 
-list_dns_records(){
-  header
-  echo -e "${CYAN}DNS Records:${NC}"
-  if [ ! -s "$RECORDS_DB" ]; then
-    echo "No records."
-  else
-    nl -ba "$RECORDS_DB"
-  fi
-  pause
-}
-
-delete_dns_record(){
-  header
-  [ ! -s "$RECORDS_DB" ] && echo "No records." && pause && return
-  nl -ba "$RECORDS_DB"
-  read -rp "Line number: " N
-  [ -z "$N" ] && return
-  sed -i "${N}d" "$RECORDS_DB"
-  echo -e "${GREEN}Deleted.${NC}"
-  pause
-}
-
-read_clients_json(){
-  python3 - <<PY
+clients_json(){
+python3 - <<PY
 import json, os
 xdb="$XDB"
-
-def read_db(proto):
-    p=os.path.join(xdb, proto+".db")
-    arr=[]
-    if not os.path.exists(p):
-        return arr
-    for line in open(p, errors="ignore"):
+def rd(p):
+    f=os.path.join(xdb,p+".db")
+    a=[]
+    if not os.path.exists(f):
+        return a
+    for line in open(f,errors="ignore"):
         x=line.strip().split("|")
-        if len(x)<2: continue
-        u=x[0].strip()
-        v=x[1].strip()
-        if proto=="vless":
-            arr.append({"id":v,"email":u})
-        elif proto=="vmess":
-            arr.append({"id":v,"alterId":0,"email":u})
-        elif proto=="trojan":
-            arr.append({"password":v,"email":u})
-    return arr
-
-print(json.dumps({
-  "vless": read_db("vless"),
-  "vmess": read_db("vmess"),
-  "trojan": read_db("trojan")
-}))
+        if len(x)<2:
+            continue
+        u,v=x[0],x[1]
+        if p=="vless":
+            a.append({"id":v,"email":u})
+        elif p=="vmess":
+            a.append({"id":v,"alterId":0,"email":u})
+        elif p=="trojan":
+            a.append({"password":v,"email":u})
+    return a
+print(json.dumps({"vless":rd("vless"),"vmess":rd("vmess"),"trojan":rd("trojan")}))
 PY
 }
 
-configure_xray_v2ray_dns(){
-  header
-  D="$(get_domain)"
-  [ "$D" = "Not Set" ] && echo "Set domain first." && pause && return
-
-  command -v xray >/dev/null 2>&1 || [ -x /usr/local/bin/xray ] || {
-    echo "Xray not installed. Run Setting > Install Xray first."
-    pause
-    return
-  }
+xray_tcp_apply(){
+  headx
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && echo "Set domain first." && pause && return
+  command -v xray >/dev/null 2>&1 || { echo "Install Xray first."; pause; return; }
 
   ensure_cert
-  CERT="$(cert_file)"
-  KEY="$(key_file)"
-
-  mkdir -p /usr/local/etc/xray "$XDB"
-
-  CLIENTS="$(read_clients_json)"
-  VLESS_CLIENTS="$(echo "$CLIENTS" | jq -c '.vless')"
-  VMESS_CLIENTS="$(echo "$CLIENTS" | jq -c '.vmess')"
-  TROJAN_CLIENTS="$(echo "$CLIENTS" | jq -c '.trojan')"
-
-  cat >"$XRAY_CONFIG" <<EOF
-{
-  "log": {"loglevel": "warning"},
-  "dns": {
-    "servers": [
-      "https+local://1.1.1.1/dns-query",
-      "https+local://8.8.8.8/dns-query",
-      "1.1.1.1",
-      "8.8.8.8",
-      "localhost"
-    ],
-    "queryStrategy": "UseIP"
-  },
-  "inbounds": [
-    {
-      "tag": "vless-tcp-tls",
-      "listen": "0.0.0.0",
-      "port": $VLESS_PORT,
-      "protocol": "vless",
-      "settings": {"clients": $VLESS_CLIENTS, "decryption": "none"},
-      "streamSettings": {
-        "network": "tcp",
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "$D",
-          "certificates": [{"certificateFile": "$CERT", "keyFile": "$KEY"}],
-          "alpn": ["http/1.1"]
-        }
-      }
-    },
-    {
-      "tag": "vmess-tcp-tls",
-      "listen": "0.0.0.0",
-      "port": $VMESS_PORT,
-      "protocol": "vmess",
-      "settings": {"clients": $VMESS_CLIENTS},
-      "streamSettings": {
-        "network": "tcp",
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "$D",
-          "certificates": [{"certificateFile": "$CERT", "keyFile": "$KEY"}],
-          "alpn": ["http/1.1"]
-        }
-      }
-    },
-    {
-      "tag": "trojan-tcp-tls",
-      "listen": "0.0.0.0",
-      "port": $TROJAN_PORT,
-      "protocol": "trojan",
-      "settings": {"clients": $TROJAN_CLIENTS},
-      "streamSettings": {
-        "network": "tcp",
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "$D",
-          "certificates": [{"certificateFile": "$CERT", "keyFile": "$KEY"}],
-          "alpn": ["http/1.1"]
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},
-    {"tag":"block","protocol":"blackhole"}
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {"type":"field","outboundTag":"block","protocol":["bittorrent"]},
-      {"type":"field","outboundTag":"direct","network":"tcp,udp"}
-    ]
-  }
-}
-EOF
+  c="$(cert)"
+  k="$(key)"
+  cj="$(clients_json)"
+  vl="$(echo "$cj" | jq -c .vless)"
+  vm="$(echo "$cj" | jq -c .vmess)"
+  tr="$(echo "$cj" | jq -c .trojan)"
 
   systemctl stop haproxy 2>/dev/null || true
   systemctl disable haproxy 2>/dev/null || true
 
-  xray run -test -config "$XRAY_CONFIG" && systemctl enable xray >/dev/null 2>&1 && systemctl restart xray
-  echo -e "${GREEN}Xray V2Ray + DNS configured. No WebSocket.${NC}"
-  pause
-}
-
-create_user(){
-  header
-  PROTO="$1"
-  D="$(get_domain)"
-  [ "$D" = "Not Set" ] && echo "Set domain first." && pause && return
-
-  mkdir -p "$XDB"
-  read -rp "Username: " USER
-  [ -z "$USER" ] && echo "Empty username." && pause && return
-
-  if [ "$PROTO" = "trojan" ]; then
-    PASS="$(openssl rand -hex 8)"
-    echo "$USER|$PASS|trojan|tcp-tls|$D|$TROJAN_PORT" >> "$XDB/trojan.db"
-  else
-    UUID="$(uuidgen)"
-    echo "$USER|$UUID|$PROTO|tcp-tls|$D|$( [ "$PROTO" = "vless" ] && echo "$VLESS_PORT" || echo "$VMESS_PORT" )" >> "$XDB/$PROTO.db"
-  fi
-
-  configure_xray_v2ray_dns_quiet
-
-  header
-  echo -e "${GREEN}$PROTO user created.${NC}"
-  if [ "$PROTO" = "vless" ]; then
-    echo "vless://$UUID@$D:$VLESS_PORT?type=tcp&encryption=none&security=tls&sni=$D&fp=chrome#$USER"
-  elif [ "$PROTO" = "vmess" ]; then
-    JSON="{\"v\":\"2\",\"ps\":\"$USER\",\"add\":\"$D\",\"port\":\"$VMESS_PORT\",\"id\":\"$UUID\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"tls\",\"sni\":\"$D\"}"
-    echo "vmess://$(echo -n "$JSON" | base64 -w 0 2>/dev/null || echo -n "$JSON" | base64 | tr -d '\n')"
-  else
-    echo "trojan://$PASS@$D:$TROJAN_PORT?security=tls&sni=$D&fp=chrome#$USER"
-  fi
-  pause
-}
-
-configure_xray_v2ray_dns_quiet(){
-  D="$(get_domain)"
-  [ "$D" = "Not Set" ] && return
-  command -v xray >/dev/null 2>&1 || [ -x /usr/local/bin/xray ] || return
-  ensure_cert
-  CERT="$(cert_file)"
-  KEY="$(key_file)"
-  CLIENTS="$(read_clients_json)"
-  VLESS_CLIENTS="$(echo "$CLIENTS" | jq -c '.vless')"
-  VMESS_CLIENTS="$(echo "$CLIENTS" | jq -c '.vmess')"
-  TROJAN_CLIENTS="$(echo "$CLIENTS" | jq -c '.trojan')"
-
   mkdir -p /usr/local/etc/xray
-
   cat >"$XRAY_CONFIG" <<EOF
 {
-  "log": {"loglevel": "warning"},
-  "dns": {"servers": ["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"], "queryStrategy": "UseIP"},
-  "inbounds": [
-    {"tag":"vless-tcp-tls","listen":"0.0.0.0","port":$VLESS_PORT,"protocol":"vless","settings":{"clients":$VLESS_CLIENTS,"decryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$D","certificates":[{"certificateFile":"$CERT","keyFile":"$KEY"}],"alpn":["http/1.1"]}}},
-    {"tag":"vmess-tcp-tls","listen":"0.0.0.0","port":$VMESS_PORT,"protocol":"vmess","settings":{"clients":$VMESS_CLIENTS},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$D","certificates":[{"certificateFile":"$CERT","keyFile":"$KEY"}],"alpn":["http/1.1"]}}},
-    {"tag":"trojan-tcp-tls","listen":"0.0.0.0","port":$TROJAN_PORT,"protocol":"trojan","settings":{"clients":$TROJAN_CLIENTS},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$D","certificates":[{"certificateFile":"$CERT","keyFile":"$KEY"}],"alpn":["http/1.1"]}}}
+  "log":{"loglevel":"warning"},
+  "dns":{"servers":["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"],"queryStrategy":"UseIP"},
+  "inbounds":[
+    {"tag":"vless-tcp-tls","listen":"0.0.0.0","port":$VLESS_TCP_PORT,"protocol":"vless","settings":{"clients":$vl,"decryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$d","certificates":[{"certificateFile":"$c","keyFile":"$k"}],"alpn":["http/1.1"]}}},
+    {"tag":"vmess-tcp-tls","listen":"0.0.0.0","port":$VMESS_TCP_PORT,"protocol":"vmess","settings":{"clients":$vm},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$d","certificates":[{"certificateFile":"$c","keyFile":"$k"}],"alpn":["http/1.1"]}}},
+    {"tag":"trojan-tcp-tls","listen":"0.0.0.0","port":$TROJAN_TCP_PORT,"protocol":"trojan","settings":{"clients":$tr},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$d","certificates":[{"certificateFile":"$c","keyFile":"$k"}],"alpn":["http/1.1"]}}}
   ],
-  "outbounds": [{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},{"tag":"block","protocol":"blackhole"}],
-  "routing": {"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","outboundTag":"block","protocol":["bittorrent"]},{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}
+  "outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},{"tag":"block","protocol":"blackhole"}],
+  "routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","outboundTag":"block","protocol":["bittorrent"]}]}
 }
+EOF
+
+  xray run -test -config "$XRAY_CONFIG" && systemctl enable xray >/dev/null 2>&1 && systemctl restart xray
+  echo -e "${G}V2Ray TCP/TLS + DNS applied.${N}"
+  pause
+}
+
+xray_ws_apply(){
+  headx
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && echo "Set domain first." && pause && return
+  command -v xray >/dev/null 2>&1 || { echo "Install Xray first."; pause; return; }
+
+  cj="$(clients_json)"
+  vl="$(echo "$cj" | jq -c .vless)"
+  vm="$(echo "$cj" | jq -c .vmess)"
+  tr="$(echo "$cj" | jq -c .trojan)"
+
+  mkdir -p /usr/local/etc/xray
+  cat >"$XRAY_CONFIG" <<EOF
+{
+  "log":{"loglevel":"warning"},
+  "dns":{"servers":["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"],"queryStrategy":"UseIP"},
+  "inbounds":[
+    {"tag":"vless-ws","listen":"127.0.0.1","port":$VLESS_WS_PORT,"protocol":"vless","settings":{"clients":$vl,"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"$VLESS_WS_PATH"}}},
+    {"tag":"vmess-ws","listen":"127.0.0.1","port":$VMESS_WS_PORT,"protocol":"vmess","settings":{"clients":$vm},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"$VMESS_WS_PATH"}}},
+    {"tag":"trojan-ws","listen":"127.0.0.1","port":$TROJAN_WS_PORT,"protocol":"trojan","settings":{"clients":$tr},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"$TROJAN_WS_PATH"}}}
+  ],
+  "outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},{"tag":"block","protocol":"blackhole"}],
+  "routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","outboundTag":"block","protocol":["bittorrent"]}]}
+}
+EOF
+
+  xray run -test -config "$XRAY_CONFIG" && systemctl enable xray >/dev/null 2>&1 && systemctl restart xray
+  echo -e "${G}V2Ray WebSocket + DNS applied. Now install HAProxy/Nginx from Setting.${N}"
+  pause
+}
+
+nginx80(){
+  headx
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && d="_"
+  rm -f /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*
+  cat >/etc/nginx/conf.d/sultan-80.conf <<EOF
+server {
+ listen 80;
+ listen [::]:80;
+ server_name $d;
+ location / { return 200 "SULTAN VIP SERVER V2RAY DNS OK"; add_header Content-Type text/plain; }
+ location /ok { return 200 "SULTAN 200 OK"; add_header Content-Type text/plain; }
+ location /block { return 403 "SULTAN 403"; add_header Content-Type text/plain; }
+}
+EOF
+  nginx -t && systemctl enable nginx >/dev/null 2>&1 && systemctl restart nginx
+  echo -e "${G}Nginx 80 installed/configured.${N}"
+  pause
+}
+
+haproxy443(){
+  headx
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && echo "Set domain first." && pause && return
+
+  ensure_cert
+  c="$(cert)"
+  k="$(key)"
+  hp="/etc/haproxy/certs/$d.pem"
+  mkdir -p /etc/haproxy/certs
+  cat "$c" "$k" > "$hp"
+  chmod 600 "$hp"
+
+  cat >/etc/haproxy/haproxy.cfg <<EOF
+global
+    daemon
+    maxconn 20000
+
+defaults
+    mode http
+    option httplog
+    timeout connect 10s
+    timeout client  2h
+    timeout server  2h
+    timeout tunnel  2h
+
+frontend sultan_443_ws
+    bind *:443 ssl crt $hp alpn http/1.1
+
+    acl is_ok path /ok
+    acl is_block path /block
+    acl is_vless path_beg $VLESS_WS_PATH
+    acl is_vmess path_beg $VMESS_WS_PATH
+    acl is_trojan path_beg $TROJAN_WS_PATH
+
+    http-request return status 200 content-type text/plain lf-string "SULTAN HAPROXY 443 OK\n" if is_ok
+    http-request return status 403 content-type text/plain lf-string "SULTAN 403\n" if is_block
+
+    use_backend vless_ws_backend if is_vless
+    use_backend vmess_ws_backend if is_vmess
+    use_backend trojan_ws_backend if is_trojan
+    default_backend nginx80_backend
+
+backend vless_ws_backend
+    mode http
+    option http-server-close
+    server vless 127.0.0.1:$VLESS_WS_PORT check
+
+backend vmess_ws_backend
+    mode http
+    option http-server-close
+    server vmess 127.0.0.1:$VMESS_WS_PORT check
+
+backend trojan_ws_backend
+    mode http
+    option http-server-close
+    server trojan 127.0.0.1:$TROJAN_WS_PORT check
+
+backend nginx80_backend
+    mode http
+    option http-server-close
+    server nginx 127.0.0.1:80 check
+EOF
+
+  haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl enable haproxy >/dev/null 2>&1 && systemctl restart haproxy
+  echo -e "${G}HAProxy 443 installed/configured.${N}"
+  pause
+}
+
+add_user(){
+  headx
+  p="$1"
+  mode="$2"
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && echo "Set domain first." && pause && return
+  read -rp "Username: " u
+  [ -z "$u" ] && return
+
+  if [ "$p" = "trojan" ]; then
+    pass="$(openssl rand -hex 8)"
+    echo "$u|$pass|trojan|$mode|$d" >> "$XDB/trojan.db"
+  else
+    id="$(uuidgen)"
+    echo "$u|$id|$p|$mode|$d" >> "$XDB/$p.db"
+  fi
+
+  if [ "$mode" = "ws" ]; then
+    xray_ws_apply_quiet
+  else
+    xray_tcp_apply_quiet
+  fi
+
+  headx
+  if [ "$p" = "vless" ]; then
+    if [ "$mode" = "ws" ]; then
+      echo "vless://$id@$d:443?type=ws&encryption=none&security=tls&sni=$d&host=$d&path=%2Fvless-ws#$u"
+    else
+      echo "vless://$id@$d:$VLESS_TCP_PORT?type=tcp&encryption=none&security=tls&sni=$d&fp=chrome#$u"
+    fi
+  elif [ "$p" = "vmess" ]; then
+    if [ "$mode" = "ws" ]; then
+      j="{\"v\":\"2\",\"ps\":\"$u\",\"add\":\"$d\",\"port\":\"443\",\"id\":\"$id\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"$d\",\"path\":\"$VMESS_WS_PATH\",\"tls\":\"tls\",\"sni\":\"$d\"}"
+    else
+      j="{\"v\":\"2\",\"ps\":\"$u\",\"add\":\"$d\",\"port\":\"$VMESS_TCP_PORT\",\"id\":\"$id\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"tls\",\"sni\":\"$d\"}"
+    fi
+    echo "vmess://$(echo -n "$j" | base64 -w0 2>/dev/null || echo -n "$j" | base64 | tr -d '\n')"
+  else
+    if [ "$mode" = "ws" ]; then
+      echo "trojan://$pass@$d:443?type=ws&security=tls&sni=$d&host=$d&path=%2Ftrojan-ws#$u"
+    else
+      echo "trojan://$pass@$d:$TROJAN_TCP_PORT?security=tls&sni=$d&fp=chrome#$u"
+    fi
+  fi
+  pause
+}
+
+xray_tcp_apply_quiet(){
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && return
+  command -v xray >/dev/null 2>&1 || return
+  ensure_cert
+  c="$(cert)"
+  k="$(key)"
+  cj="$(clients_json)"
+  vl="$(echo "$cj" | jq -c .vless)"
+  vm="$(echo "$cj" | jq -c .vmess)"
+  tr="$(echo "$cj" | jq -c .trojan)"
+  cat >"$XRAY_CONFIG" <<EOF
+{"log":{"loglevel":"warning"},"dns":{"servers":["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"],"queryStrategy":"UseIP"},"inbounds":[{"tag":"vless-tcp-tls","listen":"0.0.0.0","port":$VLESS_TCP_PORT,"protocol":"vless","settings":{"clients":$vl,"decryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$d","certificates":[{"certificateFile":"$c","keyFile":"$k"}],"alpn":["http/1.1"]}}},{"tag":"vmess-tcp-tls","listen":"0.0.0.0","port":$VMESS_TCP_PORT,"protocol":"vmess","settings":{"clients":$vm},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$d","certificates":[{"certificateFile":"$c","keyFile":"$k"}],"alpn":["http/1.1"]}}},{"tag":"trojan-tcp-tls","listen":"0.0.0.0","port":$TROJAN_TCP_PORT,"protocol":"trojan","settings":{"clients":$tr},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"$d","certificates":[{"certificateFile":"$c","keyFile":"$k"}],"alpn":["http/1.1"]}}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},{"tag":"block","protocol":"blackhole"}]}
 EOF
   xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1 && systemctl restart xray >/dev/null 2>&1 || true
 }
 
-list_users(){
-  header
-  echo -e "${CYAN}VLESS:${NC}"
-  cat "$XDB/vless.db" 2>/dev/null || echo "No users"
-  echo ""
-  echo -e "${CYAN}VMESS:${NC}"
-  cat "$XDB/vmess.db" 2>/dev/null || echo "No users"
-  echo ""
-  echo -e "${CYAN}TROJAN:${NC}"
-  cat "$XDB/trojan.db" 2>/dev/null || echo "No users"
+xray_ws_apply_quiet(){
+  d="$(domain)"
+  [ "$d" = "Not Set" ] && return
+  command -v xray >/dev/null 2>&1 || return
+  cj="$(clients_json)"
+  vl="$(echo "$cj" | jq -c .vless)"
+  vm="$(echo "$cj" | jq -c .vmess)"
+  tr="$(echo "$cj" | jq -c .trojan)"
+  cat >"$XRAY_CONFIG" <<EOF
+{"log":{"loglevel":"warning"},"dns":{"servers":["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"],"queryStrategy":"UseIP"},"inbounds":[{"tag":"vless-ws","listen":"127.0.0.1","port":$VLESS_WS_PORT,"protocol":"vless","settings":{"clients":$vl,"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"$VLESS_WS_PATH"}}},{"tag":"vmess-ws","listen":"127.0.0.1","port":$VMESS_WS_PORT,"protocol":"vmess","settings":{"clients":$vm},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"$VMESS_WS_PATH"}}},{"tag":"trojan-ws","listen":"127.0.0.1","port":$TROJAN_WS_PORT,"protocol":"trojan","settings":{"clients":$tr},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"$TROJAN_WS_PATH"}}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}},{"tag":"block","protocol":"blackhole"}]}
+EOF
+  xray run -test -config "$XRAY_CONFIG" >/dev/null 2>&1 && systemctl restart xray >/dev/null 2>&1 || true
+}
+
+users(){
+  headx
+  echo -e "${C}VLESS${N}"
+  cat "$XDB/vless.db" 2>/dev/null || true
+  echo -e "\n${C}VMESS${N}"
+  cat "$XDB/vmess.db" 2>/dev/null || true
+  echo -e "\n${C}TROJAN${N}"
+  cat "$XDB/trojan.db" 2>/dev/null || true
   pause
 }
 
-delete_user(){
-  header
-  echo "[1] VLESS"
-  echo "[2] VMESS"
-  echo "[3] TROJAN"
-  read -rp "Protocol: " P
-  case "$P" in
-    1) DB="$XDB/vless.db" ;;
-    2) DB="$XDB/vmess.db" ;;
-    3) DB="$XDB/trojan.db" ;;
-    *) return ;;
-  esac
-  [ ! -f "$DB" ] && echo "No database." && pause && return
-  nl -ba "$DB"
-  read -rp "Line number: " N
-  [ -z "$N" ] && return
-  sed -i "${N}d" "$DB"
-  configure_xray_v2ray_dns_quiet
-  echo -e "${GREEN}Deleted.${NC}"
-  pause
-}
-
-show_links_info(){
-  header
-  D="$(get_domain)"
-  echo "VLESS TCP/TLS  : $D:$VLESS_PORT"
-  echo "VMESS TCP/TLS  : $D:$VMESS_PORT"
-  echo "TROJAN TCP/TLS : $D:$TROJAN_PORT"
-  echo "DNS Server     : $(get_ip):53"
-  echo ""
-  echo "لا يوجد WebSocket ولا Path."
-  pause
-}
-
-open_ports(){
-  header
-  ufw allow 22/tcp 2>/dev/null || true
+ports(){
   ufw allow 80/tcp 2>/dev/null || true
-  ufw allow "$VLESS_PORT/tcp" 2>/dev/null || true
-  ufw allow "$VMESS_PORT/tcp" 2>/dev/null || true
-  ufw allow "$TROJAN_PORT/tcp" 2>/dev/null || true
+  ufw allow 443/tcp 2>/dev/null || true
+  ufw allow 8443/tcp 2>/dev/null || true
+  ufw allow 2083/tcp 2>/dev/null || true
   ufw allow 53/tcp 2>/dev/null || true
   ufw allow 53/udp 2>/dev/null || true
-  echo -e "${GREEN}Ports opened.${NC}"
+  echo -e "${G}Ports opened.${N}"
   pause
 }
 
-check_all(){
-  header
-  echo -e "${CYAN}=== SERVICES ===${NC}"
-  echo "xray    : $(svc xray)"
-  echo "dnsmasq : $(svc dnsmasq)"
-  echo "nginx   : $(svc nginx)"
-  echo ""
-  echo -e "${CYAN}=== PORTS ===${NC}"
-  ss -tulpn | grep -E ':53|:80|:443|:8443|:2083' || true
-  echo ""
-  echo -e "${CYAN}=== DNS TEST ===${NC}"
-  D="$(get_domain)"
-  [ "$D" != "Not Set" ] && dig @127.0.0.1 "$D" +short 2>/dev/null || true
-  echo ""
-  echo -e "${CYAN}=== XRAY CONFIG TEST ===${NC}"
-  command -v xray >/dev/null 2>&1 && xray run -test -config "$XRAY_CONFIG" 2>&1 | tail -n 5 || true
+check(){
+  headx
+  echo "SERVICES:"
+  echo "xray=$(svc xray) dns=$(svc dnsmasq) haproxy=$(svc haproxy) nginx=$(svc nginx)"
+  echo
+  echo "PORTS:"
+  ss -tulpn | grep -E ':53|:80|:443|:8443|:2083|:10000|:10085|:10086' || true
+  echo
+  echo "DNS TEST:"
+  [ "$(domain)" != "Not Set" ] && dig @127.0.0.1 "$(domain)" +short || true
   pause
 }
 
-auto_fix_v2ray_dns(){
-  header
-  echo -e "${YELLOW}Auto Fix V2Ray + DNS...${NC}"
-  apt update -y
-  apt install -y curl wget socat cron jq uuid-runtime openssl ca-certificates \
-    nginx openssh-server dnsmasq dnsutils ufw psmisc iproute2 net-tools lsof \
-    qrencode unzip certbot
-
+autofix_core(){
+  install_deps
   command -v xray >/dev/null 2>&1 || bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-
-  configure_dns
-  configure_nginx_80
-  configure_xray_v2ray_dns
-  open_ports
+  dns_apply
+  nginx80
+  xray_tcp_apply
+  ports
+  check
 }
 
-setting_menu(){
+autofix_ws(){
+  install_deps
+  command -v xray >/dev/null 2>&1 || bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  dns_apply
+  nginx80
+  xray_ws_apply
+  haproxy443
+  ports
+  check
+}
+
+settings(){
   while true; do
-    header
-    echo -e "${BLUE}[1]${NC} Install Base Packages"
-    echo -e "${BLUE}[2]${NC} Install / Repair Xray"
-    echo -e "${BLUE}[3]${NC} Set / Change Domain"
-    echo -e "${BLUE}[4]${NC} Issue / Renew SSL"
-    echo -e "${BLUE}[5]${NC} Configure DNS"
-    echo -e "${BLUE}[6]${NC} Configure Nginx 80"
-    echo -e "${BLUE}[7]${NC} Configure Xray V2Ray + DNS"
-    echo -e "${BLUE}[8]${NC} Open Firewall Ports"
-    echo -e "${BLUE}[9]${NC} Check All"
-    echo -e "${BLUE}[10]${NC} Auto Fix V2Ray + DNS"
-    echo -e "${BLUE}[0]${NC} Back"
-    echo -e "${PURPLE}────────────────────────────────────────────────────${NC}"
-    read -rp "Select: " S
-    case "$S" in
-      1) install_base ;;
+    headx
+    echo -e "${B}[1]${N} Install Packages"
+    echo -e "${B}[2]${N} Install Xray"
+    echo -e "${B}[3]${N} Set Domain"
+    echo -e "${B}[4]${N} SSL"
+    echo -e "${B}[5]${N} DNS Apply"
+    echo -e "${B}[6]${N} Xray TCP/TLS Core"
+    echo -e "${B}[7]${N} Xray WebSocket"
+    echo -e "${B}[8]${N} Install/Configure Nginx 80"
+    echo -e "${B}[9]${N} Install/Configure HAProxy 443"
+    echo -e "${B}[10]${N} Open Ports"
+    echo -e "${B}[11]${N} Check"
+    echo -e "${B}[12]${N} Auto Fix Core DNS+V2Ray"
+    echo -e "${B}[13]${N} Auto Fix WebSocket + HAProxy/Nginx"
+    echo -e "${B}[0]${N} Back"
+    read -rp "Select: " s
+    case "$s" in
+      1) install_deps ;;
       2) install_xray ;;
       3) set_domain ;;
-      4) issue_ssl ;;
-      5) configure_dns ;;
-      6) configure_nginx_80 ;;
-      7) configure_xray_v2ray_dns ;;
-      8) open_ports ;;
-      9) check_all ;;
-      10) auto_fix_v2ray_dns ;;
+      4) ssl_issue ;;
+      5) dns_apply ;;
+      6) xray_tcp_apply ;;
+      7) xray_ws_apply ;;
+      8) nginx80 ;;
+      9) haproxy443 ;;
+      10) ports ;;
+      11) check ;;
+      12) autofix_core ;;
+      13) autofix_ws ;;
       0) return ;;
-      *) ;;
     esac
   done
 }
 
-dns_menu(){
+menu(){
   while true; do
-    header
-    echo -e "${BLUE}[1]${NC} Add DNS Record"
-    echo -e "${BLUE}[2]${NC} List DNS Records"
-    echo -e "${BLUE}[3]${NC} Delete DNS Record"
-    echo -e "${BLUE}[4]${NC} Apply DNS Config"
-    echo -e "${BLUE}[0]${NC} Back"
-    echo -e "${PURPLE}────────────────────────────────────────────────────${NC}"
-    read -rp "Select: " D
-    case "$D" in
-      1) add_dns_record ;;
-      2) list_dns_records ;;
-      3) delete_dns_record ;;
-      4) configure_dns ;;
-      0) return ;;
-      *) ;;
-    esac
-  done
-}
-
-main_menu(){
-  while true; do
-    header
-    echo -e "${BLUE}[1]${NC} Create VLESS TCP/TLS"
-    echo -e "${BLUE}[2]${NC} Create VMESS TCP/TLS"
-    echo -e "${BLUE}[3]${NC} Create TROJAN TCP/TLS"
-    echo -e "${BLUE}[4]${NC} List Users"
-    echo -e "${BLUE}[5]${NC} Delete User"
-    echo -e "${BLUE}[6]${NC} DNS Manager"
-    echo -e "${BLUE}[7]${NC} Show Connection Info"
-    echo -e "${BLUE}[8]${NC} Check All"
-    echo -e "${BLUE}[9]${NC} Restart Services"
-    echo -e "${BLUE}[10]${NC} Setting"
-    echo -e "${BLUE}[0]${NC} Exit"
-    echo -e "${PURPLE}────────────────────────────────────────────────────${NC}"
-    read -rp "Select: " M
-    case "$M" in
-      1) create_user vless ;;
-      2) create_user vmess ;;
-      3) create_user trojan ;;
-      4) list_users ;;
-      5) delete_user ;;
-      6) dns_menu ;;
-      7) show_links_info ;;
-      8) check_all ;;
-      9) systemctl restart xray dnsmasq nginx 2>/dev/null || true; pause ;;
-      10) setting_menu ;;
+    headx
+    echo -e "${B}[1]${N} Create VLESS TCP/TLS"
+    echo -e "${B}[2]${N} Create VMESS TCP/TLS"
+    echo -e "${B}[3]${N} Create TROJAN TCP/TLS"
+    echo -e "${B}[4]${N} Create VLESS WebSocket"
+    echo -e "${B}[5]${N} Create VMESS WebSocket"
+    echo -e "${B}[6]${N} Create TROJAN WebSocket"
+    echo -e "${B}[7]${N} Users"
+    echo -e "${B}[8]${N} Add DNS Record"
+    echo -e "${B}[9]${N} Check"
+    echo -e "${B}[10]${N} Setting"
+    echo -e "${B}[0]${N} Exit"
+    read -rp "Select: " m
+    case "$m" in
+      1) add_user vless tcp ;;
+      2) add_user vmess tcp ;;
+      3) add_user trojan tcp ;;
+      4) add_user vless ws ;;
+      5) add_user vmess ws ;;
+      6) add_user trojan ws ;;
+      7) users ;;
+      8) dns_record ;;
+      9) check ;;
+      10) settings ;;
       0) exit 0 ;;
-      *) ;;
     esac
   done
 }
+
+install_menu_cmd
 
 case "$1" in
-  install)
-    install_menu_command
-  ;;
-  menu|"")
-    install_menu_command
-    main_menu
-  ;;
-  *)
-    main_menu
-  ;;
+  install) echo "Installed: menu" ;;
+  *) menu ;;
 esac
