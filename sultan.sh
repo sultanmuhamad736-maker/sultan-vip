@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# SULTAN VIP SERVER - V2RAY + DNS + OPTIONAL WEBSOCKET
-# GitHub-ready mini installer
+# SULTAN VIP SERVER - FULL
+# GitHub-ready full server
 # Core: V2Ray + DNS
 # Optional: WebSocket + HAProxy 443 + Nginx 80 from Setting menu
 
 set +e
+
+# GitHub linkage
+GITHUB_USER="sultanmuhamad736-maker"
+GITHUB_REPO="Sultanmaker"
+GITHUB_BRANCH="main"
+MINI_FILE="install-mini-v2.sh"
+FULL_FILE="sultan.sh"
+MINI_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${MINI_FILE}"
+FULL_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${FULL_FILE}"
+
 
 BASE="/etc/sultan"
 DOMAIN_FILE="$BASE/domain"
@@ -585,6 +595,21 @@ menu(){
 }
 
 install_menu_cmd
+
+
+show_github_linked_files(){
+  echo "=================================================="
+  echo "        SULTAN VIP GITHUB LINK"
+  echo "=================================================="
+  echo "Mini file : ${MINI_FILE}"
+  echo "Full file : ${FULL_FILE}"
+  echo "Mini URL  : ${MINI_URL}"
+  echo "Full URL  : ${FULL_URL}"
+  echo ""
+  echo "Run command:"
+  echo "bash <(curl -Ls ${MINI_URL})"
+  echo "=================================================="
+}
 
 case "$1" in
   install) echo "Installed: menu" ;;
