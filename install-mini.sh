@@ -1,1 +1,0 @@
- /tmp/sultan-vip.sh
