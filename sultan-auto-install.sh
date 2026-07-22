@@ -2,11 +2,19 @@
 # ==========================================================
 # SULTAN VIP AUTO INSTALL — NO PANEL / NO MENU
 # نفس التثبيت التلقائي الموجود في السكربت الأصلي
-# تم حذف واجهة اللوحة والقوائم فقط
+# الإضافات المطلوبة فقط: HTTP 200 tunnel + auto-repair + UDPGW
 # ==========================================================
+
+# Sourcing this installer would apply `set -e` to the parent shell and may
+# close the current VPS session. It must run as its own Bash process.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  echo "Do not use source. Run: bash ${BASH_SOURCE[0]} your-domain.com"
+  return 1
+fi
 
 set -e
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_SUSPEND=1
 
 if [ "$(id -u)" != "0" ]; then
   echo "Run as root."
@@ -18,6 +26,8 @@ XDB="$BASE/xray"
 DB="$BASE/users.db"
 DOMAIN_FILE="$BASE/domain"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+HTTP200_PORT=8080
+UDPGW_VERSION="1.999.130"
 
 mkdir -p "$BASE" "$XDB"
 
@@ -57,6 +67,87 @@ core_status(){
         echo READY
     else
         echo "NEEDS CHECK"
+    fi
+}
+
+current_sshd_pid(){
+    local P="${PPID:-0}" C NEXT I
+    for I in {1..40}; do
+        [[ "$P" =~ ^[0-9]+$ ]] || return 1
+        [ "$P" -gt 1 ] || return 1
+        C="$(cat "/proc/$P/comm" 2>/dev/null || true)"
+        if [ "$C" = "sshd" ]; then
+            echo "$P"
+            return 0
+        fi
+        NEXT="$(awk '{print $4}' "/proc/$P/stat" 2>/dev/null || true)"
+        [ -n "$NEXT" ] && [ "$NEXT" != "$P" ] || return 1
+        P="$NEXT"
+    done
+    return 1
+}
+
+current_session_via_tunnel(){
+    local REMOTE="${SSH_CONNECTION%% *}"
+    case "$REMOTE" in
+        127.0.0.1|::1|localhost) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+defer_command_until_logout(){
+    local NAME="$1" CMD="$2" PID UNIT
+    PID="$(current_sshd_pid || true)"
+    [[ "$PID" =~ ^[0-9]+$ ]] || return 1
+    UNIT="sultan-${NAME}-after-ssh-${PID}"
+
+    # Do not schedule the same deferred action twice during one installation.
+    if systemctl cat "$UNIT.service" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    systemd-run --quiet --collect --unit="$UNIT" /bin/bash -c \
+        "while kill -0 $PID 2>/dev/null; do sleep 3; done; $CMD" >/dev/null 2>&1
+}
+
+safe_reload_ssh(){
+    if ! sshd -t; then
+        echo "SSH configuration test failed; reload skipped."
+        return 1
+    fi
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+}
+
+activate_sultan_ws_safely(){
+    systemctl enable sultan-ws >/dev/null 2>&1 || true
+    if current_session_via_tunnel; then
+        defer_command_until_logout "ws-restart" "systemctl restart sultan-ws" || true
+        echo "Current SSH session uses the tunnel; Sultan-WS restart is deferred until logout."
+    else
+        systemctl restart sultan-ws
+    fi
+}
+
+activate_proxy_stack_safely(){
+    nginx -t
+    haproxy -c -f /etc/haproxy/haproxy.cfg
+    systemctl enable nginx haproxy >/dev/null 2>&1 || true
+
+    if current_session_via_tunnel; then
+        defer_command_until_logout "proxy-reload" \
+            "nginx -t && systemctl reload nginx; haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl reload haproxy" || true
+        echo "Current SSH session uses the tunnel; proxy reload is deferred until logout."
+    else
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            systemctl reload nginx || systemctl restart nginx
+        else
+            systemctl restart nginx
+        fi
+        if systemctl is-active --quiet haproxy 2>/dev/null; then
+            systemctl reload haproxy || systemctl restart haproxy
+        else
+            systemctl restart haproxy
+        fi
     fi
 }
 
@@ -109,70 +200,163 @@ key_file_for_domain(){
 install_sultan_ws_core(){
 cat >/usr/local/bin/sultan-ssh-ws <<'PYWS'
 #!/usr/bin/env python3
-import asyncio, base64, hashlib
+import asyncio
+import base64
+import hashlib
+import os
 
-async def forward(r, w):
+LISTEN_HOST = os.environ.get("SULTAN_HTTP_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("SULTAN_HTTP_PORT", "8080"))
+SSH_HOST = os.environ.get("SULTAN_SSH_HOST", "127.0.0.1")
+SSH_PORT = int(os.environ.get("SULTAN_SSH_PORT", "22"))
+MAX_HEADER = 65536
+MAX_CONNECTIONS = 256
+slots = asyncio.Semaphore(MAX_CONNECTIONS)
+
+async def forward(reader, writer):
     try:
         while True:
-            data = await r.read(8192)
+            data = await reader.read(16384)
             if not data:
                 break
-            w.write(data)
-            await w.drain()
-    except Exception:
+            writer.write(data)
+            await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionError, OSError):
         pass
-    try:
-        w.close()
-    except Exception:
-        pass
-
-async def handle(cr, cw):
-    try:
-        header = await cr.readuntil(b"\r\n\r\n")
-        text = header.decode(errors="ignore")
-        key = ""
-        for line in text.split("\r\n"):
-            if line.lower().startswith("sec-websocket-key:"):
-                key = line.split(":", 1)[1].strip()
-        if key:
-            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-            cw.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
-        else:
-            cw.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-        await cw.drain()
-        sr, sw = await asyncio.open_connection("127.0.0.1", 22)
-        await asyncio.gather(forward(cr, sw), forward(sr, cw))
-    except Exception:
+    finally:
         try:
-            cw.close()
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+def parse_request(header):
+    lines = header.decode("latin1", errors="replace").split("\r\n")
+    request = lines[0].split()
+    if len(request) < 2:
+        raise ValueError("invalid request")
+    headers = {}
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    return request[0].upper(), request[1], headers
+
+async def handle(client_reader, client_writer):
+    ssh_writer = None
+    try:
+        async with slots:
+            header = await asyncio.wait_for(
+                client_reader.readuntil(b"\r\n\r\n"), timeout=8
+            )
+            if len(header) > MAX_HEADER:
+                raise ValueError("header too large")
+
+            method, path, headers = parse_request(header)
+            is_websocket = (
+                headers.get("upgrade", "").lower() == "websocket"
+                and "upgrade" in headers.get("connection", "").lower()
+                and bool(headers.get("sec-websocket-key", ""))
+            )
+
+            # Connect to SSH before replying. This prevents a client from being
+            # left stuck after HTTP/1.1 200 OK when sshd is unavailable.
+            try:
+                ssh_reader, ssh_writer = await asyncio.wait_for(
+                    asyncio.open_connection(SSH_HOST, SSH_PORT), timeout=5
+                )
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                client_writer.write(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+                await client_writer.drain()
+                return
+
+            if is_websocket:
+                key = headers["sec-websocket-key"]
+                accept = base64.b64encode(
+                    hashlib.sha1(
+                        (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                    ).digest()
+                ).decode("ascii")
+                client_writer.write(
+                    (
+                        "HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                    ).encode("ascii")
+                )
+            else:
+                # Direct HTTP compatibility mode on TCP 8080. It deliberately
+                # returns the exact status requested, then keeps the same TCP
+                # connection open as a raw SSH tunnel.
+                client_writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Connection: keep-alive\r\n"
+                    b"Proxy-Agent: SULTAN-SSH-HTTP200\r\n\r\n"
+                )
+            await client_writer.drain()
+
+            await asyncio.gather(
+                forward(client_reader, ssh_writer),
+                forward(ssh_reader, client_writer),
+            )
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError, ValueError):
+        pass
+    finally:
+        if ssh_writer is not None:
+            try:
+                ssh_writer.close()
+            except Exception:
+                pass
+        try:
+            client_writer.close()
+            await client_writer.wait_closed()
         except Exception:
             pass
 
 async def main():
-    server = await asyncio.start_server(handle, "127.0.0.1", 8080)
+    server = await asyncio.start_server(
+        handle,
+        LISTEN_HOST,
+        LISTEN_PORT,
+        limit=MAX_HEADER,
+        reuse_address=True,
+    )
     async with server:
         await server.serve_forever()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
 PYWS
 
 chmod +x /usr/local/bin/sultan-ssh-ws
 cat >/etc/systemd/system/sultan-ws.service <<'EOF'
 [Unit]
-Description=SULTAN SSH WebSocket Ready
-After=network.target
+Description=SULTAN SSH WebSocket and HTTP 200 tunnel
+After=network.target ssh.service
+Wants=ssh.service
+StartLimitIntervalSec=0
 
 [Service]
+Environment=SULTAN_HTTP_HOST=0.0.0.0
+Environment=SULTAN_HTTP_PORT=8080
+Environment=SULTAN_SSH_HOST=127.0.0.1
+Environment=SULTAN_SSH_PORT=22
 ExecStart=/usr/local/bin/sultan-ssh-ws
 Restart=always
+RestartSec=2
 User=root
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable sultan-ws
-systemctl restart sultan-ws
+activate_sultan_ws_safely
 }
 
 write_ready_xray_config(){
@@ -190,20 +374,57 @@ EOF
     systemctl restart xray 2>/dev/null || true
 }
 
+install_badvpn_udpgw_binary(){
+    local FOUND WORKDIR ARCHIVE SRC BUILD
+
+    FOUND="$(command -v badvpn-udpgw 2>/dev/null || true)"
+    if [ -n "$FOUND" ]; then
+        [ "$FOUND" = "/usr/local/bin/badvpn-udpgw" ] || install -m 0755 "$FOUND" /usr/local/bin/badvpn-udpgw
+        return 0
+    fi
+
+    echo "Building BadVPN UDPGW ${UDPGW_VERSION}..."
+    WORKDIR="$(mktemp -d /tmp/sultan-badvpn.XXXXXX)"
+    ARCHIVE="$WORKDIR/badvpn.tar.gz"
+    curl -fL --retry 3 --connect-timeout 20 \
+        "https://github.com/ambrop72/badvpn/archive/refs/tags/${UDPGW_VERSION}.tar.gz" \
+        -o "$ARCHIVE"
+    tar -xzf "$ARCHIVE" -C "$WORKDIR"
+    SRC="$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d -name 'badvpn-*' | head -n1)"
+    [ -n "$SRC" ] || { rm -rf "$WORKDIR"; return 1; }
+    BUILD="$WORKDIR/build"
+    cmake -S "$SRC" -B "$BUILD" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DBUILD_NOTHING_BY_DEFAULT=1 \
+        -DBUILD_UDPGW=1
+    cmake --build "$BUILD" --parallel "$(nproc)"
+    install -m 0755 "$BUILD/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
+    rm -rf "$WORKDIR"
+}
+
 reinstall_udp(){
     systemctl stop udp-custom 2>/dev/null || true
     systemctl disable udp-custom 2>/dev/null || true
     rm -f /etc/systemd/system/udp-custom.service
-    apt-get update -y
-    apt-get install -y socat
+
+    install_badvpn_udpgw_binary
+
     cat >/etc/systemd/system/udp-custom.service <<'EOF'
 [Unit]
-Description=UDP Custom 7300
-After=network.target
+Description=BadVPN UDPGW for SSH game UDP
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
-ExecStart=/usr/bin/socat UDP-LISTEN:7300,fork UDP:127.0.0.1:7300
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 512 --max-connections-for-client 32
 Restart=always
+RestartSec=2
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -211,7 +432,6 @@ EOF
     systemctl daemon-reload
     systemctl enable udp-custom
     systemctl restart udp-custom
-    ufw allow 7300/udp 2>/dev/null || true
 }
 
 write_ready_nginx_haproxy(){
@@ -318,8 +538,11 @@ global
 defaults
     mode tcp
     timeout connect 10s
-    timeout client 1m
-    timeout server 1m
+    timeout client 7d
+    timeout server 7d
+    timeout tunnel 7d
+    option clitcpka
+    option srvtcpka
 
 frontend sultan_tls_443
     bind *:443
@@ -329,11 +552,115 @@ backend sultan_nginx_tls
     server nginx_tls 127.0.0.1:8443 check
 EOF
 
-    nginx -t
-    haproxy -c -f /etc/haproxy/haproxy.cfg
-    systemctl enable nginx haproxy
-    systemctl restart nginx
-    systemctl restart haproxy
+    activate_proxy_stack_safely
+}
+
+install_tunnel_autorepair(){
+    cat >/usr/local/sbin/sultan-tunnel-health <<'HEALTH'
+#!/bin/bash
+set -u
+
+probe_http200_tunnel(){
+python3 - <<'PYPROBE'
+import socket
+import sys
+
+try:
+    with socket.create_connection(("127.0.0.1", 8080), timeout=3) as sock:
+        sock.settimeout(3)
+        sock.sendall(
+            b"GET /ssh200 HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Connection: keep-alive\r\n\r\n"
+        )
+        data = bytearray()
+        while len(data) < 8192 and (b"\r\n\r\n" not in data or b"SSH-" not in data):
+            chunk = sock.recv(2048)
+            if not chunk:
+                break
+            data.extend(chunk)
+        ok = data.startswith(b"HTTP/1.1 200 OK\r\n") and b"SSH-" in data
+        sys.exit(0 if ok else 1)
+except OSError:
+    sys.exit(1)
+PYPROBE
+}
+
+ssh_active(){
+    systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null
+}
+
+restart_ssh(){
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+}
+
+if ! ssh_active; then
+    restart_ssh
+fi
+
+if ! systemctl is-active --quiet sultan-ws 2>/dev/null; then
+    systemctl restart sultan-ws 2>/dev/null || true
+fi
+
+if ! probe_http200_tunnel; then
+    logger -t sultan-tunnel-health "HTTP 200 tunnel stalled; restarting SSH and sultan-ws"
+    restart_ssh
+    systemctl restart sultan-ws 2>/dev/null || true
+    sleep 2
+    probe_http200_tunnel || {
+        logger -t sultan-tunnel-health "HTTP 200 tunnel repair failed"
+        exit 1
+    }
+fi
+
+if ! systemctl is-active --quiet udp-custom 2>/dev/null || \
+   ! ss -H -ltn 'sport = :7300' 2>/dev/null | grep -q .; then
+    systemctl restart udp-custom 2>/dev/null || true
+fi
+
+if ! systemctl is-active --quiet nginx 2>/dev/null; then
+    nginx -t >/dev/null 2>&1 && systemctl restart nginx 2>/dev/null || true
+fi
+
+if ! systemctl is-active --quiet haproxy 2>/dev/null; then
+    haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 && systemctl restart haproxy 2>/dev/null || true
+fi
+HEALTH
+    chmod 700 /usr/local/sbin/sultan-tunnel-health
+
+    cat >/etc/systemd/system/sultan-tunnel-health.service <<'EOF'
+[Unit]
+Description=SULTAN HTTP 200 and UDPGW self-repair
+After=network-online.target ssh.service sultan-ws.service udp-custom.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sultan-tunnel-health
+EOF
+
+    cat >/etc/systemd/system/sultan-tunnel-health.timer <<'EOF'
+[Unit]
+Description=SULTAN tunnel health timer
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable sultan-tunnel-health.timer >/dev/null 2>&1 || true
+    if current_session_via_tunnel; then
+        systemctl stop sultan-tunnel-health.timer 2>/dev/null || true
+        defer_command_until_logout "health-start" \
+            "systemctl start sultan-tunnel-health.timer; /usr/local/sbin/sultan-tunnel-health" || true
+        echo "Tunnel health timer will start automatically after logout."
+    else
+        systemctl start sultan-tunnel-health.timer
+    fi
 }
 
 enable_bbr(){
@@ -352,6 +679,8 @@ show_payloads(){
     box "SNI" "$D"
     box "Port TLS" "443"
     box "SSH WS Path" "/"
+    box "HTTP 200 Port" "8080 (TLS OFF)"
+    box "UDPGW" "127.0.0.1:7300 via SSH"
     box "VLESS XHTTP" "/vless-xhttp"
     box "VMESS XHTTP" "/vmess-xhttp"
     box "TROJAN XHTTP" "/trojan-xhttp"
@@ -359,6 +688,11 @@ show_payloads(){
     echo "SSH WebSocket Payload:"
     echo "GET / HTTP/1.1[crlf]Host: $D[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[crlf]Sec-WebSocket-Version: 13[crlf][crlf]"
     echo ""
+    echo "SSH HTTP 200 Payload (connect to $D:8080, SSL/TLS OFF):"
+    echo "GET /ssh200 HTTP/1.1[crlf]Host: $D[crlf]Connection: keep-alive[crlf][crlf]"
+    echo "Expected Response: HTTP/1.1 200 OK"
+    echo ""
+    echo "For game UDP, enable UDPGW in the client: 127.0.0.1:7300"
     echo "VLESS  XHTTP: $D:443  TLS ON  SNI $D  Path /vless-xhttp"
     echo "VMESS  XHTTP: $D:443  TLS ON  SNI $D  Path /vmess-xhttp"
     echo "TROJAN XHTTP: $D:443  TLS ON  SNI $D  Path /trojan-xhttp"
@@ -370,11 +704,17 @@ show_status(){
     echo "=========================================="
     printf "%-16s : [ %s ]\n" "TLS / SSL" "$(tls_status)"
     printf "%-16s : [ %s ]\n" "WebSocket" "$(svc sultan-ws)"
+    printf "%-16s : [ %s ]\n" "HTTP 200" "$(svc sultan-ws)"
     printf "%-16s : [ %s ]\n" "XHTTP" "$(svc xray)"
     printf "%-16s : [ %s ]\n" "VMESS" "$(svc xray)"
     printf "%-16s : [ %s ]\n" "VLESS" "$(svc xray)"
     printf "%-16s : [ %s ]\n" "TROJAN" "$(svc xray)"
     printf "%-16s : [ %s ]\n" "UDP Custom" "$(svc udp-custom)"
+    if current_session_via_tunnel; then
+        printf "%-16s : [ DEFERRED ]\n" "Auto Repair"
+    else
+        printf "%-16s : [ %s ]\n" "Auto Repair" "$(svc sultan-tunnel-health.timer)"
+    fi
     printf "%-16s : [ %s ]\n" "Nginx" "$(svc nginx)"
     printf "%-16s : [ %s ]\n" "HAProxy" "$(svc haproxy)"
     if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
@@ -393,8 +733,15 @@ setup_ready_ssl_ws_xhttp(){
     echo "   READY SSL/TLS + SNI + WS + XHTTP"
     echo "==================================="
 
-    local D SERVER_IP DOMAIN_IP CERTOK
+    local D SERVER_IP DOMAIN_IP CERTOK CURRENT_SSH_PORT
     D="${1:-}"
+
+    # An older health timer must not restart the tunnel while this installer
+    # is replacing its executable and unit files.
+    if current_session_via_tunnel; then
+        systemctl stop sultan-tunnel-health.timer 2>/dev/null || true
+        echo "Tunnel SSH session detected; disruptive restarts will be deferred."
+    fi
 
     if [ -z "$D" ]; then
         D="$(get_domain)"
@@ -418,32 +765,39 @@ setup_ready_ssl_ws_xhttp(){
 
     echo "[1/8] Installing required packages..."
     apt update -y
-    apt install -y curl wget nginx haproxy openssh-server python3 certbot ufw socat jq uuid-runtime psmisc openssl ca-certificates dnsutils iproute2 tar gzip lsb-release bc vnstat fail2ban speedtest-cli
+    apt install -y curl wget nginx haproxy openssh-server python3 certbot ufw socat jq uuid-runtime psmisc openssl ca-certificates dnsutils iproute2 tar gzip lsb-release bc vnstat fail2ban speedtest-cli build-essential cmake
 
     echo "[2/8] Enabling SSH, Fail2Ban, vnStat and BBR..."
     systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    safe_reload_ssh || true
     systemctl enable vnstat fail2ban 2>/dev/null || true
     systemctl restart vnstat fail2ban 2>/dev/null || true
     enable_bbr
 
     echo "[3/8] Opening firewall ports..."
+    CURRENT_SSH_PORT="${SSH_CONNECTION##* }"
+    [[ "$CURRENT_SSH_PORT" =~ ^[0-9]+$ ]] || CURRENT_SSH_PORT=22
+    ufw allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
     ufw allow 22/tcp 2>/dev/null || true
     ufw allow 80/tcp 2>/dev/null || true
     ufw allow 443/tcp 2>/dev/null || true
-    ufw allow 7300/udp 2>/dev/null || true
+    ufw allow 8080/tcp 2>/dev/null || true
     ufw --force enable 2>/dev/null || true
 
     echo "[4/8] Preparing SSL certificate..."
-    systemctl stop nginx haproxy 2>/dev/null || true
-    fuser -k 80/tcp 2>/dev/null || true
-    fuser -k 443/tcp 2>/dev/null || true
-    fuser -k 8443/tcp 2>/dev/null || true
+    if current_session_via_tunnel; then
+        echo "Keeping Nginx/HAProxy running to protect the current SSH tunnel."
+    else
+        systemctl stop nginx haproxy 2>/dev/null || true
+        fuser -k 80/tcp 2>/dev/null || true
+        fuser -k 443/tcp 2>/dev/null || true
+        fuser -k 8443/tcp 2>/dev/null || true
+    fi
 
     CERTOK=0
     if [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ]; then
         CERTOK=1
-    elif [ -n "$DOMAIN_IP" ] && [ "$SERVER_IP" = "$DOMAIN_IP" ]; then
+    elif [ -n "$DOMAIN_IP" ] && [ "$SERVER_IP" = "$DOMAIN_IP" ] && ! current_session_via_tunnel; then
         certbot certonly --standalone -d "$D" --cert-name "$D" --agree-tos -m "admin@$D" --non-interactive --preferred-challenges http && CERTOK=1 || CERTOK=0
     fi
 
@@ -452,26 +806,33 @@ setup_ready_ssl_ws_xhttp(){
         create_self_signed_cert "$D"
     fi
 
-    echo "[5/8] Installing SSH WebSocket..."
+    echo "[5/8] Installing SSH WebSocket and HTTP 200 tunnel..."
     install_sultan_ws_core
 
     echo "[6/8] Installing Xray and XHTTP configuration..."
     install_xray_core_auto
     write_ready_xray_config
 
-    echo "[7/8] Installing UDP Custom..."
+    echo "[7/8] Installing UDPGW for game UDP..."
     reinstall_udp
 
     echo "[8/8] Configuring Nginx and HAProxy..."
     write_ready_nginx_haproxy "$D"
+    install_tunnel_autorepair
 
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    safe_reload_ssh || true
     systemctl restart fail2ban 2>/dev/null || true
-    systemctl restart sultan-ws 2>/dev/null || true
+    activate_sultan_ws_safely
     systemctl restart xray 2>/dev/null || true
     systemctl restart udp-custom 2>/dev/null || true
-    systemctl restart nginx 2>/dev/null || true
-    systemctl restart haproxy 2>/dev/null || true
+    activate_proxy_stack_safely
+
+    if current_session_via_tunnel; then
+        echo "Live tunnel health check is deferred until logout to keep this VPS session connected."
+    elif ! /usr/local/sbin/sultan-tunnel-health; then
+        echo -e "${RED}HTTP 200/UDPGW automatic repair did not pass. Check: journalctl -u sultan-tunnel-health --no-pager${NC}"
+        exit 1
+    fi
 
     show_status
     show_payloads
