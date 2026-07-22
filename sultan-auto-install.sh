@@ -847,3 +847,417 @@ echo "       NO PANEL / NO MENU"
 echo "==========================================="
 
 setup_ready_ssl_ws_xhttp "${1:-}"
+
+#!/bin/bash
+# Fix Cloudflare/proxy HTTP 520 while keeping the SULTAN SSH tunnel on WS 101.
+# Scope: Sultan-WS, the Nginx TLS WebSocket route, and the tunnel health probe.
+
+set -Eeuo pipefail
+
+if [ "$(id -u)" != "0" ]; then
+    echo "Run as root: sudo bash $0"
+    exit 1
+fi
+
+WS_FILE="/usr/local/bin/sultan-ssh-ws"
+NGINX_FILE="/etc/nginx/conf.d/sultan-ready.conf"
+HEALTH_FILE="/usr/local/sbin/sultan-tunnel-health"
+HEALTH_SERVICE="/etc/systemd/system/sultan-tunnel-health.service"
+HEALTH_TIMER="sultan-tunnel-health.timer"
+
+for FILE in "$NGINX_FILE" "$HEALTH_FILE"; do
+    if [ ! -f "$FILE" ]; then
+        echo "Required file is missing: $FILE"
+        exit 1
+    fi
+done
+
+REMOTE_IP="${SSH_CONNECTION%% *}"
+VIA_TUNNEL=0
+case "$REMOTE_IP" in
+    127.0.0.1|::1|localhost) VIA_TUNNEL=1 ;;
+esac
+
+BACKUP_DIR="/etc/sultan/ws101-520-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+[ -f "$WS_FILE" ] && cp -a "$WS_FILE" "$BACKUP_DIR/sultan-ssh-ws"
+cp -a "$NGINX_FILE" "$BACKUP_DIR/sultan-ready.conf"
+cp -a "$HEALTH_FILE" "$BACKUP_DIR/sultan-tunnel-health"
+[ -f "$HEALTH_SERVICE" ] && cp -a "$HEALTH_SERVICE" "$BACKUP_DIR/sultan-tunnel-health.service"
+
+TIMER_WAS_ACTIVE=0
+if systemctl is-active --quiet "$HEALTH_TIMER" 2>/dev/null; then
+    TIMER_WAS_ACTIVE=1
+fi
+systemctl stop "$HEALTH_TIMER" 2>/dev/null || true
+
+ROLLBACK=1
+rollback_on_error(){
+    local STATUS=$?
+    if [ "$ROLLBACK" = "1" ]; then
+        [ -f "$BACKUP_DIR/sultan-ssh-ws" ] && cp -a "$BACKUP_DIR/sultan-ssh-ws" "$WS_FILE"
+        cp -a "$BACKUP_DIR/sultan-ready.conf" "$NGINX_FILE"
+        cp -a "$BACKUP_DIR/sultan-tunnel-health" "$HEALTH_FILE"
+        [ -f "$BACKUP_DIR/sultan-tunnel-health.service" ] && \
+            cp -a "$BACKUP_DIR/sultan-tunnel-health.service" "$HEALTH_SERVICE"
+        systemctl daemon-reload 2>/dev/null || true
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+        if [ "$VIA_TUNNEL" = "0" ]; then
+            systemctl restart sultan-ws 2>/dev/null || true
+        fi
+        [ "$TIMER_WAS_ACTIVE" = "1" ] && systemctl start "$HEALTH_TIMER" 2>/dev/null || true
+        echo "The 520 repair failed; the original files were restored."
+    fi
+    exit "$STATUS"
+}
+trap rollback_on_error ERR INT TERM
+
+# Keep the tunnel response on WS101 and never return HTTP 200/403/426 from the
+# Sultan-WS backend. HTTP/1.1 at the Nginx origin remains the targeted 520 fix.
+cat >"$WS_FILE" <<'PYWS'
+#!/usr/bin/env python3
+import asyncio
+import base64
+import hashlib
+import os
+
+LISTEN_HOST = os.environ.get("SULTAN_HTTP_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("SULTAN_HTTP_PORT", "8080"))
+SSH_HOST = os.environ.get("SULTAN_SSH_HOST", "127.0.0.1")
+SSH_PORT = int(os.environ.get("SULTAN_SSH_PORT", "22"))
+MAX_HEADER = 65536
+MAX_CONNECTIONS = 256
+slots = asyncio.Semaphore(MAX_CONNECTIONS)
+
+
+async def close_writer(writer):
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def forward(reader, writer):
+    try:
+        while True:
+            data = await reader.read(16384)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionError, OSError):
+        pass
+    finally:
+        await close_writer(writer)
+
+
+def parse_request(header):
+    lines = header.decode("latin1", errors="replace").split("\r\n")
+    request = lines[0].split()
+    if len(request) < 3:
+        raise ValueError("invalid request line")
+    headers = {}
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    return request[0].upper(), request[1], headers
+
+
+async def send_http_error(writer, status, extra=b""):
+    writer.write(
+        f"HTTP/1.1 {status}\r\n".encode("ascii")
+        + b"Connection: close\r\n"
+        + extra
+        + b"Content-Length: 0\r\n\r\n"
+    )
+    await writer.drain()
+
+
+async def handle(client_reader, client_writer):
+    ssh_writer = None
+    try:
+        async with slots:
+            header = await asyncio.wait_for(
+                client_reader.readuntil(b"\r\n\r\n"), timeout=10
+            )
+            if len(header) > MAX_HEADER:
+                await send_http_error(client_writer, "431 Request Header Fields Too Large")
+                return
+
+            _method, _path, headers = parse_request(header)
+            key = headers.get(
+                "sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="
+            )
+
+            try:
+                ssh_reader, ssh_writer = await asyncio.wait_for(
+                    asyncio.open_connection(SSH_HOST, SSH_PORT), timeout=5
+                )
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                await send_http_error(client_writer, "503 Service Unavailable")
+                return
+
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                ).digest()
+            ).decode("ascii")
+            client_writer.write(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode("ascii")
+            )
+            await client_writer.drain()
+
+            await asyncio.gather(
+                forward(client_reader, ssh_writer),
+                forward(ssh_reader, client_writer),
+            )
+    except (
+        asyncio.IncompleteReadError,
+        asyncio.LimitOverrunError,
+        asyncio.TimeoutError,
+        ConnectionError,
+        OSError,
+        ValueError,
+    ):
+        pass
+    finally:
+        if ssh_writer is not None:
+            await close_writer(ssh_writer)
+        await close_writer(client_writer)
+
+
+async def main():
+    server = await asyncio.start_server(
+        handle,
+        LISTEN_HOST,
+        LISTEN_PORT,
+        limit=MAX_HEADER,
+        reuse_address=True,
+    )
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+PYWS
+chmod 755 "$WS_FILE"
+
+# Keep the origin side on HTTP/1.1 for a classic WebSocket 101 handshake.
+# Only the TLS catch-all SSH/WS route is replaced; XHTTP locations stay intact.
+python3 - "$NGINX_FILE" <<'PYNGINX'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+
+def block_end(source, start):
+    opening = source.find("{", start)
+    if opening < 0:
+        raise SystemExit("Malformed Nginx block")
+    depth = 0
+    for index in range(opening, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    raise SystemExit("Unclosed Nginx block")
+
+
+tls_match = re.search(
+    r"server\s*\{\s*listen\s+127\.0\.0\.1:8443\s+ssl(?:\s+http2)?\s*;",
+    text,
+)
+if not tls_match:
+    raise SystemExit("Could not locate the Sultan TLS server block")
+
+tls_start = tls_match.start()
+tls_end = block_end(text, tls_start)
+tls = text[tls_start:tls_end]
+tls = re.sub(
+    r"listen\s+127\.0\.0\.1:8443\s+ssl(?:\s+http2)?\s*;",
+    "listen 127.0.0.1:8443 ssl;",
+    tls,
+    count=1,
+)
+tls = re.sub(r"^\s*http2\s+on\s*;\s*$", "", tls, flags=re.M)
+
+# Remove the deliberate TLS /block 403 route if an older config still has it.
+block_marker = re.search(r"\n\s{4}location\s+/block\s*\{", tls)
+if block_marker:
+    start = block_marker.start() + 1
+    end = block_end(tls, start)
+    tls = tls[:start] + tls[end:]
+
+root_match = re.search(r"\n\s{4}location\s+/\s*\{", tls)
+if not root_match:
+    raise SystemExit("Could not locate the Sultan TLS root location")
+root_start = root_match.start() + 1
+root_end = block_end(tls, root_start)
+
+new_root = '''    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Sec-WebSocket-Key $http_sec_websocket_key;
+        proxy_set_header Sec-WebSocket-Version $http_sec_websocket_version;
+        proxy_set_header Host $host;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }'''
+
+tls = tls[:root_start] + new_root + tls[root_end:]
+text = text[:tls_start] + tls + text[tls_end:]
+path.write_text(text)
+PYNGINX
+
+cat >"$HEALTH_FILE" <<'HEALTH'
+#!/bin/bash
+set -u
+
+probe_ws101_tunnel(){
+python3 - <<'PYPROBE'
+import socket
+import sys
+
+request = (
+    b"GET / HTTP/1.1\r\n"
+    b"Host: 127.0.0.1\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n"
+    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    b"Sec-WebSocket-Version: 13\r\n\r\n"
+)
+try:
+    with socket.create_connection(("127.0.0.1", 8080), timeout=3) as sock:
+        sock.settimeout(3)
+        sock.sendall(request)
+        data = bytearray()
+        while len(data) < 8192 and (b"\r\n\r\n" not in data or b"SSH-" not in data):
+            chunk = sock.recv(2048)
+            if not chunk:
+                break
+            data.extend(chunk)
+        ok = (
+            data.startswith(b"HTTP/1.1 101 Switching Protocols\r\n")
+            and b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" in data
+            and b"SSH-" in data
+        )
+        sys.exit(0 if ok else 1)
+except OSError:
+    sys.exit(1)
+PYPROBE
+}
+
+ssh_active(){
+    systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null
+}
+
+start_ssh(){
+    systemctl start ssh 2>/dev/null || systemctl start sshd 2>/dev/null || true
+}
+
+if ! ssh_active; then
+    start_ssh
+fi
+
+if ! systemctl is-active --quiet sultan-ws 2>/dev/null; then
+    systemctl restart sultan-ws 2>/dev/null || true
+fi
+
+if ! probe_ws101_tunnel; then
+    logger -t sultan-tunnel-health "WebSocket 101 tunnel failed; restarting sultan-ws"
+    systemctl restart sultan-ws 2>/dev/null || true
+    sleep 2
+    probe_ws101_tunnel || {
+        logger -t sultan-tunnel-health "WebSocket 101 repair failed"
+        exit 1
+    }
+fi
+
+if ! systemctl is-active --quiet udp-custom 2>/dev/null || \
+   ! ss -H -ltn 'sport = :7300' 2>/dev/null | grep -q .; then
+    systemctl restart udp-custom 2>/dev/null || true
+fi
+
+if ! systemctl is-active --quiet nginx 2>/dev/null; then
+    nginx -t >/dev/null 2>&1 && systemctl restart nginx 2>/dev/null || true
+fi
+
+if ! systemctl is-active --quiet haproxy 2>/dev/null; then
+    haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 && \
+        systemctl restart haproxy 2>/dev/null || true
+fi
+HEALTH
+chmod 700 "$HEALTH_FILE"
+
+if [ -f "$HEALTH_SERVICE" ]; then
+    sed -i \
+        's/^Description=.*/Description=SULTAN WebSocket 101 and UDPGW self-repair/' \
+        "$HEALTH_SERVICE"
+fi
+
+python3 -m py_compile "$WS_FILE"
+bash -n "$HEALTH_FILE"
+nginx -t
+systemctl daemon-reload
+systemctl reload nginx
+
+current_sshd_pid(){
+    local P="${PPID:-0}" C NEXT I
+    for I in {1..40}; do
+        [[ "$P" =~ ^[0-9]+$ ]] || return 1
+        [ "$P" -gt 1 ] || return 1
+        C="$(cat "/proc/$P/comm" 2>/dev/null || true)"
+        if [ "$C" = "sshd" ]; then
+            echo "$P"
+            return 0
+        fi
+        NEXT="$(awk '{print $4}' "/proc/$P/stat" 2>/dev/null || true)"
+        [ -n "$NEXT" ] && [ "$NEXT" != "$P" ] || return 1
+        P="$NEXT"
+    done
+    return 1
+}
+
+if [ "$VIA_TUNNEL" = "1" ]; then
+    SSHD_PID="$(current_sshd_pid || true)"
+    if [[ "$SSHD_PID" =~ ^[0-9]+$ ]]; then
+        UNIT="sultan-ws520-after-ssh-${SSHD_PID}"
+        systemd-run --quiet --collect --unit="$UNIT" /bin/bash -c \
+            "while kill -0 $SSHD_PID 2>/dev/null; do sleep 3; done; systemctl restart sultan-ws; systemctl start $HEALTH_TIMER; sleep 2; $HEALTH_FILE || true"
+        echo "The 520 fix is installed. It will activate after this SSH session logs out."
+    else
+        systemd-run --quiet --collect --on-active=10s \
+            --unit="sultan-ws520-delayed-$$" /bin/bash -c \
+            "systemctl restart sultan-ws; systemctl start $HEALTH_TIMER; sleep 2; $HEALTH_FILE || true"
+        echo "The 520 fix is installed. The tunnel will restart once in 10 seconds."
+    fi
+else
+    systemctl restart sultan-ws
+    systemctl start "$HEALTH_TIMER"
+    sleep 2
+    "$HEALTH_FILE"
+    echo "WS101 is active and the local health check passed."
+fi
+
+ROLLBACK=0
+trap - ERR INT TERM
+echo "Backup: $BACKUP_DIR"
