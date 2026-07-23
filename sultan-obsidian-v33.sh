@@ -68,7 +68,35 @@ normalize_limit_fields_zero(){
   mv -f "$TMP" "$FILE"
 }
 
-normalize_limit_fields_zero "$DB" 3 4 5
+# Keep SSH unlimited fields exactly like the old working build: the literal word Unlimited.
+normalize_ssh_limit_fields_unlimited(){
+  local FILE="$1" EXP_FIELD="$2" QUOTA_FIELD="$3" LOGIN_FIELD="$4" TMP
+  [ -f "$FILE" ] || return 0
+  TMP="$(mktemp "${FILE}.normalize.XXXXXX")" || return 1
+  awk -F'|' -v ef="$EXP_FIELD" -v qf="$QUOTA_FIELD" -v lf="$LOGIN_FIELD" '
+    BEGIN{OFS="|"}
+    function clean(v){
+      gsub(/\r/, "", v)
+      sub(/^[[:space:]]+/, "", v)
+      sub(/[[:space:]]+$/, "", v)
+      return v
+    }
+    function is_unlimited(v, lower){
+      lower=tolower(v)
+      return (v=="" || v ~ /^0+$/ || lower=="unlimited")
+    }
+    {
+      if(NF>=ef){$ef=clean($ef); if(is_unlimited($ef)) $ef="Unlimited"}
+      if(NF>=qf){$qf=clean($qf); if(is_unlimited($qf)) $qf="Unlimited"}
+      if(NF>=lf){$lf=clean($lf); if(is_unlimited($lf)) $lf="Unlimited"}
+      print
+    }
+  ' "$FILE" > "$TMP" || { rm -f "$TMP"; return 1; }
+  chmod 600 "$TMP"
+  mv -f "$TMP" "$FILE"
+}
+
+normalize_ssh_limit_fields_unlimited "$DB" 3 4 5
 for LEGACY_XRAY_DB in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db"; do
   [ -f "$LEGACY_XRAY_DB" ] && normalize_limit_fields_zero "$LEGACY_XRAY_DB" 7 8 9
 done
@@ -192,13 +220,13 @@ handle_existing_users_before_final(){
           OLD_LOGIN="$(printf '%s\n' "$OLD_LINE" | awk -F'|' '{print $5}')"
 
           case "$OLD_EXP" in
-            ""|0|Unlimited|unlimited|UNLIMITED) OLD_EXP="0" ;;
+            ""|0|Unlimited|unlimited|UNLIMITED) OLD_EXP="Unlimited" ;;
           esac
           case "$OLD_QUOTA" in
-            ""|0|Unlimited|unlimited|UNLIMITED) OLD_QUOTA="0" ;;
+            ""|0|Unlimited|unlimited|UNLIMITED) OLD_QUOTA="Unlimited" ;;
           esac
           case "$OLD_LOGIN" in
-            ""|0|Unlimited|unlimited|UNLIMITED) OLD_LOGIN="0" ;;
+            ""|0|Unlimited|unlimited|UNLIMITED) OLD_LOGIN="Unlimited" ;;
           esac
 
           # Preserve a stored SULTAN expiry when present. Otherwise import the
@@ -210,7 +238,7 @@ handle_existing_users_before_final(){
             if [[ "$SHADOW_EXPIRE" =~ ^[0-9]+$ ]] && [ "$SHADOW_EXPIRE" -gt 0 ]; then
               EXP="$(date -u -d "1970-01-01 +${SHADOW_EXPIRE} days" +%Y-%m-%d 2>/dev/null || echo 0)"
             else
-              EXP="0"
+              EXP="Unlimited"
             fi
           fi
 
@@ -394,7 +422,7 @@ device_id_for() {
 }
 
 device_name_guess() {
-  local IP="$1" HINT="$2" OLD_NAME RDNS
+  local IP="$1" HINT="$2" OLD_NAME
   OLD_NAME="$(awk -F'|' -v u="$USER_NAME" -v id="$DEVICE_ID" '$1==u && $2==id{print $3;exit}' "$DEVICE_DB" 2>/dev/null || true)"
   if [ -n "$OLD_NAME" ] && [ "$OLD_NAME" != "Unknown Device" ]; then
     echo "$OLD_NAME"
@@ -408,12 +436,9 @@ device_name_guess() {
     *Windows*|*windows*) echo "Windows Device"; return ;;
     *Macintosh*|*macOS*|*darwin*) echo "Mac Device"; return ;;
   esac
-  RDNS="$(getent hosts "$IP" 2>/dev/null | awk 'NR==1{print $2}')"
-  if [ -n "$RDNS" ]; then
-    echo "$(safe_value "$RDNS")"
-  else
-    echo "Unknown Device"
-  fi
+  # Never perform DNS/network lookups inside PAM. A slow resolver can hold
+  # password authentication long enough for WebSocket clients to reconnect.
+  echo "Unknown Device"
 }
 
 update_device_login() {
@@ -470,7 +495,7 @@ close_slot() {
 SSHD_PID="$(find_sshd_pid || true)"
 [ -n "$SSHD_PID" ] || exit 0
 RUNTIME_DIR="/run/sultan-login-slots"
-LOCK_FILE="/run/lock/sultan-login-limit.lock"
+LOCK_FILE="/run/lock/sultan-login-limit-${USER_NAME:-unknown}.lock"
 
 [ -z "$USER_NAME" ] && exit 0
 [ "$USER_NAME" = "root" ] && exit 0
@@ -484,7 +509,10 @@ chmod 600 "$DEVICE_DB" "$SESSION_LOG" 2>/dev/null || true
 # All checks and slot changes are serialized. This prevents two devices
 # authenticating at the same instant from both taking the same final slot.
 exec 9>"$LOCK_FILE"
-flock -x 9
+if ! flock -w 2 -x 9; then
+  logger -t sultan-login-limit "Limiter lock timeout user=$USER_NAME; allowing login"
+  exit 0
+fi
 
 USER_DIR="$RUNTIME_DIR/$USER_NAME"
 mkdir -p "$USER_DIR"
@@ -517,7 +545,7 @@ SSHD_START="$(awk '{print $22}' "/proc/$SSHD_PID/stat" 2>/dev/null || true)"
 # PAM close_session is called by the same authenticated sshd process.
 # Removing its PID file immediately frees the login slot and saves session duration.
 if [ "$PAM_ACTION" = "close_session" ]; then
-  /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 || true
+  # Quota accounting runs from systemd. Never block logout on a full scan.
   close_slot
   exit 0
 fi
@@ -615,8 +643,9 @@ cat >/etc/ssh/sshd_config.d/98-sultan-legacy-login.conf <<'EOF'
 PasswordAuthentication yes
 KbdInteractiveAuthentication yes
 PubkeyAuthentication yes
-AuthenticationMethods any
 UsePAM yes
+UseDNS no
+GSSAPIAuthentication no
 AllowTcpForwarding yes
 PermitTunnel no
 X11Forwarding no
@@ -657,14 +686,15 @@ USAGE="$DIR/usage.db"
 BLOCKED="$DIR/blocked.db"
 QUOTA_LOCKED="$DIR/quota-locked.db"
 DEVICE_USAGE="$DIR/device_usage.db"
-LOCK_FILE="/run/lock/sultan-db.lock"
+LOCK_FILE="/run/lock/sultan-quota-state.lock"
 
 mkdir -p "$DIR" /run/lock
 touch "$DB" "$USAGE" "$BLOCKED" "$QUOTA_LOCKED" "$DEVICE_USAGE"
 chmod 600 "$DB" "$USAGE" "$BLOCKED" "$QUOTA_LOCKED" "$DEVICE_USAGE"
 
 exec 9>"$LOCK_FILE"
-flock -x 9
+# Never queue overlapping full scans.
+flock -n -x 9 || exit 0
 
 valid_number() {
   case "${1:-}" in ""|*[!0-9]*) return 1 ;; *) return 0 ;; esac
@@ -987,8 +1017,8 @@ Description=SULTAN quota checker
 
 [Timer]
 OnBootSec=10s
-OnUnitActiveSec=3s
-AccuracySec=1s
+OnUnitActiveSec=10s
+AccuracySec=2s
 Persistent=true
 
 [Install]
@@ -1038,6 +1068,7 @@ chmod 700 "$BASE" "$XDB" "$BASE/limits" 2>/dev/null || true
 chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" 2>/dev/null || true
 
 DB_LOCK="/run/lock/sultan-db.lock"
+QUOTA_LOCK="/run/lock/sultan-quota-state.lock"
 mkdir -p /run/lock
 
 current_sshd_pid(){
@@ -1206,7 +1237,7 @@ usage_reset_user(){
       chmod 600 "$TMP"
       mv -f "$TMP" "$BASE/limits/quota-locked.db"
     fi
-  ) 8>"$DB_LOCK"
+  ) 8>"$QUOTA_LOCK"
 }
 
 cleanup_managed_user_records(){
@@ -1227,7 +1258,7 @@ cleanup_managed_user_records(){
     grep -vxF "$U" "$BASE/limits/quota-locked.db" > "$TMP" 2>/dev/null || true
     chmod 600 "$TMP"
     mv -f "$TMP" "$BASE/limits/quota-locked.db"
-  ) 8>"$DB_LOCK"
+  ) 8>"$QUOTA_LOCK"
 }
 
 managed_ssh_user_exists(){
@@ -2187,7 +2218,7 @@ change_selected_user_quota(){
 
   [[ "$GB" =~ ^[0-9]+$ ]] || { echo "Invalid value."; pause; return; }
   GB=$((10#$GB))
-  [ "$GB" = "0" ] && GB_TEXT="0" || GB_TEXT="${GB}GB"
+  [ "$GB" = "0" ] && GB_TEXT="Unlimited" || GB_TEXT="${GB}GB"
 
   db_update_field "$USER" 4 "$GB_TEXT" || { echo "Update failed."; pause; return; }
 
@@ -2217,7 +2248,7 @@ change_selected_user_login(){
 
   [[ "$MAXLOGIN" =~ ^[0-9]+$ ]] || { echo "Invalid value."; pause; return; }
   MAXLOGIN=$((10#$MAXLOGIN))
-  [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="0" || LOGIN_TEXT="$MAXLOGIN"
+  [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="Unlimited" || LOGIN_TEXT="$MAXLOGIN"
 
   db_update_field "$USER" 5 "$LOGIN_TEXT" || { echo "Update failed."; pause; return; }
 
@@ -2259,8 +2290,8 @@ extend_selected_user(){
   DAYS=$((10#$DAYS))
 
   if [ "$DAYS" = "0" ]; then
-    chage -d -1 -E -1 -I -1 -m 0 -M 99999 "$USER"
-    EXP="0"
+    chage -E -1 "$USER"
+    EXP="Unlimited"
   else
     EXP="$(extend_expiry_date "$USER" "$DAYS")"
     chage -E "$EXP" "$USER"
@@ -2603,7 +2634,7 @@ create_ssh_user(){
   echo "==================================="
   show_ssh_users_table
   read -p "Username: " USER
-  read -r -s -p "Password: " PASS
+  read -s -p "Password: " PASS
   echo ""
   read -p "Days (0 = Unlimited): " DAYS
   read -p "GB Limit (0 = Unlimited): " GB
@@ -2624,9 +2655,8 @@ create_ssh_user(){
   id "$USER" &>/dev/null && { echo "User already exists"; pause; return; }
   grep -q "^${USER}|" "$DB" 2>/dev/null && { echo "User already exists"; pause; return; }
 
-  # Same login method as the old working scripts: normal /bin/bash user.
-  # The plaintext password is kept in users.db because the requested legacy panel
-  # displays it. /etc/sultan remains root-only (0700/0600).
+  # Old working login method: create a normal Linux account with /bin/bash,
+  # then install its password through chpasswd.
   useradd -m -s /bin/bash "$USER" || { echo "Failed to create user"; pause; return; }
   printf '%s:%s
 ' "$USER" "$PASS" | chpasswd || {
@@ -2637,15 +2667,49 @@ create_ssh_user(){
   }
 
   if [ "$DAYS" = "0" ]; then
-    chage -d -1 -E -1 -I -1 -m 0 -M 99999 "$USER"
-    EXP="0"
+    chage -E -1 "$USER" || {
+      userdel -r "$USER" 2>/dev/null || true
+      echo "Failed to set unlimited expiry"
+      pause
+      return
+    }
+    EXP="Unlimited"
   else
     EXP="$(extend_expiry_date "$USER" "$DAYS")"
-    chage -E "$EXP" "$USER"
+    chage -E "$EXP" "$USER" || {
+      userdel -r "$USER" 2>/dev/null || true
+      echo "Failed to set expiry"
+      pause
+      return
+    }
   fi
 
-  [ "$GB" = "0" ] && GB_TEXT="0" || GB_TEXT="${GB}GB"
-  [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="0" || LOGIN_TEXT="$MAXLOGIN"
+  [ "$GB" = "0" ] && GB_TEXT="Unlimited" || GB_TEXT="${GB}GB"
+  [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="Unlimited" || LOGIN_TEXT="$MAXLOGIN"
+
+  # Clear stale state from an older account with the same name before saving.
+  cleanup_managed_user_records "$USER" 2>/dev/null || true
+  rm -rf "/run/sultan-login-slots/$USER" 2>/dev/null || true
+
+  # Verify that the system account is usable before adding it to SULTAN.
+  restore_legacy_ssh_login "$USER" || {
+    userdel -r "$USER" 2>/dev/null || true
+    echo "Failed to prepare SSH login"
+    pause
+    return
+  }
+  case "$(passwd -S "$USER" 2>/dev/null | awk '{print $2}')" in
+    P) ;;
+    *)
+      printf '%s:%s
+' "$USER" "$PASS" | chpasswd || {
+        userdel -r "$USER" 2>/dev/null || true
+        echo "Failed to activate password authentication"
+        pause
+        return
+      }
+      ;;
+  esac
 
   db_remove_user "$USER" 2>/dev/null || true
   db_add_user "$USER|$PASS|$EXP|$GB_TEXT|$LOGIN_TEXT" || {
@@ -2655,7 +2719,8 @@ create_ssh_user(){
     return
   }
 
-  quota_sync
+  # Start quota initialization asynchronously; do not delay account creation.
+  systemctl start --no-block sultan-quota.service >/dev/null 2>&1 || true
 
   refresh_screen
   echo "==================================="
@@ -2669,6 +2734,7 @@ create_ssh_user(){
   stats_small
   pause
 }
+
 
 list_ssh_users(){
   refresh_screen
@@ -2697,8 +2763,8 @@ extend_ssh_user(){
   DAYS=$((10#$DAYS))
 
   if [ "$DAYS" = "0" ]; then
-    chage -d -1 -E -1 -I -1 -m 0 -M 99999 "$USER"
-    EXP="0"
+    chage -E -1 "$USER"
+    EXP="Unlimited"
   else
     EXP="$(extend_expiry_date "$USER" "$DAYS")"
     chage -E "$EXP" "$USER"
@@ -2774,7 +2840,7 @@ change_ssh_quota(){
   [[ "$GB" =~ ^[0-9]+$ ]] || { echo "Invalid value"; pause; return; }
   GB=$((10#$GB))
 
-  [ "$GB" = "0" ] && GB_TEXT="0" || GB_TEXT="${GB}GB"
+  [ "$GB" = "0" ] && GB_TEXT="Unlimited" || GB_TEXT="${GB}GB"
 
   db_update_field "$USER" 4 "$GB_TEXT" || { echo "Update failed."; pause; return; }
 
@@ -2790,7 +2856,7 @@ change_ssh_login(){
   [[ "$MAXLOGIN" =~ ^[0-9]+$ ]] || { echo "Invalid value"; pause; return; }
   MAXLOGIN=$((10#$MAXLOGIN))
 
-  [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="0" || LOGIN_TEXT="$MAXLOGIN"
+  [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="Unlimited" || LOGIN_TEXT="$MAXLOGIN"
 
   db_update_field "$USER" 5 "$LOGIN_TEXT" || { echo "Update failed."; pause; return; }
 
@@ -5798,7 +5864,7 @@ else
 fi
 echo "Max Login 0 = Unlimited"
 echo "GB Limit  0 = Unlimited"
-echo "Quota check: every 3 seconds"
+echo "Quota check: every 10 seconds"
 echo "==========================================="
 
 return "$SULTAN_INSTALL_STATUS" 2>/dev/null || true
