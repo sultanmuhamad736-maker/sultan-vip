@@ -4974,8 +4974,7 @@ server {
     }
 
     location / {
-        return 200 "SULTAN 200 OK";
-        add_header Content-Type text/plain;
+        return 404;
     }
 }
 
@@ -5047,7 +5046,7 @@ server {
     # arbitrary old path) is forwarded to SSH. The token is injected internally,
     # so old clients do not need to know it.
     location / {
-        if (\$http_upgrade = "") { return 200 "SULTAN 200 OK"; }
+        
         proxy_pass http://sultan_ssh_ws_backend;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
