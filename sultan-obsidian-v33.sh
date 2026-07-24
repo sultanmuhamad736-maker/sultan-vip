@@ -34,9 +34,9 @@ PANEL="/usr/local/bin/menu"
 LIMIT_DIR="$BASE/limits"
 
 mkdir -p "$BASE" "$XDB" "$LIMIT_DIR"
-touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db"
+touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db"
 chmod 700 "$BASE" "$XDB" "$LIMIT_DIR"
-chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db"
+chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db"
 
 # Store unlimited quota/login limits as the literal numeric value 0.
 # This also repairs legacy Unlimited values, whitespace and CRLF endings.
@@ -258,6 +258,184 @@ handle_existing_users_before_final(){
         rm -f "$USERS_FILE"
         /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 || true
         echo "Imported existing users into SULTAN: $IMPORTED"
+        return 0
+        ;;
+
+      *)
+        echo "Please enter y or n."
+        ;;
+    esac
+  done
+}
+
+# ==========================================================
+# Existing V2Ray/Xray user preservation
+# ==========================================================
+# y deletes the existing VMess/VLESS/Trojan users and starts with fresh
+# placeholder-only inbounds. n preserves the exact UUID/password values from
+# the SULTAN databases and imports missing WebSocket users from config.json.
+xray_import_safe_name(){
+  local RAW="${1:-}" PROTO="${2:-xray}" N="${3:-1}"
+  case "$RAW" in
+    vmess-ws:*|vless-ws:*|trojan-ws:*) RAW="${RAW#*:}" ;;
+  esac
+  RAW="$(printf '%s' "$RAW" | tr -c 'A-Za-z0-9_.-' '_')"
+  RAW="${RAW:0:56}"
+  RAW="${RAW##_}"
+  RAW="${RAW%%_}"
+  [ -n "$RAW" ] || RAW="${PROTO}_${N}"
+  printf '%s\n' "$RAW"
+}
+
+handle_existing_xray_users_before_ready(){
+  local CFG="/usr/local/etc/xray/config.json" ANSWER BACKUP_DIR NOW
+  local TAG PROTO DBF LIST_FILE CONFIG_FILE COUNT=0 IMPORTED=0 DELETED=0
+  local OLD_TAG PATHX EMAIL VALUE NAME BASE_NAME SUFFIX DOMAIN CREATED
+
+  mkdir -p "$XDB"
+  touch "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db" "$XDB/usage.db"
+  chmod 600 "$XDB"/*.db 2>/dev/null || true
+
+  LIST_FILE="$(mktemp "$XDB/.existing-xray-list.XXXXXX")" || return 1
+  CONFIG_FILE="$(mktemp "$XDB/.existing-xray-config.XXXXXX")" || { rm -f "$LIST_FILE"; return 1; }
+
+  for TAG in vmess-ws vless-ws trojan-ws; do
+    DBF="$XDB/$TAG.db"
+    awk -F'|' -v t="$TAG" 'NF && $1!="" && $2!="" {print t "\t" $1 "\t" $2}' "$DBF" 2>/dev/null >> "$LIST_FILE" || true
+  done
+
+  if [ -s "$CFG" ] && jq -e '.inbounds' "$CFG" >/dev/null 2>&1; then
+    jq -r '
+      .inbounds[]? |
+      select((.protocol=="vmess" or .protocol=="vless" or .protocol=="trojan") and ((.streamSettings.network // "ws") == "ws")) |
+      .protocol as $p |
+      (.tag // ($p + "-ws")) as $tag |
+      (.streamSettings.wsSettings.path // ("/" + $p + "-ws")) as $path |
+      .settings.clients[]? |
+      select((((.email // "") | startswith("_sultan_placeholder_")) | not)) |
+      [$p, $tag, $path, (.email // ""), (.id // .password // "")] | @tsv
+    ' "$CFG" > "$CONFIG_FILE" 2>/dev/null || : > "$CONFIG_FILE"
+
+    while IFS=$'\t' read -r PROTO OLD_TAG PATHX EMAIL VALUE; do
+      [ -n "$VALUE" ] || continue
+      TAG="${PROTO}-ws"
+      printf '%s\t%s\t%s\n' "$TAG" "${EMAIL:-unnamed}" "$VALUE" >> "$LIST_FILE"
+    done < "$CONFIG_FILE"
+  fi
+
+  echo "==========================================="
+  echo "[Existing V2Ray users check]"
+  echo "VMess / VLESS / Trojan WebSocket users"
+  echo "-------------------------------------------"
+  if [ -s "$LIST_FILE" ]; then
+    awk -F'\t' '!seen[$1 FS $2 FS $3]++ {printf "%-12s %-24s %s\n", $1, $2, $3}' "$LIST_FILE"
+  else
+    echo "(no V2Ray users found)"
+  fi
+  echo "==========================================="
+  echo "y = delete all existing VMess/VLESS/Trojan users"
+  echo "n = preserve/restore users with the same UUID/password"
+
+  while true; do
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+      printf 'Delete existing V2Ray users? (y/n): ' > /dev/tty
+      IFS= read -r ANSWER < /dev/tty || ANSWER=""
+    else
+      printf 'Delete existing V2Ray users? (y/n): '
+      IFS= read -r ANSWER || ANSWER=""
+    fi
+
+    case "$ANSWER" in
+      y|Y)
+        NOW="$(date +%Y%m%d%H%M%S)"
+        BACKUP_DIR="$XDB/preinstall-backups/$NOW"
+        mkdir -p "$BACKUP_DIR"
+        chmod 700 "$XDB/preinstall-backups" "$BACKUP_DIR" 2>/dev/null || true
+        for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db" "$XDB/usage.db"; do
+          [ -f "$DBF" ] && cp -a "$DBF" "$BACKUP_DIR/" 2>/dev/null || true
+          : > "$DBF"
+          chmod 600 "$DBF"
+        done
+        rm -f "$XDB/.preserve-existing-xray-config" "$XDB/preserved-config.json"
+        if [ -f "$CFG" ]; then
+          cp -a "$CFG" "$BACKUP_DIR/config.json" 2>/dev/null || true
+          rm -f "$CFG"
+        fi
+        DELETED="$(awk 'NF{n++} END{print n+0}' "$LIST_FILE")"
+        rm -f "$LIST_FILE" "$CONFIG_FILE"
+        echo "Deleted existing V2Ray records: $DELETED"
+        echo "Safety backup: $BACKUP_DIR"
+        return 0
+        ;;
+
+      n|N)
+        # Keep the exact working Xray configuration. This preserves every
+        # UUID/password and WebSocket path instead of rebuilding them later.
+        if [ -s "$CFG" ] && jq -e '
+          ([.inbounds[]? |
+            select((.tag=="vless-ws" or .tag=="vmess-ws" or .tag=="trojan-ws") and
+                   ((.streamSettings.network // "") == "ws"))] | length) == 3 and
+          (.outbounds | type == "array")
+        ' "$CFG" >/dev/null 2>&1; then
+          cp -a "$CFG" "$XDB/preserved-config.json"
+          chmod 600 "$XDB/preserved-config.json"
+          touch "$XDB/.preserve-existing-xray-config"
+          chmod 600 "$XDB/.preserve-existing-xray-config"
+        else
+          rm -f "$XDB/.preserve-existing-xray-config" "$XDB/preserved-config.json"
+        fi
+
+        DOMAIN="$(cat "$DOMAIN_FILE" 2>/dev/null || true)"
+        if ! [[ "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
+          DOMAIN="pending.invalid"
+        fi
+        CREATED="$(date +%s)"
+
+        while IFS=$'\t' read -r PROTO OLD_TAG PATHX EMAIL VALUE; do
+          [ -n "$VALUE" ] || continue
+          case "$PROTO" in
+            vmess|vless|trojan) ;;
+            *) continue ;;
+          esac
+          TAG="${PROTO}-ws"
+          DBF="$XDB/$TAG.db"
+
+          # Preserve any existing SULTAN row containing this exact UUID/password.
+          if awk -F'|' -v v="$VALUE" '$2==v{found=1} END{exit !found}' "$DBF" 2>/dev/null; then
+            continue
+          fi
+
+          COUNT=$((COUNT + 1))
+          BASE_NAME="$(xray_import_safe_name "$EMAIL" "$PROTO" "$COUNT")"
+          NAME="$BASE_NAME"
+          SUFFIX=1
+          while awk -F'|' -v u="$NAME" '$1==u{found=1} END{exit !found}' "$DBF" 2>/dev/null; do
+            SUFFIX=$((SUFFIX + 1))
+            NAME="${BASE_NAME:0:56}_${SUFFIX}"
+          done
+
+          case "$PATHX" in
+            /*) ;;
+            *) PATHX="/${PROTO}-ws" ;;
+          esac
+          if [[ "$PATHX" == *"|"* || "$PATHX" =~ [[:space:]] ]]; then
+            PATHX="/${PROTO}-ws"
+          fi
+
+          printf '%s|%s|%s|ws|%s|%s|0|0|0|%s|%s|%s|0|%s\n' \
+            "$NAME" "$VALUE" "$PROTO" "$DOMAIN" "$PATHX" "$CREATED" \
+            "$DOMAIN" "$DOMAIN" "$DOMAIN" >> "$DBF"
+          chmod 600 "$DBF"
+          IMPORTED=$((IMPORTED + 1))
+        done < "$CONFIG_FILE"
+
+        for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db"; do
+          normalize_limit_fields_zero "$DBF" 7 8 9
+        done
+        rm -f "$LIST_FILE" "$CONFIG_FILE"
+        echo "Preserved existing SULTAN V2Ray databases."
+        echo "Imported missing users from config.json: $IMPORTED"
+        echo "Original UUID/password values were kept unchanged."
         return 0
         ;;
 
@@ -1032,6 +1210,163 @@ if [ ! -f "$LIMIT_DIR/.quota-v2" ]; then
 fi
 
 # ==========================================================
+# Persistent per-user Xray traffic statistics
+# ==========================================================
+# Xray counters are cumulative for the lifetime of the process. This collector
+# stores deltas without resetting the API counters, so a failed write cannot
+# erase traffic and Xray restarts are detected when counters return to zero.
+cat >/usr/local/sbin/sultan-xray-stats-sync <<'XRAY_STATS_SYNC'
+#!/bin/bash
+set -u
+umask 077
+
+XDB="/etc/sultan/xray"
+USAGE="$XDB/usage.db"
+OVERVIEW="$XDB/overview.db"
+LOCK="/run/lock/sultan-xray-stats.lock"
+API="127.0.0.1:10090"
+
+mkdir -p "$XDB" /run/lock
+touch "$USAGE" "$OVERVIEW"
+chmod 600 "$USAGE" "$OVERVIEW"
+
+BIN=""
+for B in /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
+  if [ -x "$B" ]; then BIN="$B"; break; fi
+done
+[ -n "$BIN" ] || exit 0
+systemctl is-active --quiet xray 2>/dev/null || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+RAW="$(mktemp "$XDB/.xray-stats-raw.XXXXXX")" || exit 1
+PARSED="$(mktemp "$XDB/.xray-stats-parsed.XXXXXX")" || { rm -f "$RAW"; exit 1; }
+NEW="$(mktemp "$XDB/.xray-usage.XXXXXX")" || { rm -f "$RAW" "$PARSED"; exit 1; }
+NEW_OVERVIEW="$(mktemp "$XDB/.xray-overview.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$NEW"; exit 1; }
+trap 'rm -f "$RAW" "$PARSED" "$NEW" "$NEW_OVERVIEW"' EXIT
+
+if ! "$BIN" api statsquery --server="$API" -pattern 'user>>>' >"$RAW" 2>/dev/null; then
+  exit 0
+fi
+
+jq -r '
+  .stat[]? |
+  select((.name // "") | startswith("user>>>")) |
+  [(.name // ""), ((.value // 0) | tonumber? // 0)] | @tsv
+' "$RAW" > "$PARSED" 2>/dev/null || exit 0
+
+exec 9>"$LOCK"
+flock -w 4 -x 9 || exit 0
+
+NOW="$(date +%s)"
+TODAY="$(date +%F)"
+MONTH="$(date +%Y-%m)"
+
+for TAG in vmess-ws vless-ws trojan-ws; do
+  DBF="$XDB/$TAG.db"
+  [ -f "$DBF" ] || continue
+
+  while IFS='|' read -r USER VALUE PROTO NET DOMAIN PATHX EXP QUOTA LOGIN CREATED REST; do
+    [ -n "$USER" ] || continue
+    EMAIL="${TAG}:${USER}"
+    UP_NAME="user>>>${EMAIL}>>>traffic>>>uplink"
+    DOWN_NAME="user>>>${EMAIL}>>>traffic>>>downlink"
+
+    OLD="$(awk -F'|' -v t="$TAG" -v u="$USER" '$1==t && $2==u{print;exit}' "$USAGE" 2>/dev/null || true)"
+    TOTAL="$(printf '%s\n' "$OLD" | awk -F'|' '{print $3}')"
+    LAST_UP="$(printf '%s\n' "$OLD" | awk -F'|' '{print $4}')"
+    LAST_DOWN="$(printf '%s\n' "$OLD" | awk -F'|' '{print $5}')"
+    DAY_KEY="$(printf '%s\n' "$OLD" | awk -F'|' '{print $7}')"
+    DAY_BYTES="$(printf '%s\n' "$OLD" | awk -F'|' '{print $8}')"
+    MONTH_KEY="$(printf '%s\n' "$OLD" | awk -F'|' '{print $9}')"
+    MONTH_BYTES="$(printf '%s\n' "$OLD" | awk -F'|' '{print $10}')"
+
+    [[ "$TOTAL" =~ ^[0-9]+$ ]] || TOTAL=0
+    [[ "$LAST_UP" =~ ^[0-9]+$ ]] || LAST_UP=0
+    [[ "$LAST_DOWN" =~ ^[0-9]+$ ]] || LAST_DOWN=0
+    [[ "$DAY_BYTES" =~ ^[0-9]+$ ]] || DAY_BYTES=0
+    [[ "$MONTH_BYTES" =~ ^[0-9]+$ ]] || MONTH_BYTES=0
+    [ "$DAY_KEY" = "$TODAY" ] || DAY_BYTES=0
+    [ "$MONTH_KEY" = "$MONTH" ] || MONTH_BYTES=0
+
+    # A missing counter is not treated as zero. It can disappear briefly while
+    # Xray reloads its handlers; preserving the baseline prevents double count.
+    UP_ROW="$(awk -F'\t' -v n="$UP_NAME" '$1==n{found=1;s+=$2} END{if(found) printf "1|%.0f",s+0; else printf "0|0"}' "$PARSED")"
+    DOWN_ROW="$(awk -F'\t' -v n="$DOWN_NAME" '$1==n{found=1;s+=$2} END{if(found) printf "1|%.0f",s+0; else printf "0|0"}' "$PARSED")"
+    HAS_UP="${UP_ROW%%|*}"
+    CUR_UP="${UP_ROW#*|}"
+    HAS_DOWN="${DOWN_ROW%%|*}"
+    CUR_DOWN="${DOWN_ROW#*|}"
+    [[ "$CUR_UP" =~ ^[0-9]+$ ]] || CUR_UP="$LAST_UP"
+    [[ "$CUR_DOWN" =~ ^[0-9]+$ ]] || CUR_DOWN="$LAST_DOWN"
+    [ "$HAS_UP" = "1" ] || CUR_UP="$LAST_UP"
+    [ "$HAS_DOWN" = "1" ] || CUR_DOWN="$LAST_DOWN"
+
+    if [ "$CUR_UP" -ge "$LAST_UP" ]; then DELTA_UP=$((CUR_UP-LAST_UP)); else DELTA_UP="$CUR_UP"; fi
+    if [ "$CUR_DOWN" -ge "$LAST_DOWN" ]; then DELTA_DOWN=$((CUR_DOWN-LAST_DOWN)); else DELTA_DOWN="$CUR_DOWN"; fi
+    DELTA=$((DELTA_UP + DELTA_DOWN))
+    TOTAL=$((TOTAL + DELTA))
+    DAY_BYTES=$((DAY_BYTES + DELTA))
+    MONTH_BYTES=$((MONTH_BYTES + DELTA))
+
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$TAG" "$USER" "$TOTAL" "$CUR_UP" "$CUR_DOWN" "$NOW" \
+      "$TODAY" "$DAY_BYTES" "$MONTH" "$MONTH_BYTES" >> "$NEW"
+  done < "$DBF"
+
+  case "$TAG" in
+    vless-ws) PORT=10000 ;;
+    vmess-ws) PORT=10085 ;;
+    trojan-ws) PORT=10086 ;;
+  esac
+
+  CURRENT="$(ss -Htn state established 2>/dev/null | awk -v p=":$PORT" '$4 ~ (p "$"){n++} END{print n+0}')"
+  [[ "$CURRENT" =~ ^[0-9]+$ ]] || CURRENT=0
+  OLD_OVERVIEW="$(awk -F'|' -v t="$TAG" '$1==t{print;exit}' "$OVERVIEW" 2>/dev/null || true)"
+  OLD_DAY="$(printf '%s\n' "$OLD_OVERVIEW" | awk -F'|' '{print $2}')"
+  PEAK="$(printf '%s\n' "$OLD_OVERVIEW" | awk -F'|' '{print $3}')"
+  [[ "$PEAK" =~ ^[0-9]+$ ]] || PEAK=0
+  [ "$OLD_DAY" = "$TODAY" ] || PEAK=0
+  [ "$CURRENT" -gt "$PEAK" ] && PEAK="$CURRENT"
+  printf '%s|%s|%s|%s|%s\n' "$TAG" "$TODAY" "$PEAK" "$CURRENT" "$NOW" >> "$NEW_OVERVIEW"
+done
+
+chmod 600 "$NEW" "$NEW_OVERVIEW"
+mv -f "$NEW" "$USAGE"
+mv -f "$NEW_OVERVIEW" "$OVERVIEW"
+trap - EXIT
+rm -f "$RAW" "$PARSED"
+exit 0
+XRAY_STATS_SYNC
+
+chmod 700 /usr/local/sbin/sultan-xray-stats-sync
+chown root:root /usr/local/sbin/sultan-xray-stats-sync
+
+cat >/etc/systemd/system/sultan-xray-stats.service <<'EOF'
+[Unit]
+Description=SULTAN persistent Xray per-user statistics
+After=xray.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sultan-xray-stats-sync
+EOF
+
+cat >/etc/systemd/system/sultan-xray-stats.timer <<'EOF'
+[Unit]
+Description=SULTAN Xray statistics collector
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# ==========================================================
 # Main panel
 # ==========================================================
 echo "[4/6] Writing full menu panel..."
@@ -1058,14 +1393,16 @@ USAGE_DB="$BASE/limits/usage.db"
 DEVICE_DB="$BASE/limits/devices.db"
 DEVICE_USAGE_DB="$BASE/limits/device_usage.db"
 DEVICE_SESSIONS="$BASE/limits/device_sessions.log"
+XRAY_USAGE_DB="$XDB/usage.db"
+XRAY_OVERVIEW_DB="$XDB/overview.db"
 WS_TOKEN_FILE="$BASE/ws_token"
 
 mkdir -p "$BASE" "$XDB" "$BASE/limits"
-touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS"
+touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB"
 touch "$BASE/limits/blocked.db"
 touch "$BASE/limits/quota-locked.db"
 chmod 700 "$BASE" "$XDB" "$BASE/limits" 2>/dev/null || true
-chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" 2>/dev/null || true
+chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" 2>/dev/null || true
 
 DB_LOCK="/run/lock/sultan-db.lock"
 QUOTA_LOCK="/run/lock/sultan-quota-state.lock"
@@ -1679,65 +2016,255 @@ extend_expiry_date(){
   date -d "@$((BASE_TS + DAYS * 86400))" +%Y-%m-%d
 }
 
+stats_number(){
+  case "${1:-}" in
+    ""|*[!0-9]*) echo 0 ;;
+    *) echo "$1" ;;
+  esac
+}
+
+ssh_traffic_today_bytes(){
+  local TODAY
+  TODAY="$(date +%F)"
+  awk -F'|' -v d="$TODAY" '$4==d && $5 ~ /^[0-9]+$/ {s+=$5} END{printf "%.0f\n",s+0}' "$DEVICE_USAGE_DB" 2>/dev/null
+}
+
+ssh_traffic_month_bytes(){
+  local MONTH
+  MONTH="$(date +%Y-%m)"
+  awk -F'|' -v m="$MONTH" '$6==m && $7 ~ /^[0-9]+$/ {s+=$7} END{printf "%.0f\n",s+0}' "$DEVICE_USAGE_DB" 2>/dev/null
+}
+
+ssh_traffic_total_bytes(){
+  awk -F'|' '$2 ~ /^[0-9]+$/ {s+=$2} END{printf "%.0f\n",s+0}' "$USAGE_DB" 2>/dev/null
+}
+
+ssh_peak_users_today(){
+  local DAY_START NOW TMP F PID CMD SAVED_START CURRENT_START START PEAK
+  DAY_START="$(date -d 'today 00:00:00' +%s)"
+  NOW="$(date +%s)"
+  TMP="$(mktemp "$BASE/limits/.ssh-peak.XXXXXX")" || { echo 0; return; }
+
+  awk -F'|' -v ds="$DAY_START" -v now="$NOW" '
+    $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
+      start=$4+0; finish=$5+0
+      if(finish < ds || start > now) next
+      if(start < ds) start=ds
+      if(finish > now) finish=now
+      print start, 1
+      print finish+1, -1
+    }
+  ' "$DEVICE_SESSIONS" > "$TMP" 2>/dev/null || true
+
+  shopt -s nullglob
+  for F in /run/sultan-login-slots/*/*; do
+    PID="${F##*/}"
+    [[ "$PID" =~ ^[0-9]+$ ]] || continue
+    [ -d "/proc/$PID" ] || continue
+    CMD="$(cat "/proc/$PID/comm" 2>/dev/null || true)"
+    SAVED_START="$(awk -F= '$1=="start"{print $2;exit}' "$F" 2>/dev/null || true)"
+    CURRENT_START="$(awk '{print $22}' "/proc/$PID/stat" 2>/dev/null || true)"
+    [ "$CMD" = "sshd" ] || continue
+    [ -n "$SAVED_START" ] && [ "$SAVED_START" = "$CURRENT_START" ] || continue
+    START="$(awk -F= '$1=="created"{print $2;exit}' "$F" 2>/dev/null || true)"
+    [[ "$START" =~ ^[0-9]+$ ]] || START="$NOW"
+    [ "$START" -lt "$DAY_START" ] && START="$DAY_START"
+    printf '%s %s\n' "$START" 1 >> "$TMP"
+    printf '%s %s\n' "$((NOW+1))" -1 >> "$TMP"
+  done
+  shopt -u nullglob
+
+  PEAK="$(sort -k1,1n -k2,2n "$TMP" 2>/dev/null | awk '{current+=$2; if(current>peak) peak=current} END{print peak+0}')"
+  rm -f "$TMP"
+  stats_number "$PEAK"
+}
+
+xray_protocol_today_bytes(){
+  local TAG="$1" TODAY
+  TODAY="$(date +%F)"
+  awk -F'|' -v t="$TAG" -v d="$TODAY" '$1==t && $7==d && $8 ~ /^[0-9]+$/ {s+=$8} END{printf "%.0f\n",s+0}' "$XRAY_USAGE_DB" 2>/dev/null
+}
+
+xray_protocol_month_bytes(){
+  local TAG="$1" MONTH
+  MONTH="$(date +%Y-%m)"
+  awk -F'|' -v t="$TAG" -v m="$MONTH" '$1==t && $9==m && $10 ~ /^[0-9]+$/ {s+=$10} END{printf "%.0f\n",s+0}' "$XRAY_USAGE_DB" 2>/dev/null
+}
+
+xray_protocol_total_bytes(){
+  local TAG="$1"
+  awk -F'|' -v t="$TAG" '$1==t && $3 ~ /^[0-9]+$/ {s+=$3} END{printf "%.0f\n",s+0}' "$XRAY_USAGE_DB" 2>/dev/null
+}
+
+xray_protocol_current_users(){
+  local TAG="$1" PORT
+  case "$TAG" in
+    vless-ws) PORT=10000 ;;
+    vmess-ws) PORT=10085 ;;
+    trojan-ws) PORT=10086 ;;
+    *) echo 0; return ;;
+  esac
+  ss -Htn state established 2>/dev/null | awk -v p=":$PORT" '$4 ~ (p "$"){n++} END{print n+0}'
+}
+
+xray_protocol_peak_today(){
+  local TAG="$1" TODAY PEAK
+  TODAY="$(date +%F)"
+  PEAK="$(awk -F'|' -v t="$TAG" -v d="$TODAY" '$1==t && $2==d{print $3;exit}' "$XRAY_OVERVIEW_DB" 2>/dev/null || true)"
+  stats_number "$PEAK"
+}
+
+protocol_total_bytes(){
+  local MODE="$1" TAG="${2:-}"
+  case "$MODE" in
+    ssh) ssh_traffic_total_bytes ;;
+    xray) xray_protocol_total_bytes "$TAG" ;;
+    *) echo 0 ;;
+  esac
+}
+
+protocol_current_users(){
+  local MODE="$1" TAG="${2:-}"
+  case "$MODE" in
+    ssh) total_online_logins ;;
+    xray) xray_protocol_current_users "$TAG" ;;
+    *) echo 0 ;;
+  esac
+}
+
+live_traffic_view(){
+  local MODE="$1" TAG="${2:-}" TITLE="$3"
+  local PREVIOUS CURRENT DELTA RATE PREVIOUS_TIME NOW ELAPSED ONLINE KEY
+
+  if [ "$MODE" = "ssh" ]; then quota_sync; else xray_stats_sync; fi
+  PREVIOUS="$(protocol_total_bytes "$MODE" "$TAG")"
+  PREVIOUS="$(stats_number "$PREVIOUS")"
+  PREVIOUS_TIME="$(date +%s)"
+
+  while true; do
+    if [ "$MODE" = "ssh" ]; then quota_sync; else xray_stats_sync; fi
+    CURRENT="$(protocol_total_bytes "$MODE" "$TAG")"
+    CURRENT="$(stats_number "$CURRENT")"
+    NOW="$(date +%s)"
+    ELAPSED=$((NOW - PREVIOUS_TIME))
+    [ "$ELAPSED" -gt 0 ] || ELAPSED=1
+    if [ "$CURRENT" -ge "$PREVIOUS" ]; then
+      DELTA=$((CURRENT - PREVIOUS))
+    else
+      DELTA=0
+    fi
+    RATE=$((DELTA / ELAPSED))
+    ONLINE="$(protocol_current_users "$MODE" "$TAG")"
+    ONLINE="$(stats_number "$ONLINE")"
+
+    refresh_screen
+    echo -e "${ORANGE}========================================${NC}"
+    echo -e "${ORANGE}          ${TITLE} LIVE TRAFFIC${NC}"
+    echo -e "${ORANGE}========================================${NC}"
+    printf "%-22s : %s/s\n" "Live Traffic" "$(human_bytes "$RATE")"
+    printf "%-22s : %s\n" "Total Traffic" "$(human_bytes "$CURRENT")"
+    printf "%-22s : %s / Unlimited\n" "Current Online Users" "$ONLINE"
+    echo -e "${ORANGE}========================================${NC}"
+    echo "0 - Back"
+
+    PREVIOUS="$CURRENT"
+    PREVIOUS_TIME="$NOW"
+    KEY=""
+    if [ -r /dev/tty ]; then
+      IFS= read -r -s -n 1 -t 1 KEY </dev/tty || true
+    else
+      sleep 1
+    fi
+    [ "$KEY" = "0" ] && return
+  done
+}
+
 quick_user_report(){
   quota_sync
 
-  local INFO U P E Q L USED LIMIT_BYTES REMAIN_BYTES ACTIVE LEFT_LOGINS
+  local INFO U P E Q L USED LIMIT_BYTES REMAIN_BYTES ACTIVE
+  local REMAIN_TEXT TOTAL_TEXT LOGIN_LEFT LN ACTION
+  local TRAFFIC_TODAY TRAFFIC_MONTH TRAFFIC_TOTAL PEAK_TODAY CURRENT_ONLINE
 
   refresh_screen
   select_ssh_user_compact || { pause; return; }
 
-  INFO="$(grep "^$USER|" "$DB" 2>/dev/null || true)"
-  [ -n "$INFO" ] || { echo "User not found."; pause; return; }
+  while true; do
+    quota_sync
+    INFO="$(grep "^$USER|" "$DB" 2>/dev/null || true)"
+    [ -n "$INFO" ] || { echo "User not found."; pause; return; }
 
-  IFS='|' read -r U P E Q L <<< "$INFO"
-  USED="$(user_used_bytes "$U")"
-  USED="${USED:-0}"
-  LIMIT_BYTES="$(quota_bytes_from_text "$Q")"
-  ACTIVE="$(active_user_logins "$U")"
+    IFS='|' read -r U P E Q L <<< "$INFO"
+    USED="$(user_used_bytes "$U")"
+    USED="$(stats_number "$USED")"
+    LIMIT_BYTES="$(quota_bytes_from_text "$Q")"
+    ACTIVE="$(active_user_logins "$U")"
+    ACTIVE="$(stats_number "$ACTIVE")"
 
-  if [ "$LIMIT_BYTES" -eq 0 ]; then
-    REMAIN_TEXT="Unlimited"
-    TOTAL_TEXT="Unlimited"
-  else
-    if [ "$USED" -ge "$LIMIT_BYTES" ]; then
-      REMAIN_BYTES=0
+    if [ "$LIMIT_BYTES" -eq 0 ]; then
+      REMAIN_TEXT="Unlimited"
+      TOTAL_TEXT="Unlimited"
     else
-      REMAIN_BYTES=$((LIMIT_BYTES - USED))
-    fi
-    REMAIN_TEXT="$(human_mb_decimal "$REMAIN_BYTES")"
-    TOTAL_TEXT="$(quota_mb_decimal "$Q")"
-  fi
-
-  case "$L" in
-    Unlimited|unlimited|UNLIMITED|0|"")
-      LOGIN_LEFT="Unlimited"
-      ;;
-    *)
-      if [[ "$L" =~ ^[0-9]+$ ]]; then
-        LN=$((10#$L))
-        [ "$ACTIVE" -ge "$LN" ] && LOGIN_LEFT=0 || LOGIN_LEFT=$((LN-ACTIVE))
+      if [ "$USED" -ge "$LIMIT_BYTES" ]; then
+        REMAIN_BYTES=0
       else
-        LOGIN_LEFT="Unknown"
+        REMAIN_BYTES=$((LIMIT_BYTES - USED))
       fi
-      ;;
-  esac
+      REMAIN_TEXT="$(human_mb_decimal "$REMAIN_BYTES")"
+      TOTAL_TEXT="$(quota_mb_decimal "$Q")"
+    fi
 
-  refresh_screen
-  echo "----------------------------------------"
-  printf "%-10s %s\n" "$U" "$(human_mb_decimal "$USED")"
-  echo "----------------------------------------"
-  printf "%-16s : %s\n" "Remaining" "$REMAIN_TEXT"
-  printf "%-16s : %s / %s\n" "Traffic" "$(human_mb_decimal "$USED")" "$TOTAL_TEXT"
-  echo "----------------------------------------"
-  printf "%-16s : %s\n" "Active Logins" "$ACTIVE"
-  printf "%-16s : %s\n" "Login Limit" "$L"
-  printf "%-16s : %s\n" "Logins Left" "$LOGIN_LEFT"
-  echo "----------------------------------------"
-  printf "%-16s : %s\n" "Expire Date" "$E"
-  printf "%-16s : %s\n" "Time Left" "$(remaining_exact "$E")"
-  echo "----------------------------------------"
-  pause
+    case "$L" in
+      Unlimited|unlimited|UNLIMITED|0|"")
+        LOGIN_LEFT="Unlimited"
+        ;;
+      *)
+        if [[ "$L" =~ ^[0-9]+$ ]]; then
+          LN=$((10#$L))
+          [ "$ACTIVE" -ge "$LN" ] && LOGIN_LEFT=0 || LOGIN_LEFT=$((LN-ACTIVE))
+        else
+          LOGIN_LEFT="Unknown"
+        fi
+        ;;
+    esac
+
+    TRAFFIC_TODAY="$(stats_number "$(ssh_traffic_today_bytes)")"
+    TRAFFIC_MONTH="$(stats_number "$(ssh_traffic_month_bytes)")"
+    TRAFFIC_TOTAL="$(stats_number "$(ssh_traffic_total_bytes)")"
+    PEAK_TODAY="$(stats_number "$(ssh_peak_users_today)")"
+    CURRENT_ONLINE="$(stats_number "$(total_online_logins)")"
+
+    refresh_screen
+    echo "----------------------------------------"
+    printf "%-10s %s\n" "$U" "$(human_mb_decimal "$USED")"
+    echo "----------------------------------------"
+    printf "%-16s : %s\n" "Remaining" "$REMAIN_TEXT"
+    printf "%-16s : %s / %s\n" "Traffic" "$(human_mb_decimal "$USED")" "$TOTAL_TEXT"
+    echo "----------------------------------------"
+    printf "%-16s : %s\n" "Active Logins" "$ACTIVE"
+    printf "%-16s : %s\n" "Login Limit" "$L"
+    printf "%-16s : %s\n" "Logins Left" "$LOGIN_LEFT"
+    echo "----------------------------------------"
+    printf "%-16s : %s\n" "Expire Date" "$E"
+    printf "%-16s : %s\n" "Time Left" "$(remaining_exact "$E")"
+    echo "----------------------------------------"
+    printf "%-22s : %s / Unlimited\n" "Traffic Today" "$(human_bytes "$TRAFFIC_TODAY")"
+    printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")"
+    printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")"
+    echo "----------------------------------------"
+    printf "%-22s : %s / Unlimited\n" "Max Users Today" "$PEAK_TODAY"
+    printf "%-22s : %s / Unlimited\n" "Current Online Users" "$CURRENT_ONLINE"
+    echo "----------------------------------------"
+    echo "1 - Live Traffic"
+    echo "0 - Back"
+    echo "----------------------------------------"
+    read -p "Select: " ACTION
+
+    case "$ACTION" in
+      1) live_traffic_view ssh "" SSH ;;
+      0) return ;;
+    esac
+  done
 }
 
 quota_sync(){ /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 || true; }
@@ -2413,19 +2940,50 @@ xray_path_encoded(){
   printf '%s' "${P//\//%2F}"
 }
 
+xray_stats_email(){
+  printf '%s:%s\n' "$1" "$2"
+}
+
+xray_stats_sync(){
+  /usr/local/sbin/sultan-xray-stats-sync >/dev/null 2>&1 || true
+}
+
+xray_usage_remove_user(){
+  local TAG="$1" U="$2" TMP LOCK="/run/lock/sultan-xray-stats.lock"
+  [ -f "$XRAY_USAGE_DB" ] || return 0
+  mkdir -p /run/lock
+  (
+    flock -w 5 -x 9 || exit 1
+    TMP="$(mktemp "$XDB/.xray-usage-remove.XXXXXX")" || exit 1
+    awk -F'|' -v t="$TAG" -v u="$U" '!($1==t && $2==u)' "$XRAY_USAGE_DB" > "$TMP" 2>/dev/null || true
+    chmod 600 "$TMP"
+    mv -f "$TMP" "$XRAY_USAGE_DB"
+  ) 9>"$LOCK"
+}
+
 xray_user_used_bytes(){
-  local U="$1" OUT USED
-  OUT="$(xray api statsquery --server=127.0.0.1:10090 -pattern "user>>>$U>>>traffic>>>" 2>/dev/null || true)"
-  USED="$(printf '%s\n' "$OUT" | awk -F"value:" '
-    NF > 1 {
-      v=$2;
-      gsub(/[^0-9]/, "", v);
-      if(v!="") sum += v
-    }
-    END{print sum+0}
-  ')"
+  local TAG="$1" U="$2" USED
+  USED="$(awk -F'|' -v t="$TAG" -v u="$U" '$1==t && $2==u{print $3;exit}' "$XRAY_USAGE_DB" 2>/dev/null || true)"
   [[ "$USED" =~ ^[0-9]+$ ]] || USED=0
   echo "$USED"
+}
+
+xray_user_online_count(){
+  local TAG="$1" U="$2" EMAIL BIN OUT VALUE STATUS
+  EMAIL="$(xray_stats_email "$TAG" "$U")"
+  BIN="$(xray_binary 2>/dev/null || true)"
+  [ -n "$BIN" ] || { echo "Unknown"; return; }
+  OUT="$("$BIN" api statsonline --server=127.0.0.1:10090 -email "$EMAIL" 2>&1)"
+  STATUS=$?
+  if [ "$STATUS" -ne 0 ]; then
+    # Xray returns NotFound until an offline user has created an online map.
+    printf '%s\n' "$OUT" | grep -qi 'not found' && { echo 0; return; }
+    echo "Unknown"
+    return
+  fi
+  VALUE="$(printf '%s\n' "$OUT" | jq -r '.. | objects | select(has("value")) | .value' 2>/dev/null | head -n1)"
+  [[ "$VALUE" =~ ^[0-9]+$ ]] || { echo "Unknown"; return; }
+  echo "$VALUE"
 }
 
 xray_link(){
@@ -2458,7 +3016,9 @@ xray_link(){
 }
 
 show_xray_users_table(){
-  local DBF="$1" TITLE="$2" N=1 U V PROTO NET DOMAIN PATHX EXP QUOTA LOGIN CREATED USED
+  local DBF="$1" TITLE="$2" TAG N=1 U V PROTO NET DOMAIN PATHX EXP QUOTA LOGIN CREATED USED
+  TAG="$(basename "$DBF" .db)"
+  xray_stats_sync
   echo "================================================================================"
   printf "%-4s %-15s %-14s %-10s %-10s %-12s\n" \
     "NO" "USERNAME" "EXPIRE" "QUOTA" "LOGIN" "USED"
@@ -2469,7 +3029,7 @@ show_xray_users_table(){
     [ -n "$EXP" ] || EXP="0"
     [ -n "$QUOTA" ] || QUOTA="Unlimited"
     [ -n "$LOGIN" ] || LOGIN="Unlimited"
-    USED="$(xray_user_used_bytes "$U")"
+    USED="$(xray_user_used_bytes "$TAG" "$U")"
     printf "%-4s %-15s %-14s %-10s %-10s %-12s\n" \
       "$N" "$U" "$EXP" "$QUOTA" "$LOGIN" "$(human_bytes "$USED")"
     N=$((N+1))
@@ -2558,7 +3118,7 @@ while true; do
   echo -e " ${WHITE}BBR${NC}           : $(badge "$(bbr_status)")"
   echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e " ${CYAN}[1]${NC} SSH MENU              ${CYAN}[11]${NC} REBOOT VPS"
-  echo -e " ${CYAN}[2]${NC} VMESS LINK MENU       ${CYAN}[12]${NC} ABOUT SCRIPT"
+  echo -e " ${CYAN}[2]${NC} VMESS MENU            ${CYAN}[12]${NC} ABOUT SCRIPT"
   echo -e " ${CYAN}[3]${NC} VLESS MENU            ${CYAN}[13]${NC} VPS INFO"
   echo -e " ${CYAN}[4]${NC} TROJAN MENU           ${CYAN}[14]${NC} ONLINE USERS"
   echo -e " ${CYAN}[5]${NC} SSR MENU              ${CYAN}[15]${NC} SPEEDTEST"
@@ -2953,6 +3513,7 @@ xray_config_ok(){
 
 xray_restart_safe(){
   local I
+  /usr/local/sbin/sultan-xray-stats-sync >/dev/null 2>&1 || true
   xray_fix_service_access
   if ! xray_config_ok; then
     echo "Xray config error. Restart skipped."
@@ -3085,7 +3646,7 @@ write_xray_ws_config(){
   "stats": {},
   "api": {"tag": "api", "listen": "127.0.0.1:10090", "services": ["StatsService"]},
   "policy": {
-    "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}},
+    "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true, "statsUserOnline": true}},
     "system": {"statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true}
   },
   "inbounds": [
@@ -3154,7 +3715,7 @@ EOF
 }
 
 xray_sync_users_from_db(){
-  local DBF U VALUE P NET DOMAIN PATHX_DB EXP QUOTA LOGIN CREATED REST TAG FILTER
+  local DBF U VALUE P NET DOMAIN PATHX_DB EXP QUOTA LOGIN CREATED REST TAG FILTER STAT_EMAIL
   command -v jq >/dev/null 2>&1 || return 1
   [ -f "$XRAY_CONFIG" ] || return 1
 
@@ -3164,27 +3725,28 @@ xray_sync_users_from_db(){
     while IFS='|' read -r U VALUE P NET DOMAIN PATHX_DB EXP QUOTA LOGIN CREATED REST; do
       [ -n "$U" ] || continue
       [ -n "$VALUE" ] || continue
+      STAT_EMAIL="$(xray_stats_email "$TAG" "$U")"
       case "$TAG" in
         trojan-ws)
           FILTER='
             (.inbounds[]|select(.tag==$tag)|.settings.clients) |=
-            ((. // []) | if any(.[]?; .email==$email or .password==$value) then . else . + [{"password":$value,"email":$email,"level":0}] end)
+            ((. // []) |
+              if any(.[]?; .password==$value) then
+                map(if .password==$value then . + {"email":$email,"level":0} else . end)
+              else . + [{"password":$value,"email":$email,"level":0}] end)
           '
           ;;
-        vmess-ws)
+        vmess-ws|vless-ws)
           FILTER='
             (.inbounds[]|select(.tag==$tag)|.settings.clients) |=
-            ((. // []) | if any(.[]?; .email==$email or .id==$value) then . else . + [{"id":$value,"email":$email,"level":0}] end)
-          '
-          ;;
-        vless-ws)
-          FILTER='
-            (.inbounds[]|select(.tag==$tag)|.settings.clients) |=
-            ((. // []) | if any(.[]?; .email==$email or .id==$value) then . else . + [{"id":$value,"email":$email,"level":0}] end)
+            ((. // []) |
+              if any(.[]?; .id==$value) then
+                map(if .id==$value then . + {"email":$email,"level":0} else . end)
+              else . + [{"id":$value,"email":$email,"level":0}] end)
           '
           ;;
       esac
-      xray_jq_update "$FILTER" --arg value "$VALUE" --arg email "$U" --arg tag "$TAG" || return 1
+      xray_jq_update "$FILTER" --arg value "$VALUE" --arg email "$STAT_EMAIL" --arg tag "$TAG" || return 1
     done < "$DBF"
   done
 }
@@ -3269,7 +3831,7 @@ ensure_xray_config(){
 }
 
 create_xray_user(){
-  local PROTO="$1" TAG="$2" DEFAULT_PATH="$3" DBF VALUE DOMAIN FILTER BACKUP LOCKF DAYS GB MAXLOGIN EXP QUOTA_TEXT LOGIN_TEXT LINK WS_CODE
+  local PROTO="$1" TAG="$2" DEFAULT_PATH="$3" DBF VALUE DOMAIN FILTER BACKUP LOCKF DAYS GB MAXLOGIN EXP QUOTA_TEXT LOGIN_TEXT LINK WS_CODE STAT_EMAIL
   local CURRENT_PATH INPUT_PATH PATHX CONFIRM CLIENT_ADDR CLIENT_HOST CLIENT_SNI ALLOW_INSECURE AI_ANSWER
   ensure_xray_config || { echo "Xray config is not ready."; pause; return; }
 
@@ -3360,6 +3922,7 @@ create_xray_user(){
   [ "$GB" = "0" ] && QUOTA_TEXT="0" || QUOTA_TEXT="${GB}GB"
   [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="0" || LOGIN_TEXT="$MAXLOGIN"
 
+  STAT_EMAIL="$(xray_stats_email "$TAG" "$USER")"
   if [ "$PROTO" = "trojan" ]; then
     VALUE="$(openssl rand -hex 16)"
     FILTER='(.inbounds[]|select(.tag==$tag)|.settings.clients)+=[{"password":$value,"email":$email,"level":0}]'
@@ -3371,7 +3934,7 @@ create_xray_user(){
   BACKUP="$(mktemp --suffix=.json "/usr/local/etc/xray/.rollback.XXXXXX")" || { echo "Rollback temp failed."; pause; return; }
   cp -a "$XRAY_CONFIG" "$BACKUP"
 
-  xray_jq_update "$FILTER" --arg value "$VALUE" --arg email "$USER" --arg tag "$TAG" || {
+  xray_jq_update "$FILTER" --arg value "$VALUE" --arg email "$STAT_EMAIL" --arg tag "$TAG" || {
     rm -f "$BACKUP"
     echo "Failed to update or validate Xray config."
     pause
@@ -3429,6 +3992,7 @@ create_xray_user(){
   fi
 
   rm -f "$BACKUP"
+  xray_usage_remove_user "$TAG" "$USER" >/dev/null 2>&1 || true
   LINK="$(xray_link "$PROTO" "$USER" "$VALUE" "$CLIENT_ADDR" "$PATHX" "$CLIENT_HOST" "$CLIENT_SNI" "$ALLOW_INSECURE")"
 
   refresh_screen
@@ -3491,6 +4055,7 @@ delete_xray_user(){
     chmod 600 "$TMP"
     mv -f "$TMP" "$DBF"
   ) 7>"$LOCKF" || { echo "Xray user DB update failed."; pause; return; }
+  xray_usage_remove_user "$TAG" "$USER" >/dev/null 2>&1 || true
   if [ -f /etc/nginx/conf.d/sultan-ready.conf ]; then
     nginx_haproxy_restart_safe || { echo "Proxy reload failed."; pause; return; }
   fi
@@ -3512,7 +4077,8 @@ show_xray_user_statistics(){
   validate_domain "$CLIENT_SNI" || CLIENT_SNI="$CLIENT_HOST"
   case "$ALLOW_INSECURE" in 1|y|Y|yes|YES|true|TRUE|on|ON) ALLOW_INSECURE=1 ;; *) ALLOW_INSECURE=0 ;; esac
   validate_link_address "$CLIENT_ADDR" || CLIENT_ADDR="$DOMAIN"
-  USED="$(xray_user_used_bytes "$U")"
+  xray_stats_sync
+  USED="$(xray_user_used_bytes "$TAG" "$U")"
   LIMIT="$(quota_bytes_from_text "$QUOTA")"
   if [ "$LIMIT" -eq 0 ]; then
     REMAIN="Unlimited"
@@ -3550,6 +4116,95 @@ show_xray_user_statistics(){
   pause
 }
 
+xray_quick_user_report(){
+  local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db"
+  local LINE U VALUE NET DOMAIN PATHX EXP QUOTA LOGIN CREATED REST
+  local USED LIMIT_BYTES REMAIN_BYTES REMAIN_TEXT TOTAL_TEXT ACTIVE LOGIN_LEFT LN ACTION
+  local TRAFFIC_TODAY TRAFFIC_MONTH TRAFFIC_TOTAL PEAK_TODAY CURRENT_ONLINE
+
+  refresh_screen
+  select_xray_user "$DBF" "${PROTO^^}" || { pause; return; }
+
+  while true; do
+    xray_stats_sync
+    LINE="$(awk -F'|' -v u="$USER" '$1==u{print;exit}' "$DBF" 2>/dev/null)"
+    [ -n "$LINE" ] || { echo "User not found."; pause; return; }
+    IFS='|' read -r U VALUE PROTO NET DOMAIN PATHX EXP QUOTA LOGIN CREATED REST <<< "$LINE"
+    [ -n "$EXP" ] || EXP="0"
+    [ -n "$QUOTA" ] || QUOTA="0"
+    [ -n "$LOGIN" ] || LOGIN="0"
+
+    USED="$(xray_user_used_bytes "$TAG" "$U")"
+    USED="$(stats_number "$USED")"
+    LIMIT_BYTES="$(quota_bytes_from_text "$QUOTA")"
+    ACTIVE="$(xray_user_online_count "$TAG" "$U")"
+
+    if [ "$LIMIT_BYTES" -eq 0 ]; then
+      REMAIN_TEXT="Unlimited"
+      TOTAL_TEXT="Unlimited"
+    else
+      if [ "$USED" -ge "$LIMIT_BYTES" ]; then
+        REMAIN_BYTES=0
+      else
+        REMAIN_BYTES=$((LIMIT_BYTES - USED))
+      fi
+      REMAIN_TEXT="$(human_mb_decimal "$REMAIN_BYTES")"
+      TOTAL_TEXT="$(quota_mb_decimal "$QUOTA")"
+    fi
+
+    case "$LOGIN" in
+      Unlimited|unlimited|UNLIMITED|0|"")
+        LOGIN_LEFT="Unlimited"
+        ;;
+      *)
+        if [[ "$LOGIN" =~ ^[0-9]+$ ]] && [[ "$ACTIVE" =~ ^[0-9]+$ ]]; then
+          LN=$((10#$LOGIN))
+          [ "$ACTIVE" -ge "$LN" ] && LOGIN_LEFT=0 || LOGIN_LEFT=$((LN-ACTIVE))
+        else
+          LOGIN_LEFT="Unknown"
+        fi
+        ;;
+    esac
+
+    TRAFFIC_TODAY="$(stats_number "$(xray_protocol_today_bytes "$TAG")")"
+    TRAFFIC_MONTH="$(stats_number "$(xray_protocol_month_bytes "$TAG")")"
+    TRAFFIC_TOTAL="$(stats_number "$(xray_protocol_total_bytes "$TAG")")"
+    PEAK_TODAY="$(stats_number "$(xray_protocol_peak_today "$TAG")")"
+    CURRENT_ONLINE="$(stats_number "$(xray_protocol_current_users "$TAG")")"
+
+    refresh_screen
+    echo "----------------------------------------"
+    printf "%-10s %s\n" "$U" "$(human_mb_decimal "$USED")"
+    echo "----------------------------------------"
+    printf "%-16s : %s\n" "Remaining" "$REMAIN_TEXT"
+    printf "%-16s : %s / %s\n" "Traffic" "$(human_mb_decimal "$USED")" "$TOTAL_TEXT"
+    echo "----------------------------------------"
+    printf "%-16s : %s\n" "Active Logins" "$ACTIVE"
+    printf "%-16s : %s\n" "Login Limit" "$LOGIN"
+    printf "%-16s : %s\n" "Logins Left" "$LOGIN_LEFT"
+    echo "----------------------------------------"
+    printf "%-16s : %s\n" "Expire Date" "$EXP"
+    printf "%-16s : %s\n" "Time Left" "$(remaining_exact "$EXP")"
+    echo "----------------------------------------"
+    printf "%-22s : %s / Unlimited\n" "Traffic Today" "$(human_bytes "$TRAFFIC_TODAY")"
+    printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")"
+    printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")"
+    echo "----------------------------------------"
+    printf "%-22s : %s / Unlimited\n" "Max Users Today" "$PEAK_TODAY"
+    printf "%-22s : %s / Unlimited\n" "Current Online Users" "$CURRENT_ONLINE"
+    echo "----------------------------------------"
+    echo "1 - Live Traffic"
+    echo "0 - Back"
+    echo "----------------------------------------"
+    read -p "Select: " ACTION
+
+    case "$ACTION" in
+      1) live_traffic_view xray "$TAG" "${PROTO^^}" ;;
+      0) return ;;
+    esac
+  done
+}
+
 show_xray_traffic_statistics(){
   local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db"
   local LINE U VALUE NET DOMAIN PATHX EXP QUOTA LOGIN CREATED REST
@@ -3580,7 +4235,8 @@ show_xray_traffic_statistics(){
       ;;
   esac
 
-  USED="$(xray_user_used_bytes "$U")"
+  xray_stats_sync
+  USED="$(xray_user_used_bytes "$TAG" "$U")"
   LIMIT="$(quota_bytes_from_text "$QUOTA")"
   if [ "$LIMIT" -eq 0 ]; then
     REMAIN="Unlimited"
@@ -3707,9 +4363,10 @@ xray_proto_menu(){
     echo "[2] Change User"
     echo "[3] Delete User"
     echo "[4] Show Statistics + Link"
-    echo "[5] List Links"
+    echo "[5] Quick User Report"
     echo "[6] Change WebSocket Path"
     echo "[7] ${PROTO^^} User Statistics"
+    echo "[8] List Links"
     echo "[0] Back"
     read -p "Select: " x
     case "$x" in
@@ -3717,7 +4374,10 @@ xray_proto_menu(){
       2) change_xray_user_menu "$PROTO" "$TAG" ;;
       3) delete_xray_user "$PROTO" "$TAG" "$FIELD" ;;
       4) show_xray_user_statistics "$PROTO" "$TAG" ;;
-      5)
+      5) xray_quick_user_report "$PROTO" "$TAG" ;;
+      6) change_xray_path_menu "$PROTO" "$TAG" "$PATHX" ;;
+      7) show_xray_traffic_statistics "$PROTO" "$TAG" ;;
+      8)
         refresh_screen
         while IFS='|' read -r U VALUE P NET DOMAIN PATHX_DB EXP QUOTA LOGIN CREATED CLIENT_HOST CLIENT_SNI ALLOW_INSECURE CLIENT_ADDR REST; do
           [ -n "$U" ] || continue
@@ -3731,8 +4391,6 @@ xray_proto_menu(){
         done < "$XDB/$TAG.db"
         pause
         ;;
-      6) change_xray_path_menu "$PROTO" "$TAG" "$PATHX" ;;
-      7) show_xray_traffic_statistics "$PROTO" "$TAG" ;;
       0) return ;;
     esac
   done
@@ -4892,7 +5550,7 @@ v2ray_ws_verify_or_repair(){
 
 full_install_self_test(){
   local D="$1" SERVICE FAILED=0
-  for SERVICE in sultan-ws udp-custom xray nginx haproxy fail2ban sultan-quota.timer; do
+  for SERVICE in sultan-ws udp-custom xray nginx haproxy fail2ban sultan-quota.timer sultan-xray-stats.timer; do
     wait_service_active "$SERVICE" || FAILED=1
   done
   if ! systemctl is-active --quiet ssh 2>/dev/null && ! systemctl is-active --quiet sshd 2>/dev/null; then
@@ -4933,13 +5591,56 @@ setup_ready(){
   echo "$D" > "$DOMAIN_FILE"
   chmod 600 "$DOMAIN_FILE"
 
+  # Complete imported records that were preserved before a domain was known.
+  for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db"; do
+    [ -f "$DBF" ] || continue
+    TMP_DB="$(mktemp "$XDB/.domain-fill.XXXXXX")" || return 1
+    awk -F'|' -v d="$D" '
+      BEGIN{OFS="|"}
+      NF {
+        while(NF<14) $(NF+1)=""
+        if($5=="" || $5=="Not Set" || $5=="pending.invalid") $5=d
+        if($11=="" || $11=="Not Set" || $11=="pending.invalid") $11=d
+        if($12=="" || $12=="Not Set" || $12=="pending.invalid") $12=d
+        if($14=="" || $14=="Not Set" || $14=="pending.invalid") $14=d
+      }
+      {print}
+    ' "$DBF" > "$TMP_DB" || { rm -f "$TMP_DB"; return 1; }
+    chmod 600 "$TMP_DB"
+    mv -f "$TMP_DB" "$DBF"
+  done
+
   open_main_ports || { echo "Firewall setup failed."; pause; return 1; }
 
   install_ws || { pause; return 1; }
   install_udp || { pause; return 1; }
   install_xray --quiet || { echo "Xray install failed."; pause; return 1; }
-  create_xray_config --quiet || { echo "Xray WebSocket config creation failed."; pause; return 1; }
-  ensure_xray_config || { echo "Xray config is invalid."; pause; return 1; }
+
+  if [ -f "$XDB/.preserve-existing-xray-config" ] && [ -s "$XDB/preserved-config.json" ]; then
+    mkdir -p "$(dirname "$XRAY_CONFIG")"
+    cp -a "$XDB/preserved-config.json" "$XRAY_CONFIG"
+    chown root:root "$XRAY_CONFIG"
+    chmod 600 "$XRAY_CONFIG"
+    xray_fix_service_access
+
+    if xray_test_file "$XRAY_CONFIG"; then
+      # Add only database users that are missing. Existing UUID/password and
+      # paths remain unchanged because matching clients are updated in place.
+      xray_sync_users_from_db || echo "Warning: some saved database users could not be synchronized. Existing Xray clients were kept unchanged."
+      xray_restart_safe || { echo "Preserved Xray config failed to start."; pause; return 1; }
+      rm -f "$XDB/.preserve-existing-xray-config"
+      echo "Existing Xray config restored with the same UUID/password and WebSocket paths."
+    else
+      echo "Preserved Xray config is invalid; rebuilding from the saved user databases."
+      rm -f "$XDB/.preserve-existing-xray-config"
+      create_xray_config --quiet || { echo "Xray WebSocket config creation failed."; pause; return 1; }
+      ensure_xray_config || { echo "Xray config is invalid."; pause; return 1; }
+    fi
+  else
+    create_xray_config --quiet || { echo "Xray WebSocket config creation failed."; pause; return 1; }
+    ensure_xray_config || { echo "Xray config is invalid."; pause; return 1; }
+  fi
+
   WS_TOKEN="$(ensure_ws_token)"
 
   [ -f "/etc/letsencrypt/live/$D/fullchain.pem" ] || create_self_signed_cert "$D"
@@ -5324,9 +6025,10 @@ backup_menu(){
       tar -czf "$BP" \
         /etc/sultan /usr/local/etc/xray /usr/local/bin/menu \
         /usr/local/bin/sultan-ssh-ws /usr/local/bin/sultan-udp-relay \
-        /usr/local/sbin/sultan-login-limit /usr/local/sbin/sultan-quota-sync /usr/local/sbin/sultan-tunnel-shell \
+        /usr/local/sbin/sultan-login-limit /usr/local/sbin/sultan-quota-sync /usr/local/sbin/sultan-xray-stats-sync /usr/local/sbin/sultan-tunnel-shell \
         /etc/systemd/system/sultan-ws.service /etc/systemd/system/udp-custom.service \
         /etc/systemd/system/sultan-quota.service /etc/systemd/system/sultan-quota.timer \
+        /etc/systemd/system/sultan-xray-stats.service /etc/systemd/system/sultan-xray-stats.timer \
         /etc/nginx/conf.d/sultan-ready.conf /etc/haproxy/haproxy.cfg \
         /etc/ssh/sshd_config.d/98-sultan-legacy-login.conf /etc/ssh/sshd_config.d/99-sultan-users.conf /etc/fail2ban/jail.d/sultan-sshd.conf \
         /etc/sysctl.d/99-sultan-bbr.conf 2>/dev/null ||
@@ -5705,11 +6407,13 @@ remove_script(){
   done < "$TMP_USERS"
   rm -f "$TMP_USERS"
 
-  systemctl disable --now sultan-ws udp-custom sultan-quota.timer sultan-quota.service xray 2>/dev/null || true
+  systemctl disable --now sultan-ws udp-custom sultan-quota.timer sultan-quota.service sultan-xray-stats.timer sultan-xray-stats.service xray 2>/dev/null || true
   rm -f /etc/systemd/system/sultan-ws.service
   rm -f /etc/systemd/system/udp-custom.service
   rm -f /etc/systemd/system/sultan-quota.service
   rm -f /etc/systemd/system/sultan-quota.timer
+  rm -f /etc/systemd/system/sultan-xray-stats.service
+  rm -f /etc/systemd/system/sultan-xray-stats.timer
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
   rm -rf /etc/systemd/system/xray.service.d
   rm -f /usr/local/bin/xray /usr/local/share/xray/geoip.dat /usr/local/share/xray/geosite.dat
@@ -5718,6 +6422,7 @@ remove_script(){
   rm -f /usr/local/bin/sultan-udp-relay
   rm -f /usr/local/sbin/sultan-login-limit
   rm -f /usr/local/sbin/sultan-quota-sync
+  rm -f /usr/local/sbin/sultan-xray-stats-sync
   rm -f /usr/local/sbin/sultan-tunnel-shell
   sed -i '\|/usr/local/sbin/sultan-tunnel-shell|d' /etc/shells 2>/dev/null || true
   rm -f /etc/systemd/system/user-.slice.d/50-sultan-ipaccounting.conf
@@ -5765,8 +6470,9 @@ chmod +x "$PANEL"
 
 echo "[5/6] Enabling services..."
 systemctl daemon-reload
-systemctl enable sultan-quota.timer >/dev/null 2>&1 || true
+systemctl enable sultan-quota.timer sultan-xray-stats.timer >/dev/null 2>&1 || true
 systemctl restart sultan-quota.timer
+systemctl restart sultan-xray-stats.timer
 systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
 systemctl enable nginx haproxy vnstat fail2ban 2>/dev/null || true
 if sshd -t; then
@@ -5814,10 +6520,16 @@ sysctl -p /etc/sysctl.d/99-sultan-bbr.conf >/dev/null 2>&1 || sysctl --system >/
 
 /usr/local/sbin/sultan-quota-sync || true
 
+echo "[Before V2Ray setup] Checking existing VMess/VLESS/Trojan users..."
+if ! handle_existing_xray_users_before_ready; then
+  echo "Existing V2Ray user delete/restore step failed."
+  SULTAN_INSTALL_STATUS=1
+fi
+
 echo "[6/6] Ready setup..."
 echo "You will be asked for your domain. The installer will continue automatically after setup."
-SULTAN_INSTALL_STATUS=0
-if ! "$PANEL" --ready-install; then
+SULTAN_INSTALL_STATUS="${SULTAN_INSTALL_STATUS:-0}"
+if [ "$SULTAN_INSTALL_STATUS" -eq 0 ] && ! "$PANEL" --ready-install; then
   echo "Ready setup failed. Fix the error above, then run: menu"
   echo "Xray status:"
   systemctl status xray --no-pager -l 2>/dev/null || true
