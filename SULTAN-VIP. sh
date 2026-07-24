@@ -2,7 +2,7 @@
 # ==========================================================
 # SULTAN VIP FULL PURPLE MENU INSTALL
 # Full verified installer + full panel + SSL/TLS/SNI/WS/V2Ray WebSocket
-# Build: v33-VMESS-LINK V33-BASE + REAL-VMESS-LINK-MENU + REAL-PER-USER-LOGIN-STATS
+# Build: v33-VMESS-LINK V33-BASE + REAL-VMESS-LINK-MENU + REAL-PER-USER-LOGIN-STATS + LIVE-PRESERVED-XRAY + ORDERED-ONLINE-USERS + EXACT-N-LIVE-LINKS + LIVE-ONLINE-DECREMENT
 # Integrated real SSH login limit + per-user GB quota
 # Quick reports show current/peak logins for the selected account, not server-wide totals.
 # 0 Max Login = Unlimited
@@ -35,9 +35,9 @@ PANEL="/usr/local/bin/menu"
 LIMIT_DIR="$BASE/limits"
 
 mkdir -p "$BASE" "$XDB" "$LIMIT_DIR"
-touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db"
+touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db"
 chmod 700 "$BASE" "$XDB" "$LIMIT_DIR"
-chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db"
+chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db"
 
 # Store unlimited quota/login limits as the literal numeric value 0.
 # This also repairs legacy Unlimited values, whitespace and CRLF endings.
@@ -292,6 +292,7 @@ handle_existing_xray_users_before_ready(){
   local CFG="/usr/local/etc/xray/config.json" ANSWER BACKUP_DIR NOW
   local TAG PROTO DBF LIST_FILE CONFIG_FILE COUNT=0 IMPORTED=0 DELETED=0
   local OLD_TAG PATHX EMAIL VALUE NAME BASE_NAME SUFFIX DOMAIN CREATED
+  local EXISTING_NAME TMP_DB CANON_PATH
 
   mkdir -p "$XDB"
   touch "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db" "$XDB/usage.db"
@@ -312,7 +313,7 @@ handle_existing_xray_users_before_ready(){
       .protocol as $p |
       (.tag // ($p + "-ws")) as $tag |
       (.streamSettings.wsSettings.path // ("/" + $p + "-ws")) as $path |
-      .settings.clients[]? |
+      (((.settings.clients // []) + (.settings.users // []))[]) |
       select((((.email // "") | startswith("_sultan_placeholder_")) | not)) |
       [$p, $tag, $path, (.email // ""), (.id // .password // "")] | @tsv
     ' "$CFG" > "$CONFIG_FILE" 2>/dev/null || : > "$CONFIG_FILE"
@@ -353,12 +354,13 @@ handle_existing_xray_users_before_ready(){
         mkdir -p "$BACKUP_DIR"
         chmod 700 "$XDB/preinstall-backups" "$BACKUP_DIR" 2>/dev/null || true
         for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db" \
-                   "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db"; do
+                   "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db"; do
           [ -f "$DBF" ] && cp -a "$DBF" "$BACKUP_DIR/" 2>/dev/null || true
           : > "$DBF"
           chmod 600 "$DBF"
         done
-        rm -f "$XDB/.preserve-existing-xray-config" "$XDB/preserved-config.json"
+        rm -f "$XDB/.preserve-existing-xray-config" "$XDB/.preserved-live-pending" \
+          "$XDB/preserved-config.json" "$XDB/preserved-link-fields.db" "$XDB/preserved-ws-aliases.db"
         if [ -f "$CFG" ]; then
           cp -a "$CFG" "$BACKUP_DIR/config.json" 2>/dev/null || true
           rm -f "$CFG"
@@ -371,13 +373,16 @@ handle_existing_xray_users_before_ready(){
         ;;
 
       n|N)
-        # Keep the exact working Xray configuration. This preserves every
-        # UUID/password and WebSocket path instead of rebuilding them later.
+        # Save the original configuration as the source of truth. During ready
+        # setup it is normalized only at the server-facing layer (tags, local
+        # ports and WebSocket listener), while every client UUID/password and
+        # client object is retained and loaded into the active Xray service.
         if [ -s "$CFG" ] && jq -e '
-          ([.inbounds[]? |
-            select((.tag=="vless-ws" or .tag=="vmess-ws" or .tag=="trojan-ws") and
-                   ((.streamSettings.network // "") == "ws"))] | length) == 3 and
-          (.outbounds | type == "array")
+          (.inbounds | type == "array") and
+          any(.inbounds[]?;
+            (.protocol=="vmess" or .protocol=="vless" or .protocol=="trojan") and
+            ((.streamSettings.network // "ws") == "ws")
+          )
         ' "$CFG" >/dev/null 2>&1; then
           cp -a "$CFG" "$XDB/preserved-config.json"
           chmod 600 "$XDB/preserved-config.json"
@@ -386,6 +391,35 @@ handle_existing_xray_users_before_ready(){
         else
           rm -f "$XDB/.preserve-existing-xray-config" "$XDB/preserved-config.json"
         fi
+
+        # Snapshot every client-facing field before integration. These fields
+        # generate the original link shown by the panel. A preserved account is
+        # not accepted later if its username, domain, path, Host, SNI,
+        # allowInsecure value or connection address changes.
+        : > "$XDB/preserved-link-fields.db"
+        : > "$XDB/preserved-ws-aliases.db"
+        for TAG in vmess-ws vless-ws trojan-ws; do
+          DBF="$XDB/$TAG.db"
+          awk -F'|' -v t="$TAG" '
+            BEGIN{OFS="|"}
+            NF && $2!="" {
+              while(NF<14) $(NF+1)=""
+              print t,$2,$1,$5,$6,$11,$12,$13,$14
+            }
+          ' "$DBF" 2>/dev/null >> "$XDB/preserved-link-fields.db" || true
+        done
+
+        # Keep every original WebSocket path as a public alias. This lets an
+        # old link continue working even when more than one legacy path existed
+        # for the same protocol. Nginx rewrites aliases internally to the
+        # canonical Xray listener without changing the client's link.
+        awk -F'\t' '
+          $1=="vmess" || $1=="vless" || $1=="trojan" {
+            if($3 ~ /^\/[A-Za-z0-9._~-]+(\/[A-Za-z0-9._~-]+)*$/)
+              print $1 "-ws|" $3
+          }
+        ' "$CONFIG_FILE" 2>/dev/null >> "$XDB/preserved-ws-aliases.db" || true
+        chmod 600 "$XDB/preserved-link-fields.db" "$XDB/preserved-ws-aliases.db"
 
         DOMAIN="$(cat "$DOMAIN_FILE" 2>/dev/null || true)"
         if ! [[ "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
@@ -402,8 +436,37 @@ handle_existing_xray_users_before_ready(){
           TAG="${PROTO}-ws"
           DBF="$XDB/$TAG.db"
 
-          # Preserve any existing SULTAN row containing this exact UUID/password.
-          if awk -F'|' -v v="$VALUE" '$2==v{found=1} END{exit !found}' "$DBF" 2>/dev/null; then
+          case "$PATHX" in
+            /*) ;;
+            *) PATHX="/${PROTO}-ws" ;;
+          esac
+          if [[ "$PATHX" == *"|"* || "$PATHX" =~ [[:space:]] ]]; then
+            PATHX="/${PROTO}-ws"
+          fi
+
+          # When this credential already exists in the SULTAN database, retain
+          # its account limits/name but repair its protocol and real WS path.
+          EXISTING_NAME="$(awk -F'|' -v v="$VALUE" '$2==v{print $1;exit}' "$DBF" 2>/dev/null || true)"
+          if [ -n "$EXISTING_NAME" ]; then
+            TMP_DB="$(mktemp "$XDB/.preserve-row.XXXXXX")" || { rm -f "$LIST_FILE" "$CONFIG_FILE"; return 1; }
+            awk -F'|' -v v="$VALUE" -v p="$PROTO" -v path="$PATHX" -v d="$DOMAIN" '
+              BEGIN{OFS="|"}
+              {
+                while(NF<14) $(NF+1)=""
+                if($2==v){
+                  $3=p
+                  $4="ws"
+                  if($6=="" || $6 !~ /^\//) $6=path
+                  if($5=="" || $5=="Not Set" || $5=="pending.invalid") $5=d
+                  if($11=="" || $11=="Not Set" || $11=="pending.invalid") $11=d
+                  if($12=="" || $12=="Not Set" || $12=="pending.invalid") $12=d
+                  if($14=="" || $14=="Not Set" || $14=="pending.invalid") $14=d
+                }
+                print
+              }
+            ' "$DBF" > "$TMP_DB" || { rm -f "$TMP_DB" "$LIST_FILE" "$CONFIG_FILE"; return 1; }
+            chmod 600 "$TMP_DB"
+            mv -f "$TMP_DB" "$DBF"
             continue
           fi
 
@@ -416,14 +479,6 @@ handle_existing_xray_users_before_ready(){
             NAME="${BASE_NAME:0:56}_${SUFFIX}"
           done
 
-          case "$PATHX" in
-            /*) ;;
-            *) PATHX="/${PROTO}-ws" ;;
-          esac
-          if [[ "$PATHX" == *"|"* || "$PATHX" =~ [[:space:]] ]]; then
-            PATHX="/${PROTO}-ws"
-          fi
-
           printf '%s|%s|%s|ws|%s|%s|0|0|0|%s|%s|%s|0|%s\n' \
             "$NAME" "$VALUE" "$PROTO" "$DOMAIN" "$PATHX" "$CREATED" \
             "$DOMAIN" "$DOMAIN" "$DOMAIN" >> "$DBF"
@@ -431,13 +486,38 @@ handle_existing_xray_users_before_ready(){
           IMPORTED=$((IMPORTED + 1))
         done < "$CONFIG_FILE"
 
+        # Record every path already stored by the panel as an alias too. Do
+        # not overwrite existing link paths: the first valid path remains the
+        # canonical backend path and every additional old path is routed to it.
+        for PROTO in vmess vless trojan; do
+          TAG="${PROTO}-ws"
+          DBF="$XDB/$TAG.db"
+          awk -F'|' -v t="$TAG" '
+            NF && $6 ~ /^\/[A-Za-z0-9._~-]+(\/[A-Za-z0-9._~-]+)*$/ {print t "|" $6}
+          ' "$DBF" 2>/dev/null >> "$XDB/preserved-ws-aliases.db" || true
+        done
+        sort -u "$XDB/preserved-ws-aliases.db" -o "$XDB/preserved-ws-aliases.db"
+        chmod 600 "$XDB/preserved-ws-aliases.db"
+
+        # The same public path cannot belong to two different protocols. Stop
+        # instead of silently changing an old link.
+        if awk -F'|' '
+          {if(path_tag[$2]!="" && path_tag[$2]!=$1){bad=1} else path_tag[$2]=$1}
+          END{exit !bad}
+        ' "$XDB/preserved-ws-aliases.db"; then
+          echo "Cannot preserve exactly: one WebSocket path is shared by different protocols."
+          rm -f "$LIST_FILE" "$CONFIG_FILE"
+          return 1
+        fi
+
         for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db"; do
           normalize_limit_fields_zero "$DBF" 7 8 9
         done
         rm -f "$LIST_FILE" "$CONFIG_FILE"
         echo "Preserved existing SULTAN V2Ray databases."
         echo "Imported missing users from config.json: $IMPORTED"
-        echo "Original UUID/password values were kept unchanged."
+        echo "Original UUID/password and client information were kept unchanged."
+        echo "The preserved accounts will be installed into the live Xray service during ready setup."
         return 0
         ;;
 
@@ -1226,12 +1306,13 @@ XDB="/etc/sultan/xray"
 USAGE="$XDB/usage.db"
 OVERVIEW="$XDB/overview.db"
 USER_ONLINE="$XDB/user-online.db"
+ONLINE_SESSIONS="$XDB/online-sessions.db"
 LOCK="/run/lock/sultan-xray-stats.lock"
 API="127.0.0.1:10090"
 
 mkdir -p "$XDB" /run/lock
-touch "$USAGE" "$OVERVIEW" "$USER_ONLINE"
-chmod 600 "$USAGE" "$OVERVIEW" "$USER_ONLINE"
+touch "$USAGE" "$OVERVIEW" "$USER_ONLINE" "$ONLINE_SESSIONS"
+chmod 600 "$USAGE" "$OVERVIEW" "$USER_ONLINE" "$ONLINE_SESSIONS"
 
 BIN=""
 for B in /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
@@ -1243,10 +1324,14 @@ command -v jq >/dev/null 2>&1 || exit 0
 
 RAW="$(mktemp "$XDB/.xray-stats-raw.XXXXXX")" || exit 1
 PARSED="$(mktemp "$XDB/.xray-stats-parsed.XXXXXX")" || { rm -f "$RAW"; exit 1; }
-NEW="$(mktemp "$XDB/.xray-usage.XXXXXX")" || { rm -f "$RAW" "$PARSED"; exit 1; }
-NEW_OVERVIEW="$(mktemp "$XDB/.xray-overview.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$NEW"; exit 1; }
-NEW_USER_ONLINE="$(mktemp "$XDB/.xray-user-online.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$NEW" "$NEW_OVERVIEW"; exit 1; }
-trap 'rm -f "$RAW" "$PARSED" "$NEW" "$NEW_OVERVIEW" "$NEW_USER_ONLINE"' EXIT
+ONLINE_ALL_RAW="$(mktemp "$XDB/.xray-online-all-raw.XXXXXX")" || { rm -f "$RAW" "$PARSED"; exit 1; }
+ONLINE_IP_ROWS="$(mktemp "$XDB/.xray-online-ip-rows.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW"; exit 1; }
+LIVE_PUBLIC_IPS="$(mktemp "$XDB/.xray-live-public-ips.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW" "$ONLINE_IP_ROWS"; exit 1; }
+NEW="$(mktemp "$XDB/.xray-usage.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW" "$ONLINE_IP_ROWS" "$LIVE_PUBLIC_IPS"; exit 1; }
+NEW_OVERVIEW="$(mktemp "$XDB/.xray-overview.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW" "$ONLINE_IP_ROWS" "$LIVE_PUBLIC_IPS" "$NEW"; exit 1; }
+NEW_USER_ONLINE="$(mktemp "$XDB/.xray-user-online.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW" "$ONLINE_IP_ROWS" "$LIVE_PUBLIC_IPS" "$NEW" "$NEW_OVERVIEW"; exit 1; }
+NEW_ONLINE_SESSIONS="$(mktemp "$XDB/.xray-online-sessions.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW" "$ONLINE_IP_ROWS" "$LIVE_PUBLIC_IPS" "$NEW" "$NEW_OVERVIEW" "$NEW_USER_ONLINE"; exit 1; }
+trap 'rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW" "$ONLINE_IP_ROWS" "$LIVE_PUBLIC_IPS" "$NEW" "$NEW_OVERVIEW" "$NEW_USER_ONLINE" "$NEW_ONLINE_SESSIONS"' EXIT
 
 if ! "$BIN" api statsquery --server="$API" -pattern 'user>>>' >"$RAW" 2>/dev/null; then
   exit 0
@@ -1257,6 +1342,45 @@ jq -r '
   select((.name // "") | startswith("user>>>")) |
   [(.name // ""), ((.value // 0) | tonumber? // 0)] | @tsv
 ' "$RAW" > "$PARSED" 2>/dev/null || exit 0
+
+# Query every online Xray account in one API call. The IP list is unique per
+# account, so reconnecting the same device cannot make 1 become 2, 3, 4...
+# The VPS socket table is then used to discard IPs that no longer have a live
+# public TLS connection on port 443.
+ONLINE_API_OK=0
+if timeout 4 "$BIN" api statsonlineiplist --server="$API" -all >"$ONLINE_ALL_RAW" 2>/dev/null &&
+   jq -e '(.users // []) | type == "array"' "$ONLINE_ALL_RAW" >/dev/null 2>&1; then
+  jq -r '
+    .users[]? as $u |
+    ($u.ips // [])[]? |
+    [($u.email // ""), (.ip // ""), ((.lastSeen // .last_seen // 0) | tonumber? // 0)] |
+    @tsv
+  ' "$ONLINE_ALL_RAW" > "$ONLINE_IP_ROWS" 2>/dev/null || : > "$ONLINE_IP_ROWS"
+  ONLINE_API_OK=1
+else
+  : > "$ONLINE_IP_ROWS"
+fi
+
+# HAProxy owns the public :443 sockets. Count only peer IPs that are currently
+# present in the kernel socket table. IPv4, IPv6 and IPv4-mapped IPv6 are
+# normalized to the same text used by the Xray online-IP API.
+ss -Htn state established 2>/dev/null | awk '
+  {
+    local_ep=$(NF-1)
+    peer_ep=$NF
+    if(local_ep !~ /:443$/ && local_ep !~ /\]:443$/) next
+
+    ip=peer_ep
+    if(ip ~ /^\[/){
+      sub(/^\[/, "", ip)
+      sub(/\]:[0-9]+$/, "", ip)
+    } else {
+      sub(/:[0-9]+$/, "", ip)
+    }
+    sub(/^::ffff:/, "", ip)
+    if(ip!="" && ip!="127.0.0.1" && ip!="::1" && ip!="*") print ip
+  }
+' | sort -u > "$LIVE_PUBLIC_IPS"
 
 exec 9>"$LOCK"
 flock -w 4 -x 9 || exit 0
@@ -1316,38 +1440,56 @@ for TAG in vmess-ws vless-ws trojan-ws; do
       "$TAG" "$USER" "$TOTAL" "$CUR_UP" "$CUR_DOWN" "$NOW" \
       "$TODAY" "$DAY_BYTES" "$MONTH" "$MONTH_BYTES" >> "$NEW"
 
-    # Track the selected account's real online count and daily peak. The old
-    # implementation used the whole protocol port, which made one offline user
-    # appear to have hundreds of logins when other customers were connected.
     OLD_USER_ONLINE="$(awk -F'|' -v t="$TAG" -v u="$USER" '$1==t && $2==u{print;exit}' "$USER_ONLINE" 2>/dev/null || true)"
     ONLINE_DAY="$(printf '%s\n' "$OLD_USER_ONLINE" | awk -F'|' '{print $3}')"
     ONLINE_PEAK="$(printf '%s\n' "$OLD_USER_ONLINE" | awk -F'|' '{print $4}')"
-    ONLINE_CURRENT="$(printf '%s\n' "$OLD_USER_ONLINE" | awk -F'|' '{print $5}')"
     [[ "$ONLINE_PEAK" =~ ^[0-9]+$ ]] || ONLINE_PEAK=0
-    [[ "$ONLINE_CURRENT" =~ ^[0-9]+$ ]] || ONLINE_CURRENT=0
     [ "$ONLINE_DAY" = "$TODAY" ] || ONLINE_PEAK=0
+    ONLINE_CURRENT=0
 
-    ONLINE_OUT="$(timeout 2 "$BIN" api statsonline --server="$API" -email "$EMAIL" 2>&1)"
-    ONLINE_STATUS=$?
-    if [ "$ONLINE_STATUS" -eq 0 ]; then
-      ONLINE_VALUE="$(printf '%s\n' "$ONLINE_OUT" | jq -r '.. | objects | select(has("value")) | .value' 2>/dev/null | head -n1)"
-      [[ "$ONLINE_VALUE" =~ ^[0-9]+$ ]] && ONLINE_CURRENT="$ONLINE_VALUE"
-    elif printf '%s\n' "$ONLINE_OUT" | grep -qi 'not found'; then
-      ONLINE_CURRENT=0
+    if [ "$ONLINE_API_OK" = "1" ]; then
+      # Count unique Xray IPs only when the same IP still has a live public
+      # port-443 socket. A dead/replaced IP disappears instead of remaining in
+      # the total and being counted again on every reconnect.
+      ONLINE_CURRENT="$(awk -F'\t' -v e="$EMAIL" '
+        NR==FNR {if($1!="") live[$1]=1; next}
+        $1==e && live[$2] && !seen[$2]++ {n++}
+        END {print n+0}
+      ' "$LIVE_PUBLIC_IPS" "$ONLINE_IP_ROWS")"
+      [[ "$ONLINE_CURRENT" =~ ^[0-9]+$ ]] || ONLINE_CURRENT=0
+
+      # Some reverse-proxy/core combinations cannot expose the real client IP.
+      # Fresh traffic is still authoritative proof that this account is online.
+      if [ "$ONLINE_CURRENT" -eq 0 ] && [ "$DELTA" -gt 0 ]; then
+        ONLINE_CURRENT=1
+      fi
+    else
+      # Old cores without the bulk IP API are never trusted for an increasing
+      # counter. Report one only when this account produced traffic in the
+      # current scan; this prevents an old stale map from climbing forever.
+      [ "$DELTA" -gt 0 ] && ONLINE_CURRENT=1 || ONLINE_CURRENT=0
     fi
 
     [ "$ONLINE_CURRENT" -gt "$ONLINE_PEAK" ] && ONLINE_PEAK="$ONLINE_CURRENT"
     printf '%s|%s|%s|%s|%s|%s\n' \
       "$TAG" "$USER" "$TODAY" "$ONLINE_PEAK" "$ONLINE_CURRENT" "$NOW" >> "$NEW_USER_ONLINE"
+
+    # Keep one active-session row per Xray account. The row is omitted as soon
+    # as the real current count reaches zero. Reconnecting then receives a new
+    # start time and moves to the end of the ordered online list.
+    if [ "$ONLINE_CURRENT" -gt 0 ]; then
+      OLD_SESSION="$(awk -F'|' -v t="$TAG" -v u="$USER" '$1==t && $2==u{print;exit}' "$ONLINE_SESSIONS" 2>/dev/null || true)"
+      SESSION_START="$(printf '%s\n' "$OLD_SESSION" | awk -F'|' '{print $3}')"
+      SESSION_LAST="$(printf '%s\n' "$OLD_SESSION" | awk -F'|' '{print $4}')"
+      if ! [[ "$SESSION_START" =~ ^[0-9]+$ && "$SESSION_LAST" =~ ^[0-9]+$ ]] || [ "$((NOW-SESSION_LAST))" -gt 8 ]; then
+        SESSION_START="$NOW"
+      fi
+      printf '%s|%s|%s|%s|%s\n' \
+        "$TAG" "$USER" "$SESSION_START" "$NOW" "$ONLINE_CURRENT" >> "$NEW_ONLINE_SESSIONS"
+    fi
   done < "$DBF"
 
-  case "$TAG" in
-    vless-ws) PORT=10000 ;;
-    vmess-ws) PORT=10085 ;;
-    trojan-ws) PORT=10086 ;;
-  esac
-
-  CURRENT="$(ss -Htn state established 2>/dev/null | awk -v p=":$PORT" '$4 ~ (p "$"){n++} END{print n+0}')"
+  CURRENT="$(awk -F'|' -v t="$TAG" '$1==t && $5 ~ /^[0-9]+$/ {s+=$5} END{print s+0}' "$NEW_USER_ONLINE")"
   [[ "$CURRENT" =~ ^[0-9]+$ ]] || CURRENT=0
   OLD_OVERVIEW="$(awk -F'|' -v t="$TAG" '$1==t{print;exit}' "$OVERVIEW" 2>/dev/null || true)"
   OLD_DAY="$(printf '%s\n' "$OLD_OVERVIEW" | awk -F'|' '{print $2}')"
@@ -1358,12 +1500,13 @@ for TAG in vmess-ws vless-ws trojan-ws; do
   printf '%s|%s|%s|%s|%s\n' "$TAG" "$TODAY" "$PEAK" "$CURRENT" "$NOW" >> "$NEW_OVERVIEW"
 done
 
-chmod 600 "$NEW" "$NEW_OVERVIEW" "$NEW_USER_ONLINE"
+chmod 600 "$NEW" "$NEW_OVERVIEW" "$NEW_USER_ONLINE" "$NEW_ONLINE_SESSIONS"
 mv -f "$NEW" "$USAGE"
 mv -f "$NEW_OVERVIEW" "$OVERVIEW"
 mv -f "$NEW_USER_ONLINE" "$USER_ONLINE"
+mv -f "$NEW_ONLINE_SESSIONS" "$ONLINE_SESSIONS"
 trap - EXIT
-rm -f "$RAW" "$PARSED"
+rm -f "$RAW" "$PARSED" "$ONLINE_ALL_RAW" "$ONLINE_IP_ROWS" "$LIVE_PUBLIC_IPS"
 exit 0
 XRAY_STATS_SYNC
 
@@ -1386,8 +1529,8 @@ cat >/etc/systemd/system/sultan-xray-stats.timer <<'EOF'
 Description=SULTAN Xray statistics collector
 
 [Timer]
-OnBootSec=5s
-OnUnitActiveSec=5s
+OnBootSec=2s
+OnUnitActiveSec=2s
 AccuracySec=1s
 Persistent=true
 
@@ -1425,14 +1568,15 @@ DEVICE_SESSIONS="$BASE/limits/device_sessions.log"
 XRAY_USAGE_DB="$XDB/usage.db"
 XRAY_OVERVIEW_DB="$XDB/overview.db"
 XRAY_USER_ONLINE_DB="$XDB/user-online.db"
+XRAY_ONLINE_SESSIONS_DB="$XDB/online-sessions.db"
 WS_TOKEN_FILE="$BASE/ws_token"
 
 mkdir -p "$BASE" "$XDB" "$BASE/limits"
-touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB"
+touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" "$XRAY_ONLINE_SESSIONS_DB"
 touch "$BASE/limits/blocked.db"
 touch "$BASE/limits/quota-locked.db"
 chmod 700 "$BASE" "$XDB" "$BASE/limits" 2>/dev/null || true
-chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" 2>/dev/null || true
+chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" "$XRAY_ONLINE_SESSIONS_DB" 2>/dev/null || true
 
 DB_LOCK="/run/lock/sultan-db.lock"
 QUOTA_LOCK="/run/lock/sultan-quota-state.lock"
@@ -2168,14 +2312,13 @@ xray_protocol_total_bytes(){
 }
 
 xray_protocol_current_users(){
-  local TAG="$1" PORT
-  case "$TAG" in
-    vless-ws) PORT=10000 ;;
-    vmess-ws) PORT=10085 ;;
-    trojan-ws) PORT=10086 ;;
-    *) echo 0; return ;;
-  esac
-  ss -Htn state established 2>/dev/null | awk -v p=":$PORT" '$4 ~ (p "$"){n++} END{print n+0}'
+  local TAG="$1" NOW
+  xray_stats_sync
+  NOW="$(date +%s)"
+  awk -F'|' -v t="$TAG" -v now="$NOW" '
+    $1==t && $5 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+$/ && (now-$6)<=8 {s+=$5}
+    END{print s+0}
+  ' "$XRAY_USER_ONLINE_DB" 2>/dev/null
 }
 
 xray_protocol_peak_today(){
@@ -3030,7 +3173,7 @@ xray_stats_sync(){
 }
 
 xray_usage_remove_user(){
-  local TAG="$1" U="$2" TMP TMP_ONLINE LOCK="/run/lock/sultan-xray-stats.lock"
+  local TAG="$1" U="$2" TMP TMP_ONLINE TMP_SESSION LOCK="/run/lock/sultan-xray-stats.lock"
   mkdir -p /run/lock
   (
     flock -w 5 -x 9 || exit 1
@@ -3048,6 +3191,13 @@ xray_usage_remove_user(){
       chmod 600 "$TMP_ONLINE"
       mv -f "$TMP_ONLINE" "$XRAY_USER_ONLINE_DB"
     fi
+
+    if [ -f "$XRAY_ONLINE_SESSIONS_DB" ]; then
+      TMP_SESSION="$(mktemp "$XDB/.xray-session-remove.XXXXXX")" || exit 1
+      awk -F'|' -v t="$TAG" -v u="$U" '!($1==t && $2==u)' "$XRAY_ONLINE_SESSIONS_DB" > "$TMP_SESSION" 2>/dev/null || true
+      chmod 600 "$TMP_SESSION"
+      mv -f "$TMP_SESSION" "$XRAY_ONLINE_SESSIONS_DB"
+    fi
   ) 9>"$LOCK"
 }
 
@@ -3059,20 +3209,15 @@ xray_user_used_bytes(){
 }
 
 xray_user_online_count(){
-  local TAG="$1" U="$2" EMAIL BIN OUT VALUE STATUS
-  EMAIL="$(xray_stats_email "$TAG" "$U")"
-  BIN="$(xray_binary 2>/dev/null || true)"
-  [ -n "$BIN" ] || { echo "Unknown"; return; }
-  OUT="$("$BIN" api statsonline --server=127.0.0.1:10090 -email "$EMAIL" 2>&1)"
-  STATUS=$?
-  if [ "$STATUS" -ne 0 ]; then
-    # Xray returns NotFound until an offline user has created an online map.
-    printf '%s\n' "$OUT" | grep -qi 'not found' && { echo 0; return; }
-    echo "Unknown"
-    return
-  fi
-  VALUE="$(printf '%s\n' "$OUT" | jq -r '.. | objects | select(has("value")) | .value' 2>/dev/null | head -n1)"
-  [[ "$VALUE" =~ ^[0-9]+$ ]] || { echo "Unknown"; return; }
+  local TAG="$1" U="$2" NOW ROW VALUE UPDATED
+  xray_stats_sync
+  NOW="$(date +%s)"
+  ROW="$(awk -F'|' -v t="$TAG" -v u="$U" '$1==t && $2==u{print;exit}' "$XRAY_USER_ONLINE_DB" 2>/dev/null || true)"
+  VALUE="$(printf '%s\n' "$ROW" | awk -F'|' '{print $5}')"
+  UPDATED="$(printf '%s\n' "$ROW" | awk -F'|' '{print $6}')"
+  [[ "$VALUE" =~ ^[0-9]+$ ]] || VALUE=0
+  [[ "$UPDATED" =~ ^[0-9]+$ ]] || { echo 0; return; }
+  [ "$((NOW-UPDATED))" -le 8 ] || VALUE=0
   echo "$VALUE"
 }
 
@@ -3236,7 +3381,7 @@ while true; do
     11) reboot ;;
     12) about_menu ;;
     13) vps_info ;;
-    14) online_users_menu ;;
+    14) online_all_users_menu ;;
     15) refresh_screen; speedtest-cli || true; pause ;;
     16) domain_menu ;;
     17) ssl_menu ;;
@@ -3269,7 +3414,7 @@ while true; do
     1) create_ssh_user ;;
     2) change_ssh_user_menu ;;
     3) delete_ssh_user_direct ;;
-    4) online_users_menu ;;
+    4) online_ssh_users_menu ;;
     5) quick_user_report ;;
     6) ssh_user_statistics_menu ;;
     0) return ;;
@@ -3839,6 +3984,305 @@ xray_sync_users_from_db(){
       xray_jq_update "$FILTER" --arg value "$VALUE" --arg email "$STAT_EMAIL" --arg tag "$TAG" || return 1
     done < "$DBF"
   done
+}
+
+
+# Convert an existing hand-written V2Ray/Xray WebSocket configuration into the
+# panel's live server layout without replacing its client credentials. Only the
+# server-facing transport is normalized: standard tags, loopback ports and WS
+# paths. Unrelated inbounds, outbounds, routing and DNS settings are retained.
+xray_prepare_preserved_config(){
+  local SOURCE="$XDB/preserved-config.json" TMP_CFG
+  local VLESS_PATH VMESS_PATH TROJAN_PATH
+  [ -s "$SOURCE" ] || return 1
+
+  VLESS_PATH="$(xray_saved_path vless-ws)"
+  VMESS_PATH="$(xray_saved_path vmess-ws)"
+  TROJAN_PATH="$(xray_saved_path trojan-ws)"
+  TMP_CFG="$(mktemp --suffix=.json "/usr/local/etc/xray/.preserved-live.XXXXXX")" || return 1
+
+  if ! python3 - "$SOURCE" "$TMP_CFG" "$VLESS_PATH" "$VMESS_PATH" "$TROJAN_PATH" <<'PYXRAYPRESERVE'
+import copy
+import json
+import re
+import sys
+
+source, target, vless_path, vmess_path, trojan_path = sys.argv[1:]
+with open(source, "r", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+
+if not isinstance(cfg, dict):
+    raise SystemExit("configuration root is not an object")
+
+inbounds = cfg.get("inbounds")
+if not isinstance(inbounds, list):
+    raise SystemExit("inbounds is not an array")
+
+specs = {
+    "vless": {"tag": "vless-ws", "port": 10000, "path": vless_path, "placeholder": {"id": "00000000-0000-4000-8000-000000000001", "email": "_sultan_placeholder_vless", "level": 0}},
+    "vmess": {"tag": "vmess-ws", "port": 10085, "path": vmess_path, "placeholder": {"id": "00000000-0000-4000-8000-000000000002", "email": "_sultan_placeholder_vmess", "level": 0}},
+    "trojan": {"tag": "trojan-ws", "port": 10086, "path": trojan_path, "placeholder": {"password": "sultan-preserved-placeholder", "email": "_sultan_placeholder_trojan", "level": 0}},
+}
+
+def valid_path(value, fallback):
+    if not isinstance(value, str):
+        return fallback
+    if not re.fullmatch(r"/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*", value):
+        return fallback
+    return value
+
+for proto, spec in specs.items():
+    spec["path"] = valid_path(spec["path"], f"/{proto}-ws")
+
+supported = []
+kept = []
+tag_map = {}
+for inbound in inbounds:
+    if not isinstance(inbound, dict):
+        kept.append(inbound)
+        continue
+    proto = inbound.get("protocol")
+    stream = inbound.get("streamSettings") or {}
+    network = stream.get("network", "ws") if isinstance(stream, dict) else ""
+    if proto in specs and network == "ws":
+        supported.append(inbound)
+        old_tag = inbound.get("tag")
+        if isinstance(old_tag, str) and old_tag:
+            tag_map[old_tag] = specs[proto]["tag"]
+    else:
+        kept.append(inbound)
+
+canonical = []
+for proto, spec in specs.items():
+    candidates = [i for i in supported if i.get("protocol") == proto]
+    template = copy.deepcopy(candidates[0]) if candidates else {}
+
+    clients = []
+    seen = set()
+    for inbound in candidates:
+        settings = inbound.get("settings") or {}
+        if not isinstance(settings, dict):
+            continue
+        values = []
+        for key in ("clients", "users"):
+            item = settings.get(key)
+            if isinstance(item, list):
+                values.extend(item)
+        for client in values:
+            if not isinstance(client, dict):
+                continue
+            credential = client.get("password") if proto == "trojan" else client.get("id")
+            if not isinstance(credential, str) or not credential:
+                continue
+            if credential in seen:
+                continue
+            seen.add(credential)
+            clients.append(copy.deepcopy(client))
+
+    if not clients:
+        clients = [copy.deepcopy(spec["placeholder"])]
+
+    settings = template.get("settings")
+    settings = copy.deepcopy(settings) if isinstance(settings, dict) else {}
+    settings.pop("users", None)
+    settings["clients"] = clients
+    if proto == "vless":
+        settings["decryption"] = "none"
+
+    stream = template.get("streamSettings")
+    stream = copy.deepcopy(stream) if isinstance(stream, dict) else {}
+    stream["network"] = "ws"
+    stream["security"] = "none"
+    stream.pop("method", None)
+    stream.pop("tlsSettings", None)
+    stream.pop("realitySettings", None)
+    stream.pop("xtlsSettings", None)
+    ws = stream.get("wsSettings")
+    ws = copy.deepcopy(ws) if isinstance(ws, dict) else {}
+    ws["path"] = spec["path"]
+    stream["wsSettings"] = ws
+
+    template["tag"] = spec["tag"]
+    template["listen"] = "127.0.0.1"
+    template["port"] = spec["port"]
+    template["protocol"] = proto
+    template["settings"] = settings
+    template["streamSettings"] = stream
+    canonical.append(template)
+
+cfg["inbounds"] = kept + canonical
+
+outbounds = cfg.get("outbounds")
+if not isinstance(outbounds, list) or not outbounds:
+    cfg["outbounds"] = [{"tag": "direct", "protocol": "direct", "settings": {}}]
+
+cfg["stats"] = cfg.get("stats") if isinstance(cfg.get("stats"), dict) else {}
+cfg["api"] = {"tag": "api", "listen": "127.0.0.1:10090", "services": ["StatsService"]}
+policy = cfg.get("policy")
+policy = copy.deepcopy(policy) if isinstance(policy, dict) else {}
+levels = policy.get("levels")
+levels = copy.deepcopy(levels) if isinstance(levels, dict) else {}
+level0 = levels.get("0")
+level0 = copy.deepcopy(level0) if isinstance(level0, dict) else {}
+level0.update({"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True})
+levels["0"] = level0
+policy["levels"] = levels
+system = policy.get("system")
+system = copy.deepcopy(system) if isinstance(system, dict) else {}
+system.update({
+    "statsInboundUplink": True,
+    "statsInboundDownlink": True,
+    "statsOutboundUplink": True,
+    "statsOutboundDownlink": True,
+})
+policy["system"] = system
+cfg["policy"] = policy
+
+routing = cfg.get("routing")
+if isinstance(routing, dict) and isinstance(routing.get("rules"), list):
+    for rule in routing["rules"]:
+        if not isinstance(rule, dict):
+            continue
+        tags = rule.get("inboundTag")
+        if isinstance(tags, list):
+            rule["inboundTag"] = list(dict.fromkeys(tag_map.get(tag, tag) for tag in tags))
+        elif isinstance(tags, str):
+            rule["inboundTag"] = tag_map.get(tags, tags)
+
+with open(target, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+PYXRAYPRESERVE
+  then
+    rm -f "$TMP_CFG"
+    echo "Failed to prepare the preserved Xray configuration."
+    return 1
+  fi
+
+  chmod 600 "$TMP_CFG"
+  if ! xray_test_file "$TMP_CFG"; then
+    echo "Xray rejected the preserved configuration after server integration."
+    [ -n "${XRAY_TEST_ERROR:-}" ] && printf '%s\n' "$XRAY_TEST_ERROR"
+    rm -f "$TMP_CFG"
+    return 1
+  fi
+
+  [ -f "$XRAY_CONFIG" ] && cp -a "$XRAY_CONFIG" "$XRAY_CONFIG.before-preserved.$(date +%Y%m%d%H%M%S)"
+  mv -f "$TMP_CFG" "$XRAY_CONFIG"
+  chown root:root "$XRAY_CONFIG"
+  chmod 600 "$XRAY_CONFIG"
+}
+
+# A preserved account is accepted only after its exact UUID/password has been
+# found in the active canonical inbound with the statistics email used by the
+# panel. This prevents database-only/fake accounts from being reported as live.
+xray_verify_db_users_loaded(){
+  local TAG DBF U VALUE REST EMAIL FAILED=0
+  [ -s "$XRAY_CONFIG" ] || return 1
+  for TAG in vless-ws vmess-ws trojan-ws; do
+    DBF="$XDB/$TAG.db"
+    [ -f "$DBF" ] || continue
+    while IFS='|' read -r U VALUE REST; do
+      [ -n "$U" ] && [ -n "$VALUE" ] || continue
+      EMAIL="$(xray_stats_email "$TAG" "$U")"
+      case "$TAG" in
+        trojan-ws)
+          jq -e --arg tag "$TAG" --arg value "$VALUE" --arg email "$EMAIL" '
+            any(.inbounds[]? | select(.tag==$tag) | .settings.clients[]?;
+                (.password // "") == $value and (.email // "") == $email)
+          ' "$XRAY_CONFIG" >/dev/null 2>&1 || {
+            echo "Missing live TROJAN credential for user: $U"
+            FAILED=1
+          }
+          ;;
+        vmess-ws|vless-ws)
+          jq -e --arg tag "$TAG" --arg value "$VALUE" --arg email "$EMAIL" '
+            any(.inbounds[]? | select(.tag==$tag) | .settings.clients[]?;
+                (.id // "") == $value and (.email // "") == $email)
+          ' "$XRAY_CONFIG" >/dev/null 2>&1 || {
+            echo "Missing live ${TAG%-ws} credential for user: $U"
+            FAILED=1
+          }
+          ;;
+      esac
+    done < "$DBF"
+  done
+  [ "$FAILED" -eq 0 ]
+}
+
+
+# Verify that every link field which already existed before choosing n remains
+# byte-for-byte unchanged in the SULTAN database. Empty legacy fields may be
+# completed from the selected server domain because no complete old link could
+# have been generated from an empty value.
+xray_verify_preserved_link_fields(){
+  local SNAP="$XDB/preserved-link-fields.db" TAG VALUE OLD_USER OLD_DOMAIN OLD_PATH OLD_HOST OLD_SNI OLD_AI OLD_ADDR
+  local DBF LINE USER DOMAIN PATHX HOST SNI AI ADDR FAILED=0
+  [ -s "$SNAP" ] || return 0
+
+  while IFS='|' read -r TAG VALUE OLD_USER OLD_DOMAIN OLD_PATH OLD_HOST OLD_SNI OLD_AI OLD_ADDR; do
+    [ -n "$TAG" ] && [ -n "$VALUE" ] || continue
+    DBF="$XDB/$TAG.db"
+    LINE="$(awk -F'|' -v v="$VALUE" '$2==v{print;exit}' "$DBF" 2>/dev/null || true)"
+    if [ -z "$LINE" ]; then
+      echo "Preserved link record is missing for credential: $VALUE"
+      FAILED=1
+      continue
+    fi
+    USER="$(printf '%s\n' "$LINE" | awk -F'|' '{print $1}')"
+    DOMAIN="$(printf '%s\n' "$LINE" | awk -F'|' '{print $5}')"
+    PATHX="$(printf '%s\n' "$LINE" | awk -F'|' '{print $6}')"
+    HOST="$(printf '%s\n' "$LINE" | awk -F'|' '{print $11}')"
+    SNI="$(printf '%s\n' "$LINE" | awk -F'|' '{print $12}')"
+    AI="$(printf '%s\n' "$LINE" | awk -F'|' '{print $13}')"
+    ADDR="$(printf '%s\n' "$LINE" | awk -F'|' '{print $14}')"
+
+    [ -z "$OLD_USER" ] || [ "$USER" = "$OLD_USER" ] || { echo "Preserved username changed: $OLD_USER -> $USER"; FAILED=1; }
+    [ -z "$OLD_DOMAIN" ] || [ "$DOMAIN" = "$OLD_DOMAIN" ] || { echo "Preserved domain changed for $OLD_USER"; FAILED=1; }
+    [ -z "$OLD_PATH" ] || [ "$PATHX" = "$OLD_PATH" ] || { echo "Preserved path changed for $OLD_USER"; FAILED=1; }
+    [ -z "$OLD_HOST" ] || [ "$HOST" = "$OLD_HOST" ] || { echo "Preserved Host changed for $OLD_USER"; FAILED=1; }
+    [ -z "$OLD_SNI" ] || [ "$SNI" = "$OLD_SNI" ] || { echo "Preserved SNI changed for $OLD_USER"; FAILED=1; }
+    [ -z "$OLD_AI" ] || [ "$AI" = "$OLD_AI" ] || { echo "Preserved allowInsecure changed for $OLD_USER"; FAILED=1; }
+    [ -z "$OLD_ADDR" ] || [ "$ADDR" = "$OLD_ADDR" ] || { echo "Preserved address changed for $OLD_USER"; FAILED=1; }
+  done < "$SNAP"
+  [ "$FAILED" -eq 0 ]
+}
+
+# Confirm that each saved legacy alias exists in the generated Nginx file and
+# routes to the correct canonical protocol listener.
+xray_verify_preserved_alias_config(){
+  local FILE="/etc/nginx/conf.d/sultan-ready.conf" ALIASES="$XDB/preserved-ws-aliases.db"
+  local TAG ALIAS CANON PORT FAILED=0
+  [ -s "$ALIASES" ] || return 0
+  [ -s "$FILE" ] || return 1
+
+  while IFS='|' read -r TAG ALIAS; do
+    validate_ws_path "$ALIAS" || continue
+    case "$TAG" in
+      vless-ws) CANON="$(xray_current_path vless-ws /vless-ws)"; PORT=10000 ;;
+      vmess-ws) CANON="$(xray_current_path vmess-ws /vmess-ws)"; PORT=10085 ;;
+      trojan-ws) CANON="$(xray_current_path trojan-ws /trojan-ws)"; PORT=10086 ;;
+      *) continue ;;
+    esac
+    python3 - "$FILE" "$ALIAS" "$CANON" "$PORT" <<'PYALIASVERIFY' || FAILED=1
+import re
+import sys
+from pathlib import Path
+
+filename, alias, canonical, port = sys.argv[1:]
+text = Path(filename).read_text(encoding="utf-8")
+pattern = r"location\s*=\s*" + re.escape(alias) + r"\s*\{(?P<body>.*?)\n\s*\}"
+m = re.search(pattern, text, re.S)
+if not m:
+    raise SystemExit(1)
+body = m.group("body")
+if f"proxy_pass http://127.0.0.1:{port};" not in body:
+    raise SystemExit(1)
+if alias != canonical and f"rewrite ^ {canonical} break;" not in body:
+    raise SystemExit(1)
+PYALIASVERIFY
+  done < "$ALIASES"
+  [ "$FAILED" -eq 0 ]
 }
 
 create_xray_config(){
@@ -4458,22 +4902,24 @@ xray_proto_menu(){
     echo "[1] Create ${PROTO^^} WS User"
     echo "[2] Change User"
     echo "[3] Delete User"
-    echo "[4] Show Statistics + Link"
-    echo "[5] Quick User Report"
-    echo "[6] Change WebSocket Path"
-    echo "[7] ${PROTO^^} User Statistics"
-    echo "[8] List Links"
+    echo "[4] Online Users"
+    echo "[5] Show Statistics + Link"
+    echo "[6] Quick User Report"
+    echo "[7] Change WebSocket Path"
+    echo "[8] ${PROTO^^} User Statistics"
+    echo "[9] List Links"
     echo "[0] Back"
     read -p "Select: " x
     case "$x" in
       1) create_xray_user "$PROTO" "$TAG" "$PATHX" ;;
       2) change_xray_user_menu "$PROTO" "$TAG" ;;
       3) delete_xray_user "$PROTO" "$TAG" "$FIELD" ;;
-      4) show_xray_user_statistics "$PROTO" "$TAG" ;;
-      5) xray_quick_user_report "$PROTO" "$TAG" ;;
-      6) change_xray_path_menu "$PROTO" "$TAG" "$PATHX" ;;
-      7) show_xray_traffic_statistics "$PROTO" "$TAG" ;;
-      8)
+      4) online_xray_users_menu "$PROTO" "$TAG" ;;
+      5) show_xray_user_statistics "$PROTO" "$TAG" ;;
+      6) xray_quick_user_report "$PROTO" "$TAG" ;;
+      7) change_xray_path_menu "$PROTO" "$TAG" "$PATHX" ;;
+      8) show_xray_traffic_statistics "$PROTO" "$TAG" ;;
+      9)
         refresh_screen
         while IFS='|' read -r U VALUE P NET DOMAIN PATHX_DB EXP QUOTA LOGIN CREATED CLIENT_HOST CLIENT_SNI ALLOW_INSECURE CLIENT_ADDR REST; do
           [ -n "$U" ] || continue
@@ -4950,11 +5396,48 @@ open_main_ports(){
   fi
 }
 
+nginx_xray_alias_locations(){
+  local VLESS_PATH="$1" VMESS_PATH="$2" TROJAN_PATH="$3"
+  local FILE="$XDB/preserved-ws-aliases.db" TAG ALIAS CANON PORT
+  [ -s "$FILE" ] || return 0
+
+  while IFS='|' read -r TAG ALIAS; do
+    validate_ws_path "$ALIAS" || continue
+    case "$TAG" in
+      vless-ws) CANON="$VLESS_PATH"; PORT=10000 ;;
+      vmess-ws) CANON="$VMESS_PATH"; PORT=10085 ;;
+      trojan-ws) CANON="$TROJAN_PATH"; PORT=10086 ;;
+      *) continue ;;
+    esac
+    [ "$ALIAS" = "$CANON" ] && continue
+    cat <<EOF
+    # Preserved legacy V2Ray link path. The client keeps the old path exactly.
+    location = $ALIAS {
+        rewrite ^ $CANON break;
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+EOF
+  done < <(sort -u "$FILE")
+}
+
 write_nginx_config(){
-  local D="$1" CERT="$2" KEY="$3" WS_TOKEN="$4" VLESS_PATH VMESS_PATH TROJAN_PATH
+  local D="$1" CERT="$2" KEY="$3" WS_TOKEN="$4" VLESS_PATH VMESS_PATH TROJAN_PATH XRAY_ALIAS_BLOCKS
   VLESS_PATH="$(xray_current_path vless-ws /vless-ws)"
   VMESS_PATH="$(xray_current_path vmess-ws /vmess-ws)"
   TROJAN_PATH="$(xray_current_path trojan-ws /trojan-ws)"
+  XRAY_ALIAS_BLOCKS="$(nginx_xray_alias_locations "$VLESS_PATH" "$VMESS_PATH" "$TROJAN_PATH")"
   mkdir -p /var/www/sultan-acme /etc/nginx/conf.d
   chmod 755 /var/www/sultan-acme
   cat >/etc/nginx/conf.d/sultan-ready.conf <<EOF
@@ -5029,6 +5512,8 @@ server {
         proxy_send_timeout 86400;
     }
 
+$XRAY_ALIAS_BLOCKS
+
     # New secure path remains available for existing v14 clients.
     location = /sshws-$WS_TOKEN {
         proxy_pass http://sultan_ssh_ws_backend;
@@ -5079,6 +5564,8 @@ defaults
     timeout client 7d
     timeout server 7d
     timeout tunnel 7d
+    timeout client-fin 1s
+    timeout server-fin 1s
     option clitcpka
     option srvtcpka
 
@@ -5352,6 +5839,11 @@ mandatory_502_preinstall_fix(){
     fi
 
     if [ "$ATTEMPT" -eq 1 ]; then
+      if [ -f "$XDB/.preserved-live-pending" ]; then
+        echo "A preserved WebSocket backend failed. The original UUID/password configuration was not regenerated."
+        echo "Fix the reported mapping/service error and run the installer again with n."
+        return 1
+      fi
       echo "A WebSocket backend failed. Rebuilding only Xray/proxy configuration..."
       create_xray_config --quiet || return 1
       refresh_proxy_config_from_current || return 1
@@ -5585,6 +6077,135 @@ PYHTTP
   return 1
 }
 
+# Run a real local tunnel through a preserved credential. This tests protocol
+# authentication and WebSocket transport, not merely an HTTP 101 handshake.
+xray_preserved_backend_auth_test(){
+  local PROTO="$1" VALUE="$2" PATHX="$3" PORT="$4" BIN
+  local SOCKS_PORT HTTP_PORT TMPDIR CLIENT_CFG CLIENT_LOG HTTP_PID XRAY_PID RESULT TRY
+  BIN="$(xray_binary 2>/dev/null || true)"
+  [ -n "$BIN" ] || return 1
+  validate_ws_path "$PATHX" || return 1
+  [[ "$PORT" =~ ^[0-9]+$ ]] || return 1
+
+  SOCKS_PORT="$(python3 - <<'PYPORT'
+import socket
+s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()
+PYPORT
+)"
+  HTTP_PORT="$(python3 - <<'PYPORT'
+import socket
+s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()
+PYPORT
+)"
+  TMPDIR="$(mktemp -d /tmp/sultan-preserved-auth.XXXXXX)" || return 1
+  CLIENT_CFG="$TMPDIR/client.json"
+  CLIENT_LOG="$TMPDIR/client.log"
+
+  python3 - "$CLIENT_CFG" "$PROTO" "$VALUE" "$PATHX" "$PORT" "$SOCKS_PORT" <<'PYPRESERVEDCLIENT' || { rm -rf "$TMPDIR"; return 1; }
+import json
+import sys
+
+filename, proto, value, path, port, socks_port = sys.argv[1:]
+port = int(port)
+socks_port = int(socks_port)
+if proto == "vmess":
+    settings = {"vnext": [{"address": "127.0.0.1", "port": port, "users": [{"id": value, "security": "auto"}]}]}
+elif proto == "vless":
+    settings = {"vnext": [{"address": "127.0.0.1", "port": port, "users": [{"id": value, "encryption": "none"}]}]}
+elif proto == "trojan":
+    settings = {"servers": [{"address": "127.0.0.1", "port": port, "password": value}]}
+else:
+    raise SystemExit(1)
+cfg = {
+    "log": {"loglevel": "warning"},
+    "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"auth": "noauth", "udp": False}}],
+    "outbounds": [{"protocol": proto, "settings": settings, "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": path}}}],
+}
+with open(filename, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+PYPRESERVEDCLIENT
+
+  xray_test_file "$CLIENT_CFG" || { rm -rf "$TMPDIR"; return 1; }
+
+  python3 - "$HTTP_PORT" <<'PYHTTP' >"$TMPDIR/http.log" 2>&1 &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port=int(sys.argv[1])
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body=b"SULTAN-PRESERVED-LIVE"
+        self.send_response(200)
+        self.send_header("Content-Length",str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, fmt, *args):
+        pass
+HTTPServer(("127.0.0.1",port),Handler).handle_request()
+PYHTTP
+  HTTP_PID=$!
+
+  "$BIN" run -config "$CLIENT_CFG" >"$CLIENT_LOG" 2>&1 &
+  XRAY_PID=$!
+  for TRY in {1..12}; do
+    ss -H -ltn "sport = :$SOCKS_PORT" 2>/dev/null | grep -q . && break
+    kill -0 "$XRAY_PID" 2>/dev/null || break
+    sleep 1
+  done
+  RESULT="$(curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:$SOCKS_PORT" "http://127.0.0.1:$HTTP_PORT/health" 2>/dev/null || true)"
+
+  kill "$XRAY_PID" "$HTTP_PID" 2>/dev/null || true
+  wait "$XRAY_PID" 2>/dev/null || true
+  wait "$HTTP_PID" 2>/dev/null || true
+  if [ "$RESULT" = "SULTAN-PRESERVED-LIVE" ]; then
+    rm -rf "$TMPDIR"
+    return 0
+  fi
+  echo "Preserved $PROTO credential failed the real backend tunnel test."
+  tail -n 20 "$CLIENT_LOG" 2>/dev/null || true
+  rm -rf "$TMPDIR"
+  return 1
+}
+
+xray_verify_preserved_accounts_end_to_end(){
+  local TAG PROTO PORT DBF U VALUE PATHX TESTED=0
+  for TAG in vless-ws vmess-ws trojan-ws; do
+    case "$TAG" in
+      vless-ws) PROTO=vless; PORT=10000 ;;
+      vmess-ws) PROTO=vmess; PORT=10085 ;;
+      trojan-ws) PROTO=trojan; PORT=10086 ;;
+    esac
+    DBF="$XDB/$TAG.db"
+    [ -s "$DBF" ] || continue
+    IFS='|' read -r U VALUE _ _ _ PATHX _ < "$DBF" || true
+    [ -n "$U" ] && [ -n "$VALUE" ] || continue
+    validate_ws_path "$PATHX" || PATHX="$(xray_current_path "$TAG" "$(xray_default_path "$TAG")")"
+    echo "Testing preserved ${PROTO^^} account through the real Xray backend: $U"
+    xray_preserved_backend_auth_test "$PROTO" "$VALUE" "$PATHX" "$PORT" || return 1
+    TESTED=$((TESTED + 1))
+  done
+  [ "$TESTED" -gt 0 ] || { echo "No preserved V2Ray credentials were available for a live authentication test."; return 1; }
+  return 0
+}
+
+xray_verify_preserved_aliases_live(){
+  local D="$1" FILE="$XDB/preserved-ws-aliases.db" TAG PATHX CODE FAILED=0
+  [ -s "$FILE" ] || return 0
+  if current_session_via_ws; then
+    echo "Public preserved-path probes are deferred until this WebSocket SSH session closes; the validated Nginx mappings are queued for reload."
+    return 0
+  fi
+  while IFS='|' read -r TAG PATHX; do
+    validate_ws_path "$PATHX" || continue
+    CODE="$(websocket_status_code "$D" "$PATHX")"
+    if [ "$CODE" != "101" ]; then
+      echo "Preserved path failed public WebSocket verification: $PATHX returned HTTP ${CODE:-000}."
+      FAILED=1
+    fi
+  done < "$FILE"
+  [ "$FAILED" -eq 0 ]
+}
+
 v2ray_ws_self_test(){
   local D="$1" TAG PATHX PORT CODE FAILED=0 VLESS_ID
   [ -n "$D" ] && [ "$D" != "Not Set" ] || { echo "Domain is not set."; return 1; }
@@ -5713,24 +6334,40 @@ setup_ready(){
 
   if [ -f "$XDB/.preserve-existing-xray-config" ] && [ -s "$XDB/preserved-config.json" ]; then
     mkdir -p "$(dirname "$XRAY_CONFIG")"
-    cp -a "$XDB/preserved-config.json" "$XRAY_CONFIG"
-    chown root:root "$XRAY_CONFIG"
-    chmod 600 "$XRAY_CONFIG"
-    xray_fix_service_access
 
-    if xray_test_file "$XRAY_CONFIG"; then
-      # Add only database users that are missing. Existing UUID/password and
-      # paths remain unchanged because matching clients are updated in place.
-      xray_sync_users_from_db || echo "Warning: some saved database users could not be synchronized. Existing Xray clients were kept unchanged."
-      xray_restart_safe || { echo "Preserved Xray config failed to start."; pause; return 1; }
-      rm -f "$XDB/.preserve-existing-xray-config"
-      echo "Existing Xray config restored with the same UUID/password and WebSocket paths."
-    else
-      echo "Preserved Xray config is invalid; rebuilding from the saved user databases."
-      rm -f "$XDB/.preserve-existing-xray-config"
-      create_xray_config --quiet || { echo "Xray WebSocket config creation failed."; pause; return 1; }
-      ensure_xray_config || { echo "Xray config is invalid."; pause; return 1; }
-    fi
+    # Choosing n means the old clients must become real live Xray clients, not
+    # database-only rows. Preserve each client object/UUID/password, integrate
+    # it into the standard server listeners, then verify it before continuing.
+    xray_prepare_preserved_config || {
+      echo "Preserved V2Ray/Xray configuration could not be integrated safely."
+      echo "Nothing was regenerated and the saved UUID/password values remain in: $XDB/preserved-config.json"
+      pause
+      return 1
+    }
+    xray_fix_service_access
+    xray_sync_users_from_db || {
+      echo "Failed to load every preserved account into the active Xray configuration."
+      pause
+      return 1
+    }
+    xray_verify_db_users_loaded || {
+      echo "Preserved-account verification failed; installation stopped before reporting success."
+      pause
+      return 1
+    }
+    xray_test_file "$XRAY_CONFIG" || {
+      echo "Integrated Xray configuration is invalid."
+      [ -n "${XRAY_TEST_ERROR:-}" ] && printf '%s\n' "$XRAY_TEST_ERROR"
+      pause
+      return 1
+    }
+    xray_restart_safe || { echo "Preserved Xray config failed to start."; pause; return 1; }
+    wait_tcp_listener 10000 || { pause; return 1; }
+    wait_tcp_listener 10085 || { pause; return 1; }
+    wait_tcp_listener 10086 || { pause; return 1; }
+    touch "$XDB/.preserved-live-pending"
+    chmod 600 "$XDB/.preserved-live-pending"
+    echo "Existing Xray accounts were loaded with the same UUID/password and are pending final live-link verification."
   else
     create_xray_config --quiet || { echo "Xray WebSocket config creation failed."; pause; return 1; }
     ensure_xray_config || { echo "Xray config is invalid."; pause; return 1; }
@@ -5789,6 +6426,17 @@ RENEW_HOOK
     echo "Ready setup stopped because the mandatory 502 check failed."
     pause
     return 1
+  fi
+
+  if [ -f "$XDB/.preserved-live-pending" ]; then
+    echo "Verifying that choosing n kept the exact old links and activated their credentials..."
+    xray_verify_preserved_link_fields || { echo "An existing link field changed; installation stopped."; pause; return 1; }
+    xray_verify_db_users_loaded || { echo "A preserved UUID/password is not loaded in Xray."; pause; return 1; }
+    xray_verify_preserved_alias_config || { echo "A preserved WebSocket path is not mapped in Nginx."; pause; return 1; }
+    xray_verify_preserved_accounts_end_to_end || { echo "Preserved credential authentication failed."; pause; return 1; }
+    xray_verify_preserved_aliases_live "$D" || { echo "A preserved public link path failed."; pause; return 1; }
+    rm -f "$XDB/.preserved-live-pending" "$XDB/.preserve-existing-xray-config"
+    echo "Preserved V2Ray links are active with the same UUID/password and client-facing link fields."
   fi
 
   if current_session_via_ws; then
@@ -6055,59 +6703,161 @@ vps_info(){
   pause
 }
 
-online_users_menu(){
-  refresh_screen
-  echo "========================================"
-  echo "             ONLINE USERS"
-  echo "========================================"
+online_duration_text(){
+  local S="${1:-0}" D H M SEC
+  [[ "$S" =~ ^[0-9]+$ ]] || S=0
+  [ "$S" -lt 0 ] && S=0
+  D=$((S / 86400))
+  H=$(((S % 86400) / 3600))
+  M=$(((S % 3600) / 60))
+  SEC=$((S % 60))
+  if [ "$D" -gt 0 ]; then
+    printf "%dd %02dh %02dm" "$D" "$H" "$M"
+  elif [ "$H" -gt 0 ]; then
+    printf "%02dh %02dm %02ds" "$H" "$M" "$SEC"
+  else
+    printf "%02dm %02ds" "$M" "$SEC"
+  fi
+}
 
-  local FOUND=0 N=1 U PID IP LIMIT ACTIVE DIR SLOT SAVED_START CURRENT_START CMD
-  while IFS='|' read -r U _ _ _ LIMIT; do
+online_login_time_text(){
+  local T="${1:-0}"
+  [[ "$T" =~ ^[0-9]+$ ]] || { echo "Unknown"; return; }
+  date -d "@$T" "+%d/%m %H:%M:%S" 2>/dev/null || echo "Unknown"
+}
+
+ssh_user_first_active_start(){
+  local U="$1" DIR="/run/sultan-login-slots/$1" SLOT PID CMD SAVED_START CURRENT_START CREATED MIN=""
+  [ -d "$DIR" ] || { echo 0; return; }
+  shopt -s nullglob
+  for SLOT in "$DIR"/*; do
+    PID="${SLOT##*/}"
+    [[ "$PID" =~ ^[0-9]+$ ]] || continue
+    [ -d "/proc/$PID" ] || continue
+    CMD="$(cat "/proc/$PID/comm" 2>/dev/null || true)"
+    SAVED_START="$(awk -F= '$1=="start"{print $2;exit}' "$SLOT" 2>/dev/null || true)"
+    CURRENT_START="$(awk '{print $22}' "/proc/$PID/stat" 2>/dev/null || true)"
+    [ "$CMD" = "sshd" ] || continue
+    [ -n "$SAVED_START" ] && [ "$SAVED_START" = "$CURRENT_START" ] || continue
+    CREATED="$(awk -F= '$1=="created"{print $2;exit}' "$SLOT" 2>/dev/null || true)"
+    [[ "$CREATED" =~ ^[0-9]+$ ]] || continue
+    if [ -z "$MIN" ] || [ "$CREATED" -lt "$MIN" ]; then
+      MIN="$CREATED"
+    fi
+  done
+  shopt -u nullglob
+  echo "${MIN:-0}"
+}
+
+append_ssh_online_rows(){
+  local OUT="$1" U ACTIVE START
+  while IFS='|' read -r U _ _ _ _; do
     [ -n "$U" ] || continue
     id "$U" >/dev/null 2>&1 || continue
-
     ACTIVE="$(active_user_logins "$U")"
+    [[ "$ACTIVE" =~ ^[0-9]+$ ]] || ACTIVE=0
     [ "$ACTIVE" -gt 0 ] || continue
-    FOUND=1
-
-    case "$LIMIT" in
-      ""|0|Unlimited|unlimited|UNLIMITED) LIMIT_TEXT="Unlimited" ;;
-      *) LIMIT_TEXT="$LIMIT" ;;
-    esac
-
-    echo ""
-    printf "%s\n" "$U"
-    printf "Online Users : %s/%s\n" "$ACTIVE" "$LIMIT_TEXT"
-
-    DIR="/run/sultan-login-slots/$U"
-    shopt -s nullglob
-    for SLOT in "$DIR"/*; do
-      PID="${SLOT##*/}"
-      [[ "$PID" =~ ^[0-9]+$ ]] || continue
-      [ -d "/proc/$PID" ] || continue
-      CMD="$(cat "/proc/$PID/comm" 2>/dev/null || true)"
-      SAVED_START="$(awk -F= '$1=="start"{print $2;exit}' "$SLOT" 2>/dev/null || true)"
-      CURRENT_START="$(awk '{print $22}' "/proc/$PID/stat" 2>/dev/null || true)"
-      [ "$CMD" = "sshd" ] || continue
-      [ -n "$SAVED_START" ] && [ "$SAVED_START" = "$CURRENT_START" ] || continue
-
-      IP="$(awk -F= '$1=="rhost"{print $2;exit}' "$SLOT" 2>/dev/null || true)"
-      [ -n "$IP" ] || IP="Unknown"
-
-      printf "\n(%d) SSH Device\n" "$N"
-      printf "%-8s: %s\n" "IP" "$IP"
-      printf "%-8s: Active\n" "Login"
-      N=$((N+1))
-    done
-    shopt -u nullglob
+    START="$(ssh_user_first_active_start "$U")"
+    [[ "$START" =~ ^[0-9]+$ ]] && [ "$START" -gt 0 ] || START="$(date +%s)"
+    printf '%s|SSH|%s|%s\n' "$START" "$U" "$ACTIVE" >> "$OUT"
   done < "$DB"
+}
 
-  [ "$FOUND" = "1" ] || echo "No SSH users online."
-  echo ""
-  echo "========================================"
+xray_online_type(){
+  case "$1" in
+    vmess-ws) echo "VMESS" ;;
+    vless-ws) echo "VLESS" ;;
+    trojan-ws) echo "TROJAN" ;;
+    *) echo "XRAY" ;;
+  esac
+}
+
+append_xray_online_rows(){
+  local OUT="$1" FILTER_TAG="${2:-}" TAG U START LAST COUNT TYPE NOW
+  [ -f "$XRAY_ONLINE_SESSIONS_DB" ] || return 0
+  NOW="$(date +%s)"
+  while IFS='|' read -r TAG U START LAST COUNT; do
+    [ -n "$TAG" ] && [ -n "$U" ] || continue
+    [ -z "$FILTER_TAG" ] || [ "$TAG" = "$FILTER_TAG" ] || continue
+    [[ "$START" =~ ^[0-9]+$ ]] || continue
+    [[ "$LAST" =~ ^[0-9]+$ ]] || continue
+    [ "$((NOW-LAST))" -le 8 ] || continue
+    [[ "$COUNT" =~ ^[0-9]+$ ]] || COUNT=0
+    [ "$COUNT" -gt 0 ] || continue
+    TYPE="$(xray_online_type "$TAG")"
+    printf '%s|%s|%s|%s\n' "$START" "$TYPE" "$U" "$COUNT" >> "$OUT"
+  done < "$XRAY_ONLINE_SESSIONS_DB"
+}
+
+online_users_view(){
+  local SCOPE="$1" TITLE="$2" TAG="${3:-}" TMP SORTED NOW FOUND=0 N=1
+  local START TYPE U COUNT TOTAL_ACCOUNTS=0 TOTAL_CONNECTIONS=0
+
+  case "$SCOPE" in
+    all|xray) xray_stats_sync ;;
+  esac
+
+  TMP="$(mktemp "$BASE/.online-users.XXXXXX")" || { echo "Cannot create online list."; pause; return; }
+  SORTED="${TMP}.sorted"
+
+  case "$SCOPE" in
+    all)
+      append_ssh_online_rows "$TMP"
+      append_xray_online_rows "$TMP"
+      ;;
+    ssh)
+      append_ssh_online_rows "$TMP"
+      ;;
+    xray)
+      append_xray_online_rows "$TMP" "$TAG"
+      ;;
+  esac
+
+  sort -t'|' -k1,1n -k2,2 -k3,3 "$TMP" > "$SORTED" 2>/dev/null || : > "$SORTED"
+  rm -f "$TMP"
+  NOW="$(date +%s)"
+
+  refresh_screen
+  echo "================================================================================"
+  printf "                         %s\n" "$TITLE"
+  echo "================================================================================"
+  printf "%-4s %-8s %-24s %-7s %-17s %s\n" "NO" "TYPE" "USERNAME" "ONLINE" "LOGIN TIME" "ONLINE FOR"
+  echo "--------------------------------------------------------------------------------"
+
+  while IFS='|' read -r START TYPE U COUNT; do
+    [ -n "$U" ] || continue
+    FOUND=1
+    TOTAL_ACCOUNTS=$((TOTAL_ACCOUNTS + 1))
+    [[ "$COUNT" =~ ^[0-9]+$ ]] || COUNT=0
+    TOTAL_CONNECTIONS=$((TOTAL_CONNECTIONS + COUNT))
+    printf "%-4s %-8s %-24s %-7s %-17s %s\n" \
+      "$N" "$TYPE" "$U" "$COUNT" "$(online_login_time_text "$START")" "$(online_duration_text "$((NOW-START))")"
+    N=$((N + 1))
+  done < "$SORTED"
+  rm -f "$SORTED"
+
+  if [ "$FOUND" = "0" ]; then
+    echo "No users online."
+  fi
+  echo "--------------------------------------------------------------------------------"
+  printf "%-22s : %s\n" "Online Accounts" "$TOTAL_ACCOUNTS"
+  printf "%-22s : %s\n" "Active Connections" "$TOTAL_CONNECTIONS"
+  echo "================================================================================"
   pause
 }
 
+online_all_users_menu(){
+  online_users_view all "ALL ONLINE USERS - FIRST LOGIN TO LAST"
+}
+
+online_ssh_users_menu(){
+  online_users_view ssh "SSH ONLINE USERS - FIRST LOGIN TO LAST"
+}
+
+online_xray_users_menu(){
+  local PROTO="$1" TAG="$2"
+  online_users_view xray "${PROTO^^} ONLINE USERS - FIRST LOGIN TO LAST" "$TAG"
+}
 backup_menu(){
   refresh_screen
   echo "[1] Create Backup"
@@ -6527,6 +7277,7 @@ remove_script(){
   rm -f /etc/letsencrypt/renewal-hooks/deploy/sultan-reload.sh
   rm -f /etc/fail2ban/jail.d/sultan-sshd.conf
   rm -f /etc/sysctl.d/99-sultan-bbr.conf
+  rm -f /etc/sysctl.d/98-sultan-online-detection.conf
   sysctl --system >/dev/null 2>&1 || true
   nft delete table inet sultan_quota 2>/dev/null || true
   nft delete table inet sultan_limits 2>/dev/null || true
@@ -6612,6 +7363,16 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 sysctl -p /etc/sysctl.d/99-sultan-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+
+# HAProxy already enables TCP keepalive on public VPN sockets. Use a short,
+# conservative keepalive window so a phone that loses Internet is removed from
+# the kernel socket table in seconds instead of remaining ESTABLISHED for hours.
+cat >/etc/sysctl.d/98-sultan-online-detection.conf <<'EOF'
+net.ipv4.tcp_keepalive_time=5
+net.ipv4.tcp_keepalive_intvl=2
+net.ipv4.tcp_keepalive_probes=2
+EOF
+sysctl -p /etc/sysctl.d/98-sultan-online-detection.conf >/dev/null 2>&1 || true
 
 /usr/local/sbin/sultan-quota-sync || true
 
