@@ -2,8 +2,9 @@
 # ==========================================================
 # SULTAN VIP FULL PURPLE MENU INSTALL
 # Full verified installer + full panel + SSL/TLS/SNI/WS/V2Ray WebSocket
-# Build: v33-VMESS-LINK V33-BASE + REAL-VMESS-LINK-MENU
+# Build: v33-VMESS-LINK V33-BASE + REAL-VMESS-LINK-MENU + REAL-PER-USER-LOGIN-STATS
 # Integrated real SSH login limit + per-user GB quota
+# Quick reports show current/peak logins for the selected account, not server-wide totals.
 # 0 Max Login = Unlimited
 # 0 GB Limit   = Unlimited
 # ==========================================================
@@ -34,9 +35,9 @@ PANEL="/usr/local/bin/menu"
 LIMIT_DIR="$BASE/limits"
 
 mkdir -p "$BASE" "$XDB" "$LIMIT_DIR"
-touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db"
+touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db"
 chmod 700 "$BASE" "$XDB" "$LIMIT_DIR"
-chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db"
+chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db"
 
 # Store unlimited quota/login limits as the literal numeric value 0.
 # This also repairs legacy Unlimited values, whitespace and CRLF endings.
@@ -351,7 +352,8 @@ handle_existing_xray_users_before_ready(){
         BACKUP_DIR="$XDB/preinstall-backups/$NOW"
         mkdir -p "$BACKUP_DIR"
         chmod 700 "$XDB/preinstall-backups" "$BACKUP_DIR" 2>/dev/null || true
-        for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db" "$XDB/usage.db"; do
+        for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db" \
+                   "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db"; do
           [ -f "$DBF" ] && cp -a "$DBF" "$BACKUP_DIR/" 2>/dev/null || true
           : > "$DBF"
           chmod 600 "$DBF"
@@ -1223,12 +1225,13 @@ umask 077
 XDB="/etc/sultan/xray"
 USAGE="$XDB/usage.db"
 OVERVIEW="$XDB/overview.db"
+USER_ONLINE="$XDB/user-online.db"
 LOCK="/run/lock/sultan-xray-stats.lock"
 API="127.0.0.1:10090"
 
 mkdir -p "$XDB" /run/lock
-touch "$USAGE" "$OVERVIEW"
-chmod 600 "$USAGE" "$OVERVIEW"
+touch "$USAGE" "$OVERVIEW" "$USER_ONLINE"
+chmod 600 "$USAGE" "$OVERVIEW" "$USER_ONLINE"
 
 BIN=""
 for B in /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
@@ -1242,7 +1245,8 @@ RAW="$(mktemp "$XDB/.xray-stats-raw.XXXXXX")" || exit 1
 PARSED="$(mktemp "$XDB/.xray-stats-parsed.XXXXXX")" || { rm -f "$RAW"; exit 1; }
 NEW="$(mktemp "$XDB/.xray-usage.XXXXXX")" || { rm -f "$RAW" "$PARSED"; exit 1; }
 NEW_OVERVIEW="$(mktemp "$XDB/.xray-overview.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$NEW"; exit 1; }
-trap 'rm -f "$RAW" "$PARSED" "$NEW" "$NEW_OVERVIEW"' EXIT
+NEW_USER_ONLINE="$(mktemp "$XDB/.xray-user-online.XXXXXX")" || { rm -f "$RAW" "$PARSED" "$NEW" "$NEW_OVERVIEW"; exit 1; }
+trap 'rm -f "$RAW" "$PARSED" "$NEW" "$NEW_OVERVIEW" "$NEW_USER_ONLINE"' EXIT
 
 if ! "$BIN" api statsquery --server="$API" -pattern 'user>>>' >"$RAW" 2>/dev/null; then
   exit 0
@@ -1311,6 +1315,30 @@ for TAG in vmess-ws vless-ws trojan-ws; do
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
       "$TAG" "$USER" "$TOTAL" "$CUR_UP" "$CUR_DOWN" "$NOW" \
       "$TODAY" "$DAY_BYTES" "$MONTH" "$MONTH_BYTES" >> "$NEW"
+
+    # Track the selected account's real online count and daily peak. The old
+    # implementation used the whole protocol port, which made one offline user
+    # appear to have hundreds of logins when other customers were connected.
+    OLD_USER_ONLINE="$(awk -F'|' -v t="$TAG" -v u="$USER" '$1==t && $2==u{print;exit}' "$USER_ONLINE" 2>/dev/null || true)"
+    ONLINE_DAY="$(printf '%s\n' "$OLD_USER_ONLINE" | awk -F'|' '{print $3}')"
+    ONLINE_PEAK="$(printf '%s\n' "$OLD_USER_ONLINE" | awk -F'|' '{print $4}')"
+    ONLINE_CURRENT="$(printf '%s\n' "$OLD_USER_ONLINE" | awk -F'|' '{print $5}')"
+    [[ "$ONLINE_PEAK" =~ ^[0-9]+$ ]] || ONLINE_PEAK=0
+    [[ "$ONLINE_CURRENT" =~ ^[0-9]+$ ]] || ONLINE_CURRENT=0
+    [ "$ONLINE_DAY" = "$TODAY" ] || ONLINE_PEAK=0
+
+    ONLINE_OUT="$(timeout 2 "$BIN" api statsonline --server="$API" -email "$EMAIL" 2>&1)"
+    ONLINE_STATUS=$?
+    if [ "$ONLINE_STATUS" -eq 0 ]; then
+      ONLINE_VALUE="$(printf '%s\n' "$ONLINE_OUT" | jq -r '.. | objects | select(has("value")) | .value' 2>/dev/null | head -n1)"
+      [[ "$ONLINE_VALUE" =~ ^[0-9]+$ ]] && ONLINE_CURRENT="$ONLINE_VALUE"
+    elif printf '%s\n' "$ONLINE_OUT" | grep -qi 'not found'; then
+      ONLINE_CURRENT=0
+    fi
+
+    [ "$ONLINE_CURRENT" -gt "$ONLINE_PEAK" ] && ONLINE_PEAK="$ONLINE_CURRENT"
+    printf '%s|%s|%s|%s|%s|%s\n' \
+      "$TAG" "$USER" "$TODAY" "$ONLINE_PEAK" "$ONLINE_CURRENT" "$NOW" >> "$NEW_USER_ONLINE"
   done < "$DBF"
 
   case "$TAG" in
@@ -1330,9 +1358,10 @@ for TAG in vmess-ws vless-ws trojan-ws; do
   printf '%s|%s|%s|%s|%s\n' "$TAG" "$TODAY" "$PEAK" "$CURRENT" "$NOW" >> "$NEW_OVERVIEW"
 done
 
-chmod 600 "$NEW" "$NEW_OVERVIEW"
+chmod 600 "$NEW" "$NEW_OVERVIEW" "$NEW_USER_ONLINE"
 mv -f "$NEW" "$USAGE"
 mv -f "$NEW_OVERVIEW" "$OVERVIEW"
+mv -f "$NEW_USER_ONLINE" "$USER_ONLINE"
 trap - EXIT
 rm -f "$RAW" "$PARSED"
 exit 0
@@ -1395,14 +1424,15 @@ DEVICE_USAGE_DB="$BASE/limits/device_usage.db"
 DEVICE_SESSIONS="$BASE/limits/device_sessions.log"
 XRAY_USAGE_DB="$XDB/usage.db"
 XRAY_OVERVIEW_DB="$XDB/overview.db"
+XRAY_USER_ONLINE_DB="$XDB/user-online.db"
 WS_TOKEN_FILE="$BASE/ws_token"
 
 mkdir -p "$BASE" "$XDB" "$BASE/limits"
-touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB"
+touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB"
 touch "$BASE/limits/blocked.db"
 touch "$BASE/limits/quota-locked.db"
 chmod 700 "$BASE" "$XDB" "$BASE/limits" 2>/dev/null || true
-chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" 2>/dev/null || true
+chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" 2>/dev/null || true
 
 DB_LOCK="/run/lock/sultan-db.lock"
 QUOTA_LOCK="/run/lock/sultan-quota-state.lock"
@@ -2079,6 +2109,47 @@ ssh_peak_users_today(){
   stats_number "$PEAK"
 }
 
+ssh_user_peak_today(){
+  local U="$1" DAY_START NOW TMP F PID CMD SAVED_START CURRENT_START START PEAK
+  [ -n "$U" ] || { echo 0; return; }
+  DAY_START="$(date -d 'today 00:00:00' +%s)"
+  NOW="$(date +%s)"
+  TMP="$(mktemp "$BASE/limits/.ssh-user-peak.XXXXXX")" || { echo 0; return; }
+
+  awk -F'|' -v u="$U" -v ds="$DAY_START" -v now="$NOW" '
+    $1==u && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
+      start=$4+0; finish=$5+0
+      if(finish < ds || start > now) next
+      if(start < ds) start=ds
+      if(finish > now) finish=now
+      print start, 1
+      print finish+1, -1
+    }
+  ' "$DEVICE_SESSIONS" > "$TMP" 2>/dev/null || true
+
+  shopt -s nullglob
+  for F in "/run/sultan-login-slots/$U"/*; do
+    PID="${F##*/}"
+    [[ "$PID" =~ ^[0-9]+$ ]] || continue
+    [ -d "/proc/$PID" ] || continue
+    CMD="$(cat "/proc/$PID/comm" 2>/dev/null || true)"
+    SAVED_START="$(awk -F= '$1=="start"{print $2;exit}' "$F" 2>/dev/null || true)"
+    CURRENT_START="$(awk '{print $22}' "/proc/$PID/stat" 2>/dev/null || true)"
+    [ "$CMD" = "sshd" ] || continue
+    [ -n "$SAVED_START" ] && [ "$SAVED_START" = "$CURRENT_START" ] || continue
+    START="$(awk -F= '$1=="created"{print $2;exit}' "$F" 2>/dev/null || true)"
+    [[ "$START" =~ ^[0-9]+$ ]] || START="$NOW"
+    [ "$START" -lt "$DAY_START" ] && START="$DAY_START"
+    printf '%s %s\n' "$START" 1 >> "$TMP"
+    printf '%s %s\n' "$((NOW+1))" -1 >> "$TMP"
+  done
+  shopt -u nullglob
+
+  PEAK="$(sort -k1,1n -k2,2n "$TMP" 2>/dev/null | awk '{current+=$2; if(current>peak) peak=current} END{print peak+0}')"
+  rm -f "$TMP"
+  stats_number "$PEAK"
+}
+
 xray_protocol_today_bytes(){
   local TAG="$1" TODAY
   TODAY="$(date +%F)"
@@ -2111,6 +2182,13 @@ xray_protocol_peak_today(){
   local TAG="$1" TODAY PEAK
   TODAY="$(date +%F)"
   PEAK="$(awk -F'|' -v t="$TAG" -v d="$TODAY" '$1==t && $2==d{print $3;exit}' "$XRAY_OVERVIEW_DB" 2>/dev/null || true)"
+  stats_number "$PEAK"
+}
+
+xray_user_peak_today(){
+  local TAG="$1" U="$2" TODAY PEAK
+  TODAY="$(date +%F)"
+  PEAK="$(awk -F'|' -v t="$TAG" -v u="$U" -v d="$TODAY" '$1==t && $2==u && $3==d{print $4;exit}' "$XRAY_USER_ONLINE_DB" 2>/dev/null || true)"
   stats_number "$PEAK"
 }
 
@@ -2183,7 +2261,7 @@ quick_user_report(){
   quota_sync
 
   local INFO U P E Q L USED LIMIT_BYTES REMAIN_BYTES ACTIVE
-  local REMAIN_TEXT TOTAL_TEXT LOGIN_LEFT LN ACTION
+  local REMAIN_TEXT TOTAL_TEXT LOGIN_LEFT LOGIN_MAX_TEXT LN ACTION
   local TRAFFIC_TODAY TRAFFIC_MONTH TRAFFIC_TOTAL PEAK_TODAY CURRENT_ONLINE
 
   refresh_screen
@@ -2217,13 +2295,16 @@ quick_user_report(){
     case "$L" in
       Unlimited|unlimited|UNLIMITED|0|"")
         LOGIN_LEFT="Unlimited"
+        LOGIN_MAX_TEXT="Unlimited"
         ;;
       *)
+        LOGIN_MAX_TEXT="$L"
         if [[ "$L" =~ ^[0-9]+$ ]]; then
           LN=$((10#$L))
           [ "$ACTIVE" -ge "$LN" ] && LOGIN_LEFT=0 || LOGIN_LEFT=$((LN-ACTIVE))
         else
           LOGIN_LEFT="Unknown"
+          LOGIN_MAX_TEXT="Unknown"
         fi
         ;;
     esac
@@ -2231,8 +2312,8 @@ quick_user_report(){
     TRAFFIC_TODAY="$(stats_number "$(ssh_traffic_today_bytes)")"
     TRAFFIC_MONTH="$(stats_number "$(ssh_traffic_month_bytes)")"
     TRAFFIC_TOTAL="$(stats_number "$(ssh_traffic_total_bytes)")"
-    PEAK_TODAY="$(stats_number "$(ssh_peak_users_today)")"
-    CURRENT_ONLINE="$(stats_number "$(total_online_logins)")"
+    PEAK_TODAY="$(stats_number "$(ssh_user_peak_today "$U")")"
+    CURRENT_ONLINE="$ACTIVE"
 
     refresh_screen
     echo "----------------------------------------"
@@ -2252,8 +2333,8 @@ quick_user_report(){
     printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")"
     printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")"
     echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Max Users Today" "$PEAK_TODAY"
-    printf "%-22s : %s / Unlimited\n" "Current Online Users" "$CURRENT_ONLINE"
+    printf "%-22s : %s / %s\n" "Max Users Today" "$PEAK_TODAY" "$LOGIN_MAX_TEXT"
+    printf "%-22s : %s / %s\n" "Current Online Users" "$CURRENT_ONLINE" "$LOGIN_MAX_TEXT"
     echo "----------------------------------------"
     echo "1 - Live Traffic"
     echo "0 - Back"
@@ -2949,15 +3030,24 @@ xray_stats_sync(){
 }
 
 xray_usage_remove_user(){
-  local TAG="$1" U="$2" TMP LOCK="/run/lock/sultan-xray-stats.lock"
-  [ -f "$XRAY_USAGE_DB" ] || return 0
+  local TAG="$1" U="$2" TMP TMP_ONLINE LOCK="/run/lock/sultan-xray-stats.lock"
   mkdir -p /run/lock
   (
     flock -w 5 -x 9 || exit 1
-    TMP="$(mktemp "$XDB/.xray-usage-remove.XXXXXX")" || exit 1
-    awk -F'|' -v t="$TAG" -v u="$U" '!($1==t && $2==u)' "$XRAY_USAGE_DB" > "$TMP" 2>/dev/null || true
-    chmod 600 "$TMP"
-    mv -f "$TMP" "$XRAY_USAGE_DB"
+
+    if [ -f "$XRAY_USAGE_DB" ]; then
+      TMP="$(mktemp "$XDB/.xray-usage-remove.XXXXXX")" || exit 1
+      awk -F'|' -v t="$TAG" -v u="$U" '!($1==t && $2==u)' "$XRAY_USAGE_DB" > "$TMP" 2>/dev/null || true
+      chmod 600 "$TMP"
+      mv -f "$TMP" "$XRAY_USAGE_DB"
+    fi
+
+    if [ -f "$XRAY_USER_ONLINE_DB" ]; then
+      TMP_ONLINE="$(mktemp "$XDB/.xray-online-remove.XXXXXX")" || exit 1
+      awk -F'|' -v t="$TAG" -v u="$U" '!($1==t && $2==u)' "$XRAY_USER_ONLINE_DB" > "$TMP_ONLINE" 2>/dev/null || true
+      chmod 600 "$TMP_ONLINE"
+      mv -f "$TMP_ONLINE" "$XRAY_USER_ONLINE_DB"
+    fi
   ) 9>"$LOCK"
 }
 
@@ -4119,7 +4209,7 @@ show_xray_user_statistics(){
 xray_quick_user_report(){
   local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db"
   local LINE U VALUE NET DOMAIN PATHX EXP QUOTA LOGIN CREATED REST
-  local USED LIMIT_BYTES REMAIN_BYTES REMAIN_TEXT TOTAL_TEXT ACTIVE LOGIN_LEFT LN ACTION
+  local USED LIMIT_BYTES REMAIN_BYTES REMAIN_TEXT TOTAL_TEXT ACTIVE LOGIN_LEFT LOGIN_MAX_TEXT LN ACTION
   local TRAFFIC_TODAY TRAFFIC_MONTH TRAFFIC_TOTAL PEAK_TODAY CURRENT_ONLINE
 
   refresh_screen
@@ -4155,13 +4245,16 @@ xray_quick_user_report(){
     case "$LOGIN" in
       Unlimited|unlimited|UNLIMITED|0|"")
         LOGIN_LEFT="Unlimited"
+        LOGIN_MAX_TEXT="Unlimited"
         ;;
       *)
+        LOGIN_MAX_TEXT="$LOGIN"
         if [[ "$LOGIN" =~ ^[0-9]+$ ]] && [[ "$ACTIVE" =~ ^[0-9]+$ ]]; then
           LN=$((10#$LOGIN))
           [ "$ACTIVE" -ge "$LN" ] && LOGIN_LEFT=0 || LOGIN_LEFT=$((LN-ACTIVE))
         else
           LOGIN_LEFT="Unknown"
+          [[ "$LOGIN" =~ ^[0-9]+$ ]] || LOGIN_MAX_TEXT="Unknown"
         fi
         ;;
     esac
@@ -4169,8 +4262,11 @@ xray_quick_user_report(){
     TRAFFIC_TODAY="$(stats_number "$(xray_protocol_today_bytes "$TAG")")"
     TRAFFIC_MONTH="$(stats_number "$(xray_protocol_month_bytes "$TAG")")"
     TRAFFIC_TOTAL="$(stats_number "$(xray_protocol_total_bytes "$TAG")")"
-    PEAK_TODAY="$(stats_number "$(xray_protocol_peak_today "$TAG")")"
-    CURRENT_ONLINE="$(stats_number "$(xray_protocol_current_users "$TAG")")"
+    PEAK_TODAY="$(stats_number "$(xray_user_peak_today "$TAG" "$U")")"
+    if [[ "$ACTIVE" =~ ^[0-9]+$ ]] && [ "$ACTIVE" -gt "$PEAK_TODAY" ]; then
+      PEAK_TODAY="$ACTIVE"
+    fi
+    CURRENT_ONLINE="$ACTIVE"
 
     refresh_screen
     echo "----------------------------------------"
@@ -4190,8 +4286,8 @@ xray_quick_user_report(){
     printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")"
     printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")"
     echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Max Users Today" "$PEAK_TODAY"
-    printf "%-22s : %s / Unlimited\n" "Current Online Users" "$CURRENT_ONLINE"
+    printf "%-22s : %s / %s\n" "Max Users Today" "$PEAK_TODAY" "$LOGIN_MAX_TEXT"
+    printf "%-22s : %s / %s\n" "Current Online Users" "$CURRENT_ONLINE" "$LOGIN_MAX_TEXT"
     echo "----------------------------------------"
     echo "1 - Live Traffic"
     echo "0 - Back"
