@@ -39,6 +39,7 @@ touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-lock
 chmod 700 "$BASE" "$XDB" "$LIMIT_DIR"
 chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db"
 
+
 # Store unlimited quota/login limits as the literal numeric value 0.
 # This also repairs legacy Unlimited values, whitespace and CRLF endings.
 # Passwords remain in users.db for compatibility with the legacy panel behavior.
@@ -137,6 +138,7 @@ apt_retry install -y curl wget nginx haproxy openssh-server python3 \
   certbot python3-certbot-nginx ufw socat lsb-release bc jq uuid-runtime vnstat \
   fail2ban openssl speedtest-cli dnsutils iproute2 tar gzip ca-certificates psmisc \
   nftables procps gawk util-linux coreutils grep sed findutils passwd login
+apt_retry install -y unzip
 
 for CMD in curl nginx haproxy sshd python3 certbot ufw jq nft flock openssl systemctl; do
   command -v "$CMD" >/dev/null 2>&1 || {
@@ -1577,6 +1579,7 @@ touch "$BASE/limits/blocked.db"
 touch "$BASE/limits/quota-locked.db"
 chmod 700 "$BASE" "$XDB" "$BASE/limits" 2>/dev/null || true
 chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" "$XRAY_ONLINE_SESSIONS_DB" 2>/dev/null || true
+
 
 DB_LOCK="/run/lock/sultan-db.lock"
 QUOTA_LOCK="/run/lock/sultan-quota-state.lock"
@@ -3250,6 +3253,30 @@ xray_link(){
   esac
 }
 
+
+xray_link_80(){
+  local PROTO="$1" U="$2" VALUE="$3" LINK_ADDR="$4" PATHX="$5" CLIENT_HOST="${6:-}" PENC JSON B64
+  PENC="$(xray_path_encoded "$PATHX")"
+  validate_link_address "$LINK_ADDR" || LINK_ADDR="$CLIENT_HOST"
+  validate_domain "$CLIENT_HOST" || CLIENT_HOST="$LINK_ADDR"
+  case "$PROTO" in
+    vless)
+      printf 'vless://%s@%s:80?encryption=none&security=none&type=ws&host=%s&path=%s#%s-80\n' \
+        "$VALUE" "$LINK_ADDR" "$CLIENT_HOST" "$PENC" "$U"
+      ;;
+    trojan)
+      printf 'trojan://%s@%s:80?security=none&type=ws&host=%s&path=%s#%s-80\n' \
+        "$VALUE" "$LINK_ADDR" "$CLIENT_HOST" "$PENC" "$U"
+      ;;
+    *)
+      JSON="$(printf '{"v":"2","ps":"%s-80","add":"%s","port":"80","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"none"}' \
+        "$U" "$LINK_ADDR" "$VALUE" "$CLIENT_HOST" "$PATHX")"
+      B64="$(printf '%s' "$JSON" | base64 | tr -d '\n')"
+      printf 'vmess://%s\n' "$B64"
+      ;;
+  esac
+}
+
 show_xray_users_table(){
   local DBF="$1" TITLE="$2" TAG N=1 U V PROTO NET DOMAIN PATHX EXP QUOTA LOGIN CREATED USED
   TAG="$(basename "$DBF" .db)"
@@ -4528,6 +4555,7 @@ create_xray_user(){
   rm -f "$BACKUP"
   xray_usage_remove_user "$TAG" "$USER" >/dev/null 2>&1 || true
   LINK="$(xray_link "$PROTO" "$USER" "$VALUE" "$CLIENT_ADDR" "$PATHX" "$CLIENT_HOST" "$CLIENT_SNI" "$ALLOW_INSECURE")"
+  LINK80="$(xray_link_80 "$PROTO" "$USER" "$VALUE" "$CLIENT_ADDR" "$PATHX" "$CLIENT_HOST")"
 
   refresh_screen
   echo "==================================="
@@ -4540,15 +4568,17 @@ create_xray_user(){
   box "Users Limit" "$LOGIN_TEXT"
   box "Address" "$CLIENT_ADDR"
   [ "$CLIENT_ADDR" != "$DOMAIN" ] && box "Origin Domain" "$DOMAIN"
-  box "Port" "443"
+  box "Ports" "443 TLS + 80 HTTP"
   box "Host" "$CLIENT_HOST"
   box "SNI" "$CLIENT_SNI"
   box "Allow Insecure" "$ALLOW_INSECURE"
   box "Path" "$PATHX"
   [ "$PROTO" = "vless" ] && box "Xray Config" "VERIFIED"
   echo "-----------------------------------"
-  echo "Ready Link:"
+  echo "Ready Link 443 TLS:"
   echo "$LINK"
+  echo "Ready Link 80 HTTP:"
+  echo "$LINK80"
   echo "-----------------------------------"
   pause
 }
@@ -4623,6 +4653,7 @@ show_xray_user_statistics(){
   fi
   LEFT_TEXT="$(remaining_exact "$EXP")"
   LINK="$(xray_link "$PROTO" "$U" "$VALUE" "$CLIENT_ADDR" "$PATHX" "$CLIENT_HOST" "$CLIENT_SNI" "$ALLOW_INSECURE")"
+  LINK80="$(xray_link_80 "$PROTO" "$U" "$VALUE" "$CLIENT_ADDR" "$PATHX" "$CLIENT_HOST")"
 
   refresh_screen
   echo "========================================"
@@ -4644,8 +4675,10 @@ show_xray_user_statistics(){
   printf "%-16s : %s\n" "Allow Insecure" "$ALLOW_INSECURE"
   printf "%-16s : %s\n" "Path" "$PATHX"
   echo "----------------------------------------"
-  echo "Ready Link:"
+  echo "Ready Link 443 TLS:"
   echo "$LINK"
+  echo "Ready Link 80 HTTP:"
+  echo "$LINK80"
   echo "========================================"
   pause
 }
@@ -4928,7 +4961,10 @@ xray_proto_menu(){
           case "$ALLOW_INSECURE" in 1|y|Y|yes|YES|true|TRUE|on|ON) ALLOW_INSECURE=1 ;; *) ALLOW_INSECURE=0 ;; esac
           validate_link_address "$CLIENT_ADDR" || CLIENT_ADDR="$DOMAIN"
           echo "$U"
+          echo "443 TLS:"
           xray_link "$P" "$U" "$VALUE" "$CLIENT_ADDR" "$PATHX_DB" "$CLIENT_HOST" "$CLIENT_SNI" "$ALLOW_INSECURE"
+          echo "80 HTTP:"
+          xray_link_80 "$P" "$U" "$VALUE" "$CLIENT_ADDR" "$PATHX_DB" "$CLIENT_HOST"
           echo "----------------------------------------"
         done < "$XDB/$TAG.db"
         pause
@@ -5456,6 +5492,53 @@ server {
         default_type text/plain;
     }
 
+    location = $VLESS_PATH {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+    location = $VMESS_PATH {
+        proxy_pass http://127.0.0.1:10085;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+    location = $TROJAN_PATH {
+        proxy_pass http://127.0.0.1:10086;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+
+$XRAY_ALIAS_BLOCKS
+
     location / {
         return 404;
     }
@@ -5613,6 +5696,18 @@ websocket_status_code(){
     -o /dev/null -w '%{http_code}' "https://$D$PATHX" 2>/dev/null || true
 }
 
+
+http80_websocket_status_code(){
+  local D="$1" PATHX="$2"
+  curl -s --http1.1 --max-time 4 --connect-timeout 3 \
+    --resolve "$D:80:127.0.0.1" \
+    -H 'Connection: Upgrade' \
+    -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: c3VsdGFuLXZpcC10ZXN0LQ==' \
+    -o /dev/null -w '%{http_code}' "http://$D$PATHX" 2>/dev/null || true
+}
+
 direct_websocket_status_code(){
   local PORT="$1" PATHX="$2" D="$3"
   curl -s --http1.1 --max-time 4 --connect-timeout 3 \
@@ -5733,7 +5828,7 @@ PYMAP
 }
 
 mandatory_502_preinstall_fix(){
-  local D="$1" ATTEMPT TAG PATHX PORT DIRECT_CODE PUBLIC_CODE FAILED
+  local D="$1" ATTEMPT TAG PATHX PORT DIRECT_CODE PUBLIC_CODE HTTP80_CODE FAILED
   local NGINX_FILE="/etc/nginx/conf.d/sultan-ready.conf"
   local VIA_WS=0
 
@@ -5810,8 +5905,9 @@ mandatory_502_preinstall_fix(){
         echo "  public=deferred"
       else
         PUBLIC_CODE="$(websocket_status_code "$D" "$PATHX")"
-        printf " public=%-3s" "${PUBLIC_CODE:-000}"
-        if [ "$PUBLIC_CODE" != "101" ]; then
+        HTTP80_CODE="$(http80_websocket_status_code "$D" "$PATHX")"
+        printf " public443=%-3s public80=%-3s" "${PUBLIC_CODE:-000}" "${HTTP80_CODE:-000}"
+        if [ "$PUBLIC_CODE" != "101" ] || [ "$HTTP80_CODE" != "101" ]; then
           echo "  FAILED"
           FAILED=1
         else
@@ -5830,10 +5926,10 @@ mandatory_502_preinstall_fix(){
         echo ""
         echo "Mandatory direct HTTP 101 checks passed."
         echo "Nginx path-to-port mappings passed."
-        echo "Public 443 reload/test is deferred until logout to preserve this SSH session."
+        echo "Public 443/80 reload/test is deferred until logout to preserve this SSH session."
       else
         echo ""
-        echo "Mandatory direct and public HTTP 101 checks passed."
+        echo "Mandatory direct and public 443/80 HTTP 101 checks passed."
       fi
       return 0
     fi
@@ -6207,7 +6303,7 @@ xray_verify_preserved_aliases_live(){
 }
 
 v2ray_ws_self_test(){
-  local D="$1" TAG PATHX PORT CODE FAILED=0 VLESS_ID
+  local D="$1" TAG PATHX PORT CODE CODE80 FAILED=0 VLESS_ID
   [ -n "$D" ] && [ "$D" != "Not Set" ] || { echo "Domain is not set."; return 1; }
   validate_domain "$D" || { echo "Domain is invalid: $D"; return 1; }
 
@@ -6220,6 +6316,7 @@ v2ray_ws_self_test(){
   wait_service_active nginx || FAILED=1
   wait_service_active haproxy || FAILED=1
   wait_tcp_listener 443 || FAILED=1
+  wait_tcp_listener 80 || FAILED=1
 
   for TAG in vless-ws vmess-ws trojan-ws; do
     PATHX="$(xray_current_path "$TAG" "$(xray_default_path "$TAG")")"
@@ -6230,15 +6327,22 @@ v2ray_ws_self_test(){
     esac
     wait_tcp_listener "$PORT" || { FAILED=1; continue; }
     CODE="$(websocket_status_code "$D" "$PATHX")"
+    CODE80="$(http80_websocket_status_code "$D" "$PATHX")"
     if [ "$CODE" != "101" ]; then
-      echo "WebSocket verification failed: $PATHX returned HTTP ${CODE:-000}."
+      echo "WebSocket 443 verification failed: $PATHX returned HTTP ${CODE:-000}."
       FAILED=1
     else
-      echo "WebSocket verified: $PATHX -> 127.0.0.1:$PORT"
+      echo "WebSocket 443 verified: $PATHX -> 127.0.0.1:$PORT"
+    fi
+    if [ "$CODE80" != "101" ]; then
+      echo "WebSocket 80 verification failed: $PATHX returned HTTP ${CODE80:-000}."
+      FAILED=1
+    else
+      echo "WebSocket 80 verified: $PATHX -> 127.0.0.1:$PORT"
     fi
   done
 
-  echo "VLESS/VMess/Trojan WebSocket route checks completed with HTTP 101."
+  echo "VLESS/VMess/Trojan WebSocket route checks completed with HTTP 101 on ports 443 and 80."
 
   [ "$FAILED" -eq 0 ] || {
     echo "Recent Xray log:"
@@ -6412,6 +6516,7 @@ setup_ready(){
     fi
   fi
 
+
   mkdir -p /etc/letsencrypt/renewal-hooks/deploy
   cat >/etc/letsencrypt/renewal-hooks/deploy/sultan-reload.sh <<'RENEW_HOOK'
 #!/bin/sh
@@ -6461,41 +6566,17 @@ RENEW_HOOK
 setting_menu(){
   while true; do
     refresh_screen
-    echo "[1] Setup Domain + SSL + WS + V2Ray"
-    echo "[2] Restart All Services"
-    echo "[3] Open Main Ports"
-    echo "[4] Force Quota Check"
-    echo "[5] Reset User Traffic"
-    echo "[10] Service Control"
+    echo "========================================"
+    echo "              SETTING MENU"
+    echo "========================================"
+    echo "[10] CONTROL SERVER"
     echo "[0] Back"
+    echo "========================================"
     read -p "Select: " s
     case "$s" in
-      1) setup_ready ;;
-      2)
-        safe_restart_ssh || { pause; continue; }
-        nginx_haproxy_restart_safe || { pause; continue; }
-        if current_session_via_ws && systemctl is-active --quiet sultan-ws 2>/dev/null; then
-          echo "Skipped WebSocket restart to protect this SSH session."
-        else
-          checked_restart sultan-ws || { pause; continue; }
-        fi
-        checked_restart udp-custom || { pause; continue; }
-        xray_restart_safe || { pause; continue; }
-        checked_restart fail2ban || { pause; continue; }
-        echo "Services restarted."
-        pause
-        ;;
-      3) open_main_ports; pause ;;
-      4) quota_sync; echo "Quota checked"; pause ;;
-      5)
-        read -p "Username: " U
-        usage_reset_user "$U" || { echo "Traffic reset failed"; pause; continue; }
-        quota_sync
-        echo "Traffic reset for $U"
-        pause
-        ;;
       10) service_control_menu ;;
       0) return ;;
+      *) echo "Invalid option"; sleep 1 ;;
     esac
   done
 }
@@ -6789,6 +6870,7 @@ append_xray_online_rows(){
   done < "$XRAY_ONLINE_SESSIONS_DB"
 }
 
+
 online_users_view(){
   local SCOPE="$1" TITLE="$2" TAG="${3:-}" TMP SORTED NOW FOUND=0 N=1
   local START TYPE U COUNT TOTAL_ACCOUNTS=0 TOTAL_CONNECTIONS=0
@@ -6858,6 +6940,7 @@ online_xray_users_menu(){
   local PROTO="$1" TAG="$2"
   online_users_view xray "${PROTO^^} ONLINE USERS - FIRST LOGIN TO LAST" "$TAG"
 }
+
 backup_menu(){
   refresh_screen
   echo "[1] Create Backup"
@@ -7425,6 +7508,7 @@ echo "==========================================="
 if [ "$SULTAN_INSTALL_STATUS" -eq 0 ]; then
   echo "Installation verified. Type: menu"
   echo "Mandatory HTTP 101 / 502 prevention: PASSED"
+echo "V2Ray WS 80 support: ENABLED"
 else
   echo "Installation verification FAILED."
   echo "Mandatory HTTP 101 / 502 prevention did not pass."
