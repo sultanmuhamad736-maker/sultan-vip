@@ -5205,8 +5205,31 @@ os.chmod(os.path.join(base,'controller.auth'),0o600)
 PYAUTH
 }
 
+tgms_token_instructions(){
+  echo "==========================================="
+  echo "        HOW TO GET TELEGRAM BOT TOKEN"
+  echo "==========================================="
+  echo "[1] Open Telegram app."
+  echo "[2] Search for: @BotFather"
+  echo "[3] Open BotFather and press Start, or send: /start"
+  echo "[4] Send this command: /newbot"
+  echo "[5] BotFather will ask for a bot name."
+  echo "    Example: Sultan Server Panel"
+  echo "[6] BotFather will ask for a bot username."
+  echo "    It must end with bot."
+  echo "    Example: sultan_server_panel_bot"
+  echo "[7] BotFather will send you a token."
+  echo "    Token shape looks like this:"
+  echo "    123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  echo "[8] Copy the full token only."
+  echo "[9] Come back here, paste it, then press Enter."
+  echo "[10] Do not send this token to anyone."
+  echo "==========================================="
+}
+
 tgms_token_create(){
   local TOK
+  tgms_token_instructions
   tgms_read_hidden "Telegram Bot Token from BotFather: " TOK
   mkdir -p /etc/sultan/tg-multi
   printf '%s\n' "$TOK" > /etc/sultan/tg-multi/bot.token
@@ -5976,6 +5999,7 @@ telegram_terminal_bot_menu(){
     echo "[7] Restart This Server Agent"
     echo "[8] Reset Connect Token"
     echo "[9] Status / Logs"
+    echo "[10] How To Get BotFather Token"
     echo "[0] Back"
     echo "==========================================="
     echo "Controller = the VPS where the bot stays online."
@@ -5992,6 +6016,7 @@ telegram_terminal_bot_menu(){
       7) tgms_write_agent; tgms_write_agent_service; tgms_status ;;
       8) tgms_reset_register_token ;;
       9) tgms_status ;;
+      10) refresh_screen; tgms_token_instructions; pause ;;
       0) return ;;
       *) echo "Invalid option"; sleep 1 ;;
     esac
