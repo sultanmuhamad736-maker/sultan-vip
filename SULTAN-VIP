@@ -7739,4 +7739,4 @@ echo "GB Limit  0 = Unlimited"
 echo "Quota check: every 10 seconds"
 echo "==========================================="
 
-return "$SULTAN_INSTALL_STATUS" 2>/dev/null || true
+return
