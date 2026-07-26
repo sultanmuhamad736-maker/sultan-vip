@@ -1053,10 +1053,10 @@ quota_to_bytes() {
     ""|0|Unlimited|unlimited|UNLIMITED) echo 0 ;;
     *GB|*gb|*Gb|*gB)
       N="${Q%??}"
-      valid_number "$N" && echo $(( $(to_int "$N") * 1024 * 1024 * 1024 )) || echo 0
+      valid_number "$N" && echo $(( $(to_int "$N") * 1000 * 1000 * 1000 )) || echo 0
       ;;
     *)
-      valid_number "$Q" && echo $(( $(to_int "$Q") * 1024 * 1024 * 1024 )) || echo 0
+      valid_number "$Q" && echo $(( $(to_int "$Q") * 1000 * 1000 * 1000 )) || echo 0
       ;;
   esac
 }
@@ -1829,20 +1829,6 @@ validate_xray_username(){
   ! [[ "$1" == *"|"* ]]
 }
 
-validate_uuid(){
-  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
-}
-
-xray_identity_exists(){
-  local U="$1" VALUE="$2" F
-  [ -n "$U" ] && [ -n "$VALUE" ] || return 1
-  for F in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db"; do
-    [ -f "$F" ] || continue
-    awk -F'|' -v u="$U" -v v="$VALUE" '$1==u && $2==v{found=1; exit} END{exit found?0:1}' "$F" 2>/dev/null && return 0
-  done
-  return 1
-}
-
 validate_ws_path(){
   local P="${1:-}"
   [ -n "$P" ] || return 1
@@ -2230,6 +2216,18 @@ ssh_traffic_total_bytes(){
   awk -F'|' '$2 ~ /^[0-9]+$/ {s+=$2} END{printf "%.0f\n",s+0}' "$USAGE_DB" 2>/dev/null
 }
 
+ssh_user_traffic_today_bytes(){
+  local U="$1" TODAY
+  TODAY="$(date +%F)"
+  awk -F'|' -v u="$U" -v d="$TODAY" '$1==u && $4==d && $5 ~ /^[0-9]+$/ {s+=$5} END{printf "%.0f\n",s+0}' "$DEVICE_USAGE_DB" 2>/dev/null
+}
+
+ssh_user_traffic_month_bytes(){
+  local U="$1" MONTH
+  MONTH="$(date +%Y-%m)"
+  awk -F'|' -v u="$U" -v m="$MONTH" '$1==u && $6==m && $7 ~ /^[0-9]+$/ {s+=$7} END{printf "%.0f\n",s+0}' "$DEVICE_USAGE_DB" 2>/dev/null
+}
+
 ssh_peak_users_today(){
   local DAY_START NOW TMP F PID CMD SAVED_START CURRENT_START START PEAK
   DAY_START="$(date -d 'today 00:00:00' +%s)"
@@ -2323,90 +2321,21 @@ xray_protocol_month_bytes(){
   awk -F'|' -v t="$TAG" -v m="$MONTH" '$1==t && $9==m && $10 ~ /^[0-9]+$/ {s+=$10} END{printf "%.0f\n",s+0}' "$XRAY_USAGE_DB" 2>/dev/null
 }
 
-xray_all_today_bytes(){
-  local S=0 T N
-  for T in vmess-ws vless-ws trojan-ws; do
-    N="$(stats_number "$(xray_protocol_today_bytes "$T")")"
-    S=$((S + N))
-  done
-  echo "$S"
-}
-
-xray_all_month_bytes(){
-  local S=0 T N
-  for T in vmess-ws vless-ws trojan-ws; do
-    N="$(stats_number "$(xray_protocol_month_bytes "$T")")"
-    S=$((S + N))
-  done
-  echo "$S"
-}
-
-xray_all_total_bytes(){
-  local S=0 T N
-  for T in vmess-ws vless-ws trojan-ws; do
-    N="$(stats_number "$(xray_protocol_total_bytes "$T")")"
-    S=$((S + N))
-  done
-  echo "$S"
-}
-
-xray_all_current_users(){
-  local S=0 T N
-  xray_stats_sync
-  for T in vmess-ws vless-ws trojan-ws; do
-    N="$(stats_number "$(xray_protocol_current_users "$T")")"
-    S=$((S + N))
-  done
-  echo "$S"
-}
-
-xray_all_peak_today(){
-  local S=0 T N
-  for T in vmess-ws vless-ws trojan-ws; do
-    N="$(stats_number "$(xray_protocol_peak_today "$T")")"
-    S=$((S + N))
-  done
-  echo "$S"
-}
-
-server_traffic_today_bytes(){
-  local A B
-  A="$(stats_number "$(ssh_traffic_today_bytes)")"
-  B="$(stats_number "$(xray_all_today_bytes)")"
-  echo $((A + B))
-}
-
-server_traffic_month_bytes(){
-  local A B
-  A="$(stats_number "$(ssh_traffic_month_bytes)")"
-  B="$(stats_number "$(xray_all_month_bytes)")"
-  echo $((A + B))
-}
-
-server_traffic_total_bytes(){
-  local A B
-  A="$(stats_number "$(ssh_traffic_total_bytes)")"
-  B="$(stats_number "$(xray_all_total_bytes)")"
-  echo $((A + B))
-}
-
-server_current_users(){
-  local A B
-  A="$(stats_number "$(total_online_logins)")"
-  B="$(stats_number "$(xray_all_current_users)")"
-  echo $((A + B))
-}
-
-server_peak_users_today(){
-  local A B
-  A="$(stats_number "$(ssh_peak_users_today)")"
-  B="$(stats_number "$(xray_all_peak_today)")"
-  echo $((A + B))
-}
-
 xray_protocol_total_bytes(){
   local TAG="$1"
   awk -F'|' -v t="$TAG" '$1==t && $3 ~ /^[0-9]+$/ {s+=$3} END{printf "%.0f\n",s+0}' "$XRAY_USAGE_DB" 2>/dev/null
+}
+
+xray_user_traffic_today_bytes(){
+  local TAG="$1" U="$2" TODAY
+  TODAY="$(date +%F)"
+  awk -F'|' -v t="$TAG" -v u="$U" -v d="$TODAY" '$1==t && $2==u && $7==d && $8 ~ /^[0-9]+$/ {s+=$8} END{printf "%.0f\n",s+0}' "$XRAY_USAGE_DB" 2>/dev/null
+}
+
+xray_user_traffic_month_bytes(){
+  local TAG="$1" U="$2" MONTH
+  MONTH="$(date +%Y-%m)"
+  awk -F'|' -v t="$TAG" -v u="$U" -v m="$MONTH" '$1==t && $2==u && $9==m && $10 ~ /^[0-9]+$/ {s+=$10} END{printf "%.0f\n",s+0}' "$XRAY_USAGE_DB" 2>/dev/null
 }
 
 xray_protocol_current_users(){
@@ -2436,10 +2365,10 @@ xray_user_peak_today(){
 protocol_total_bytes(){
   local MODE="$1" TAG="${2:-}"
   case "$MODE" in
+    all) server_traffic_total_bytes ;;
     ssh) ssh_traffic_total_bytes ;;
     xray) xray_protocol_total_bytes "$TAG" ;;
-    xrayall) xray_all_total_bytes ;;
-    all) server_traffic_total_bytes ;;
+    xray-all) xray_all_traffic_total_bytes ;;
     *) echo 0 ;;
   esac
 }
@@ -2447,12 +2376,85 @@ protocol_total_bytes(){
 protocol_current_users(){
   local MODE="$1" TAG="${2:-}"
   case "$MODE" in
+    all) server_current_users ;;
     ssh) total_online_logins ;;
     xray) xray_protocol_current_users "$TAG" ;;
-    xrayall) xray_all_current_users ;;
-    all) server_current_users ;;
+    xray-all) xray_all_current_users ;;
     *) echo 0 ;;
   esac
+}
+
+user_protocol_total_bytes(){
+  local MODE="$1" TAG="${2:-}" ACCOUNT="${3:-}"
+  case "$MODE" in
+    ssh) user_used_bytes "$ACCOUNT" ;;
+    xray) xray_user_used_bytes "$TAG" "$ACCOUNT" ;;
+    *) echo 0 ;;
+  esac
+}
+
+user_protocol_current_users(){
+  local MODE="$1" TAG="${2:-}" ACCOUNT="${3:-}"
+  case "$MODE" in
+    ssh) active_user_logins "$ACCOUNT" ;;
+    xray) xray_user_online_count "$TAG" "$ACCOUNT" ;;
+    *) echo 0 ;;
+  esac
+}
+
+user_live_traffic_view(){
+  local MODE="$1" TAG="${2:-}" ACCOUNT="$3" TITLE="$4" LOGIN_MAX_TEXT="${5:-Unlimited}"
+  local PREVIOUS CURRENT DELTA RATE PREVIOUS_TIME NOW ELAPSED ONLINE KEY
+
+  case "$MODE" in
+    ssh) quota_sync ;;
+    all) quota_sync; xray_stats_sync ;;
+    *) xray_stats_sync ;;
+  esac
+  PREVIOUS="$(user_protocol_total_bytes "$MODE" "$TAG" "$ACCOUNT")"
+  PREVIOUS="$(stats_number "$PREVIOUS")"
+  PREVIOUS_TIME="$(date +%s)"
+
+  while true; do
+    case "$MODE" in
+      ssh) quota_sync ;;
+      all) quota_sync; xray_stats_sync ;;
+      *) xray_stats_sync ;;
+    esac
+    CURRENT="$(user_protocol_total_bytes "$MODE" "$TAG" "$ACCOUNT")"
+    CURRENT="$(stats_number "$CURRENT")"
+    NOW="$(date +%s)"
+    ELAPSED=$((NOW - PREVIOUS_TIME))
+    [ "$ELAPSED" -gt 0 ] || ELAPSED=1
+    if [ "$CURRENT" -ge "$PREVIOUS" ]; then
+      DELTA=$((CURRENT - PREVIOUS))
+    else
+      DELTA=0
+    fi
+    RATE=$((DELTA / ELAPSED))
+    ONLINE="$(user_protocol_current_users "$MODE" "$TAG" "$ACCOUNT")"
+    ONLINE="$(stats_number "$ONLINE")"
+
+    refresh_screen
+    echo -e "${ORANGE}========================================${NC}"
+    echo -e "${ORANGE}          ${TITLE} LIVE TRAFFIC${NC}"
+    echo -e "${ORANGE}========================================${NC}"
+    printf "%-22s : %s/s\n" "Live Traffic" "$(human_bytes "$RATE")"
+    printf "%-22s : %s\n" "Total Traffic" "$(human_bytes "$CURRENT")"
+    printf "%-22s : %s / %s\n" "Current Online Users" "$ONLINE" "$LOGIN_MAX_TEXT"
+    echo -e "${ORANGE}========================================${NC}"
+    echo "0 - Back"
+
+    PREVIOUS="$CURRENT"
+    PREVIOUS_TIME="$NOW"
+    KEY=""
+    if [ -r /dev/tty ]; then
+      IFS= read -r -s -n 1 -t 1 KEY </dev/tty || true
+    else
+      sleep 1
+    fi
+    [ "$KEY" = "0" ] && return
+  done
 }
 
 live_traffic_view(){
@@ -2562,9 +2564,9 @@ quick_user_report(){
         ;;
     esac
 
-    TRAFFIC_TODAY="$(stats_number "$(ssh_traffic_today_bytes)")"
-    TRAFFIC_MONTH="$(stats_number "$(ssh_traffic_month_bytes)")"
-    TRAFFIC_TOTAL="$(stats_number "$(ssh_traffic_total_bytes)")"
+    TRAFFIC_TODAY="$(stats_number "$(ssh_user_traffic_today_bytes "$U")")"
+    TRAFFIC_MONTH="$(stats_number "$(ssh_user_traffic_month_bytes "$U")")"
+    TRAFFIC_TOTAL="$USED"
     PEAK_TODAY="$(stats_number "$(ssh_user_peak_today "$U")")"
     CURRENT_ONLINE="$ACTIVE"
 
@@ -2582,9 +2584,9 @@ quick_user_report(){
     printf "%-16s : %s\n" "Expire Date" "$E"
     printf "%-16s : %s\n" "Time Left" "$(remaining_exact "$E")"
     echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Traffic Today" "$(human_bytes "$TRAFFIC_TODAY")"
-    printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")"
-    printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")"
+    printf "%-22s : %s / %s\n" "Traffic Today" "$(human_bytes "$TRAFFIC_TODAY")" "$TOTAL_TEXT"
+    printf "%-22s : %s / %s\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")" "$TOTAL_TEXT"
+    printf "%-22s : %s / %s\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")" "$TOTAL_TEXT"
     echo "----------------------------------------"
     printf "%-22s : %s / %s\n" "Max Users Today" "$PEAK_TODAY" "$LOGIN_MAX_TEXT"
     printf "%-22s : %s / %s\n" "Current Online Users" "$CURRENT_ONLINE" "$LOGIN_MAX_TEXT"
@@ -2595,7 +2597,7 @@ quick_user_report(){
     read -p "Select: " ACTION
 
     case "$ACTION" in
-      1) live_traffic_view ssh "" SSH ;;
+      1) user_live_traffic_view ssh "" "$U" SSH "$LOGIN_MAX_TEXT" ;;
       0) return ;;
     esac
   done
@@ -2613,9 +2615,9 @@ quota_bytes_from_text(){
     ""|0|Unlimited|unlimited|UNLIMITED) echo 0 ;;
     *GB|*gb|*Gb|*gB)
       N="${Q%??}"
-      [[ "$N" =~ ^[0-9]+$ ]] && echo $((10#$N*1024*1024*1024)) || echo 0
+      [[ "$N" =~ ^[0-9]+$ ]] && echo $((10#$N*1000*1000*1000)) || echo 0
       ;;
-    *) [[ "$Q" =~ ^[0-9]+$ ]] && echo $((10#$Q*1024*1024*1024)) || echo 0 ;;
+    *) [[ "$Q" =~ ^[0-9]+$ ]] && echo $((10#$Q*1000*1000*1000)) || echo 0 ;;
   esac
 }
 
@@ -4500,7 +4502,7 @@ ensure_xray_config(){
 
 create_xray_user(){
   local PROTO="$1" TAG="$2" DEFAULT_PATH="$3" DBF VALUE DOMAIN FILTER BACKUP LOCKF DAYS GB MAXLOGIN EXP QUOTA_TEXT LOGIN_TEXT LINK WS_CODE STAT_EMAIL
-  local CURRENT_PATH INPUT_PATH PATHX CONFIRM CLIENT_ADDR CLIENT_HOST CLIENT_SNI ALLOW_INSECURE AI_ANSWER CUSTOM_UUID
+  local CURRENT_PATH INPUT_PATH PATHX CONFIRM CLIENT_ADDR CLIENT_HOST CLIENT_SNI ALLOW_INSECURE AI_ANSWER
   ensure_xray_config || { echo "Xray config is not ready."; pause; return; }
 
   DBF="$XDB/$TAG.db"
@@ -4544,16 +4546,10 @@ create_xray_user(){
   fi
 
   read -p "Username: " USER
-  if [ "$PROTO" != "trojan" ]; then
-    read -p "Custom UUID [Enter = Auto]: " CUSTOM_UUID
-  fi
   read -p "Days (0 = Unlimited): " DAYS
   read -p "GB Limit (0 = Unlimited): " GB
   read -p "Users/Login Limit (0 = Unlimited): " MAXLOGIN
   validate_xray_username "$USER" || { echo "Invalid Xray username."; pause; return; }
-  if [ "$PROTO" != "trojan" ] && [ -n "$CUSTOM_UUID" ]; then
-    validate_uuid "$CUSTOM_UUID" || { echo "Invalid UUID."; pause; return; }
-  fi
   [[ "$DAYS" =~ ^[0-9]+$ ]] || { echo "Invalid days value."; pause; return; }
   [[ "$GB" =~ ^[0-9]+$ ]] || { echo "Invalid GB value."; pause; return; }
   [[ "$MAXLOGIN" =~ ^[0-9]+$ ]] || { echo "Invalid users value."; pause; return; }
@@ -4601,18 +4597,8 @@ create_xray_user(){
     VALUE="$(openssl rand -hex 16)"
     FILTER='(.inbounds[]|select(.tag==$tag)|.settings.clients)+=[{"password":$value,"email":$email,"level":0}]'
   else
-    if [ -n "$CUSTOM_UUID" ]; then
-      VALUE="$CUSTOM_UUID"
-    else
-      VALUE="$(xray_seed_uuid)"
-    fi
+    VALUE="$(xray_seed_uuid)"
     FILTER='(.inbounds[]|select(.tag==$tag)|.settings.clients)+=[{"id":$value,"email":$email,"level":0}]'
-  fi
-
-  if xray_identity_exists "$USER" "$VALUE"; then
-    echo "Same username and ID/Password already exists."
-    pause
-    return
   fi
 
   BACKUP="$(mktemp --suffix=.json "/usr/local/etc/xray/.rollback.XXXXXX")" || { echo "Rollback temp failed."; pause; return; }
@@ -4859,9 +4845,9 @@ xray_quick_user_report(){
         ;;
     esac
 
-    TRAFFIC_TODAY="$(stats_number "$(xray_protocol_today_bytes "$TAG")")"
-    TRAFFIC_MONTH="$(stats_number "$(xray_protocol_month_bytes "$TAG")")"
-    TRAFFIC_TOTAL="$(stats_number "$(xray_protocol_total_bytes "$TAG")")"
+    TRAFFIC_TODAY="$(stats_number "$(xray_user_traffic_today_bytes "$TAG" "$U")")"
+    TRAFFIC_MONTH="$(stats_number "$(xray_user_traffic_month_bytes "$TAG" "$U")")"
+    TRAFFIC_TOTAL="$USED"
     PEAK_TODAY="$(stats_number "$(xray_user_peak_today "$TAG" "$U")")"
     if [[ "$ACTIVE" =~ ^[0-9]+$ ]] && [ "$ACTIVE" -gt "$PEAK_TODAY" ]; then
       PEAK_TODAY="$ACTIVE"
@@ -4882,9 +4868,9 @@ xray_quick_user_report(){
     printf "%-16s : %s\n" "Expire Date" "$EXP"
     printf "%-16s : %s\n" "Time Left" "$(remaining_exact "$EXP")"
     echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Traffic Today" "$(human_bytes "$TRAFFIC_TODAY")"
-    printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")"
-    printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")"
+    printf "%-22s : %s / %s\n" "Traffic Today" "$(human_bytes "$TRAFFIC_TODAY")" "$TOTAL_TEXT"
+    printf "%-22s : %s / %s\n" "Traffic This Month" "$(human_bytes "$TRAFFIC_MONTH")" "$TOTAL_TEXT"
+    printf "%-22s : %s / %s\n" "Total Traffic" "$(human_bytes "$TRAFFIC_TOTAL")" "$TOTAL_TEXT"
     echo "----------------------------------------"
     printf "%-22s : %s / %s\n" "Max Users Today" "$PEAK_TODAY" "$LOGIN_MAX_TEXT"
     printf "%-22s : %s / %s\n" "Current Online Users" "$CURRENT_ONLINE" "$LOGIN_MAX_TEXT"
@@ -4895,7 +4881,7 @@ xray_quick_user_report(){
     read -p "Select: " ACTION
 
     case "$ACTION" in
-      1) live_traffic_view xray "$TAG" "${PROTO^^}" ;;
+      1) user_live_traffic_view xray "$TAG" "$U" "${PROTO^^}" "$LOGIN_MAX_TEXT" ;;
       0) return ;;
     esac
   done
@@ -4959,91 +4945,10 @@ show_xray_traffic_statistics(){
   pause
 }
 
-xray_change_user_value(){
-  local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db" LINE OLD_VALUE NEW_VALUE LABEL FIELD FILTER BACKUP DB_BACKUP STAT_EMAIL
-  LINE="$(awk -F'|' -v u="$USER" '$1==u{print;exit}' "$DBF" 2>/dev/null)"
-  [ -n "$LINE" ] || { echo "User not found."; pause; return; }
-  OLD_VALUE="$(printf '%s
-' "$LINE" | awk -F'|' '{print $2}')"
-
-  if [ "$PROTO" = "trojan" ]; then
-    LABEL="Password"
-    FIELD="password"
-  else
-    LABEL="UUID"
-    FIELD="id"
-  fi
-
-  read -p "New $LABEL [Enter = Auto]: " NEW_VALUE
-  if [ -z "$NEW_VALUE" ]; then
-    if [ "$PROTO" = "trojan" ]; then
-      NEW_VALUE="$(openssl rand -hex 16)"
-    else
-      NEW_VALUE="$(xray_seed_uuid)"
-    fi
-  fi
-
-  if [ "$PROTO" != "trojan" ]; then
-    validate_uuid "$NEW_VALUE" || { echo "Invalid UUID."; pause; return; }
-  fi
-  [ "$NEW_VALUE" != "$OLD_VALUE" ] || { echo "$LABEL is unchanged."; pause; return; }
-
-  if xray_identity_exists "$USER" "$NEW_VALUE"; then
-    echo "Same username and ID/Password already exists."
-    pause
-    return
-  fi
-
-  STAT_EMAIL="$(xray_stats_email "$TAG" "$USER")"
-  jq -e --arg tag "$TAG" --arg email "$STAT_EMAIL" 'any(.inbounds[]?; .tag==$tag and any(.settings.clients[]?; .email==$email))' "$XRAY_CONFIG" >/dev/null || { echo "Xray client not found."; pause; return; }
-  BACKUP="$(mktemp --suffix=.json "/usr/local/etc/xray/.value-rollback.XXXXXX")" || { echo "Rollback temp failed."; pause; return; }
-  DB_BACKUP="$(mktemp "$XDB/.value-db-rollback.XXXXXX")" || { rm -f "$BACKUP"; echo "Rollback temp failed."; pause; return; }
-  cp -a "$XRAY_CONFIG" "$BACKUP"
-  cp -a "$DBF" "$DB_BACKUP"
-
-  if [ "$FIELD" = "password" ]; then
-    FILTER='(.inbounds[]|select(.tag==$tag)|.settings.clients[]|select(.email==$email)|.password)=$value'
-  else
-    FILTER='(.inbounds[]|select(.tag==$tag)|.settings.clients[]|select(.email==$email)|.id)=$value'
-  fi
-
-  xray_jq_update "$FILTER" --arg value "$NEW_VALUE" --arg email "$STAT_EMAIL" --arg tag "$TAG" || {
-    rm -f "$BACKUP" "$DB_BACKUP"
-    echo "Failed to update or validate Xray config."
-    pause
-    return
-  }
-
-  if ! xray_restart_safe; then
-    cp -a "$BACKUP" "$XRAY_CONFIG"
-    xray_restart_safe >/dev/null 2>&1 || true
-    rm -f "$BACKUP" "$DB_BACKUP"
-    echo "Xray restart failed; config was rolled back."
-    pause
-    return
-  fi
-
-  if ! xray_db_update_field "$DBF" "$USER" 2 "$NEW_VALUE"; then
-    cp -a "$BACKUP" "$XRAY_CONFIG"
-    cp -a "$DB_BACKUP" "$DBF"
-    xray_restart_safe >/dev/null 2>&1 || true
-    rm -f "$BACKUP" "$DB_BACKUP"
-    echo "User database update failed; Xray change was rolled back."
-    pause
-    return
-  fi
-
-  rm -f "$BACKUP" "$DB_BACKUP"
-  xray_usage_remove_user "$TAG" "$USER" >/dev/null 2>&1 || true
-  echo "$LABEL changed."
-  pause
-}
-
 change_xray_user_menu(){
-  local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db" ACTION GB MAXLOGIN DAYS EXP QUOTA_TEXT LOGIN_TEXT VALUE_LABEL
+  local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db" ACTION GB MAXLOGIN DAYS EXP QUOTA_TEXT LOGIN_TEXT
   refresh_screen
   select_xray_user "$DBF" "${PROTO^^}" || { pause; return; }
-  [ "$PROTO" = "trojan" ] && VALUE_LABEL="Password" || VALUE_LABEL="UUID"
   while true; do
     refresh_screen
     show_xray_users_table "$DBF" "${PROTO^^}"
@@ -5053,7 +4958,6 @@ change_xray_user_menu(){
     echo "(3) Change Expire"
     echo "(4) Show Statistics + Link"
     echo "(5) Delete User"
-    echo "(6) Change $VALUE_LABEL"
     echo "(0) Back"
     read -p "Choose: " ACTION
     case "$ACTION" in
@@ -5083,7 +4987,6 @@ change_xray_user_menu(){
         ;;
       4) show_xray_user_statistics "$PROTO" "$TAG" ;;
       5) delete_xray_user "$PROTO" "$TAG" "$( [ "$PROTO" = "trojan" ] && echo password || echo id )"; return ;;
-      6) xray_change_user_value "$PROTO" "$TAG" ;;
       0) return ;;
     esac
   done
@@ -7134,77 +7037,94 @@ online_users_view(){
   pause
 }
 
+server_sum_numbers(){
+  awk '{s+=$1} END{printf "%.0f\n",s+0}' 2>/dev/null
+}
+
+xray_all_traffic_today_bytes(){
+  { xray_protocol_today_bytes vmess-ws; xray_protocol_today_bytes vless-ws; xray_protocol_today_bytes trojan-ws; } | server_sum_numbers
+}
+
+xray_all_traffic_month_bytes(){
+  { xray_protocol_month_bytes vmess-ws; xray_protocol_month_bytes vless-ws; xray_protocol_month_bytes trojan-ws; } | server_sum_numbers
+}
+
+xray_all_traffic_total_bytes(){
+  { xray_protocol_total_bytes vmess-ws; xray_protocol_total_bytes vless-ws; xray_protocol_total_bytes trojan-ws; } | server_sum_numbers
+}
+
+xray_all_current_users(){
+  { xray_protocol_current_users vmess-ws; xray_protocol_current_users vless-ws; xray_protocol_current_users trojan-ws; } | server_sum_numbers
+}
+
+server_traffic_today_bytes(){
+  { ssh_traffic_today_bytes; xray_all_traffic_today_bytes; } | server_sum_numbers
+}
+
+server_traffic_month_bytes(){
+  { ssh_traffic_month_bytes; xray_all_traffic_month_bytes; } | server_sum_numbers
+}
+
+server_traffic_total_bytes(){
+  { ssh_traffic_total_bytes; xray_all_traffic_total_bytes; } | server_sum_numbers
+}
+
+server_current_users(){
+  { total_online_logins; xray_all_current_users; } | server_sum_numbers
+}
+
 full_server_stats_menu(){
-  local ACTION SSH_USERS VMESS_USERS VLESS_USERS TROJAN_USERS V2RAY_USERS TOTAL_USERS
-  local SSH_TODAY XRAY_TODAY ALL_TODAY SSH_MONTH XRAY_MONTH ALL_MONTH SSH_TOTAL XRAY_TOTAL ALL_TOTAL
-  local SSH_ONLINE XRAY_ONLINE ALL_ONLINE SSH_PEAK XRAY_PEAK ALL_PEAK
+  local ACTION SSH_TODAY SSH_MONTH SSH_TOTAL XRAY_TODAY XRAY_MONTH XRAY_TOTAL TOTAL_TODAY TOTAL_MONTH TOTAL_TOTAL
+  local SSH_ONLINE XRAY_ONLINE TOTAL_ONLINE SSH_PEAK VMESS_PEAK VLESS_PEAK TROJAN_PEAK TOTAL_PEAK
 
   while true; do
     quota_sync
     xray_stats_sync
 
-    SSH_USERS="$(count_ssh | tr -d '[:space:]')"
-    VMESS_USERS="$(count_vmess | tr -d '[:space:]')"
-    VLESS_USERS="$(count_vless | tr -d '[:space:]')"
-    TROJAN_USERS="$(count_trojan | tr -d '[:space:]')"
-    SSH_USERS="$(stats_number "$SSH_USERS")"
-    VMESS_USERS="$(stats_number "$VMESS_USERS")"
-    VLESS_USERS="$(stats_number "$VLESS_USERS")"
-    TROJAN_USERS="$(stats_number "$TROJAN_USERS")"
-    V2RAY_USERS=$((VMESS_USERS + VLESS_USERS + TROJAN_USERS))
-    TOTAL_USERS=$((SSH_USERS + V2RAY_USERS))
-
     SSH_TODAY="$(stats_number "$(ssh_traffic_today_bytes)")"
-    XRAY_TODAY="$(stats_number "$(xray_all_today_bytes)")"
-    ALL_TODAY=$((SSH_TODAY + XRAY_TODAY))
     SSH_MONTH="$(stats_number "$(ssh_traffic_month_bytes)")"
-    XRAY_MONTH="$(stats_number "$(xray_all_month_bytes)")"
-    ALL_MONTH=$((SSH_MONTH + XRAY_MONTH))
     SSH_TOTAL="$(stats_number "$(ssh_traffic_total_bytes)")"
-    XRAY_TOTAL="$(stats_number "$(xray_all_total_bytes)")"
-    ALL_TOTAL=$((SSH_TOTAL + XRAY_TOTAL))
+    XRAY_TODAY="$(stats_number "$(xray_all_traffic_today_bytes)")"
+    XRAY_MONTH="$(stats_number "$(xray_all_traffic_month_bytes)")"
+    XRAY_TOTAL="$(stats_number "$(xray_all_traffic_total_bytes)")"
+    TOTAL_TODAY="$((SSH_TODAY + XRAY_TODAY))"
+    TOTAL_MONTH="$((SSH_MONTH + XRAY_MONTH))"
+    TOTAL_TOTAL="$((SSH_TOTAL + XRAY_TOTAL))"
 
     SSH_ONLINE="$(stats_number "$(total_online_logins)")"
     XRAY_ONLINE="$(stats_number "$(xray_all_current_users)")"
-    ALL_ONLINE=$((SSH_ONLINE + XRAY_ONLINE))
+    TOTAL_ONLINE="$((SSH_ONLINE + XRAY_ONLINE))"
     SSH_PEAK="$(stats_number "$(ssh_peak_users_today)")"
-    XRAY_PEAK="$(stats_number "$(xray_all_peak_today)")"
-    ALL_PEAK=$((SSH_PEAK + XRAY_PEAK))
+    VMESS_PEAK="$(stats_number "$(xray_protocol_peak_today vmess-ws)")"
+    VLESS_PEAK="$(stats_number "$(xray_protocol_peak_today vless-ws)")"
+    TROJAN_PEAK="$(stats_number "$(xray_protocol_peak_today trojan-ws)")"
+    TOTAL_PEAK="$((SSH_PEAK + VMESS_PEAK + VLESS_PEAK + TROJAN_PEAK))"
 
     refresh_screen
     echo "----------------------------------------"
-    printf "%-10s %s\n" "SERVER" "$(human_bytes "$ALL_TOTAL")"
+    echo "Full Server Stats"
     echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Traffic Today" "$(human_bytes "$ALL_TODAY")"
-    printf "%-22s : %s / Unlimited\n" "SSH Today" "$(human_bytes "$SSH_TODAY")"
-    printf "%-22s : %s / Unlimited\n" "V2Ray Today" "$(human_bytes "$XRAY_TODAY")"
+    printf "%-22s : %s / Unlimited\n" "Traffic Today" "$(human_bytes "$TOTAL_TODAY")"
+    printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$TOTAL_MONTH")"
+    printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$TOTAL_TOTAL")"
     echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Traffic This Month" "$(human_bytes "$ALL_MONTH")"
-    printf "%-22s : %s / Unlimited\n" "SSH This Month" "$(human_bytes "$SSH_MONTH")"
-    printf "%-22s : %s / Unlimited\n" "V2Ray This Month" "$(human_bytes "$XRAY_MONTH")"
+    printf "%-22s : %s / Unlimited\n" "SSH Traffic" "$(human_bytes "$SSH_TOTAL")"
+    printf "%-22s : %s / Unlimited\n" "V2Ray Traffic" "$(human_bytes "$XRAY_TOTAL")"
     echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Total Traffic" "$(human_bytes "$ALL_TOTAL")"
-    printf "%-22s : %s / Unlimited\n" "SSH Total" "$(human_bytes "$SSH_TOTAL")"
-    printf "%-22s : %s / Unlimited\n" "V2Ray Total" "$(human_bytes "$XRAY_TOTAL")"
+    printf "%-22s : %s\n" "SSH Users" "$(count_ssh)"
+    printf "%-22s : %s\n" "VMESS Users" "$(count_vmess)"
+    printf "%-22s : %s\n" "VLESS Users" "$(count_vless)"
+    printf "%-22s : %s\n" "Trojan Users" "$(count_trojan)"
     echo "----------------------------------------"
-    printf "%-22s : %s\n" "Total Users" "$TOTAL_USERS"
-    printf "%-22s : %s\n" "SSH Users" "$SSH_USERS"
-    printf "%-22s : %s\n" "V2Ray Users" "$V2RAY_USERS"
-    printf "%-22s : %s\n" "VMESS Users" "$VMESS_USERS"
-    printf "%-22s : %s\n" "VLESS Users" "$VLESS_USERS"
-    printf "%-22s : %s\n" "Trojan Users" "$TROJAN_USERS"
-    echo "----------------------------------------"
-    printf "%-22s : %s / Unlimited\n" "Max Users Today" "$ALL_PEAK"
-    printf "%-22s : %s / Unlimited\n" "SSH Max Today" "$SSH_PEAK"
-    printf "%-22s : %s / Unlimited\n" "V2Ray Max Today" "$XRAY_PEAK"
-    printf "%-22s : %s / Unlimited\n" "Current Online Users" "$ALL_ONLINE"
+    printf "%-22s : %s / Unlimited\n" "Max Users Today" "$TOTAL_PEAK"
+    printf "%-22s : %s / Unlimited\n" "Current Online Users" "$TOTAL_ONLINE"
     printf "%-22s : %s / Unlimited\n" "SSH Online Users" "$SSH_ONLINE"
     printf "%-22s : %s / Unlimited\n" "V2Ray Online Users" "$XRAY_ONLINE"
     echo "----------------------------------------"
+    printf "%-22s : %s\n" "RAM" "$(get_ram)"
+    printf "%-22s : %s\n" "Disk" "$(get_disk)"
     printf "%-22s : %s\n" "Uptime" "$(get_uptime)"
-    printf "%-22s : %s\n" "RAM Usage" "$(get_ram)"
-    printf "%-22s : %s\n" "Disk Usage" "$(get_disk)"
-    printf "%-22s : %s\n" "Load" "$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+    printf "%-22s : %s\n" "Load" "$(uptime | awk -F'load average: ' '{print $2}')"
     echo "----------------------------------------"
     echo "1 - Live Server Traffic"
     echo "2 - Live SSH Traffic"
@@ -7219,9 +7139,9 @@ full_server_stats_menu(){
     case "$ACTION" in
       1) live_traffic_view all "" SERVER ;;
       2) live_traffic_view ssh "" SSH ;;
-      3) live_traffic_view xrayall "" V2RAY ;;
-      4) online_all_users_menu ;;
-      5) online_ssh_users_menu ;;
+      3) live_traffic_view xray-all "" V2RAY ;;
+      4) online_users_view all "ALL ONLINE USERS - FIRST LOGIN TO LAST" ;;
+      5) online_users_view ssh "SSH ONLINE USERS - FIRST LOGIN TO LAST" ;;
       6) online_users_view xray "V2RAY ONLINE USERS - FIRST LOGIN TO LAST" ;;
       0) return ;;
     esac
