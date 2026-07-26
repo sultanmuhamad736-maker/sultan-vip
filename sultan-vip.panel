@@ -4384,6 +4384,1620 @@ web_panel_menu(){
   done
 }
 
+
+# ==========================================================
+# Telegram terminal bot: touch buttons connected to same menu
+# ==========================================================
+telegram_bot_read_token(){
+  local PROMPT="$1" OUTVAR="$2" V
+  while true; do
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+      printf '%s' "$PROMPT" > /dev/tty
+      IFS= read -r -s V < /dev/tty || V=""
+      printf '\n' > /dev/tty
+    else
+      printf '%s' "$PROMPT"
+      IFS= read -r -s V || V=""
+      printf '\n'
+    fi
+    V="$(printf '%s' "$V" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "$V" ] && break
+    echo "Bot token cannot be empty."
+  done
+  printf -v "$OUTVAR" '%s' "$V"
+}
+
+telegram_bot_auth_create(){
+  local AUTH_FILE="/etc/sultan/telegram-terminal-bot.auth" TG_USER TG_PASS TG_PASS2
+  echo "==========================================="
+  echo "      TELEGRAM BOT LOGIN SETUP"
+  echo "==========================================="
+  while true; do
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+      read -r -p "Telegram Bot Panel Username: " TG_USER < /dev/tty || TG_USER=""
+    else
+      read -r -p "Telegram Bot Panel Username: " TG_USER || TG_USER=""
+    fi
+    TG_USER="$(printf '%s' "$TG_USER" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if printf '%s' "$TG_USER" | grep -Eq '^[A-Za-z0-9_.-]{3,32}$'; then
+      break
+    fi
+    echo "Use 3-32 characters: letters, numbers, dot, underscore or dash."
+  done
+  while true; do
+    web_panel_read_secret "Telegram Bot Panel Password: " TG_PASS
+    web_panel_read_secret "Confirm Password: " TG_PASS2
+    [ "$TG_PASS" = "$TG_PASS2" ] && break
+    echo "Passwords do not match."
+  done
+  mkdir -p /etc/sultan
+  chmod 700 /etc/sultan
+  SULTAN_TG_USER="$TG_USER" SULTAN_TG_PASS="$TG_PASS" python3 - <<'PYTGAUTH'
+import hashlib, os
+user=os.environ['SULTAN_TG_USER']
+pw=os.environ['SULTAN_TG_PASS'].encode()
+salt=os.urandom(16)
+digest=hashlib.pbkdf2_hmac('sha256', pw, salt, 240000).hex()
+path='/etc/sultan/telegram-terminal-bot.auth'
+with open(path,'w') as f:
+    f.write(f'{user}:{salt.hex()}:{digest}\n')
+os.chmod(path,0o600)
+secret='/etc/sultan/telegram-terminal-bot.secret'
+if not os.path.exists(secret):
+    with open(secret,'wb') as f:
+        f.write(os.urandom(32).hex().encode()+b'\n')
+    os.chmod(secret,0o600)
+PYTGAUTH
+}
+
+telegram_bot_token_create(){
+  local TOKEN_FILE="/etc/sultan/telegram-terminal-bot.token" TG_TOKEN
+  telegram_bot_read_token "Telegram Bot Token from BotFather: " TG_TOKEN
+  mkdir -p /etc/sultan
+  chmod 700 /etc/sultan
+  printf '%s\n' "$TG_TOKEN" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+}
+
+telegram_bot_write_server(){
+  local BOT_DIR="/opt/sultan-telegram-bot"
+  mkdir -p "$BOT_DIR"
+  chmod 700 "$BOT_DIR"
+  cat > "$BOT_DIR/bot.py" <<'PYTGBOT'
+#!/usr/bin/env python3
+import hashlib
+import hmac
+import html
+import json
+import os
+import pty
+import re
+import select
+import signal
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = '/etc/sultan'
+TOKEN_FILE = os.path.join(BASE, 'telegram-terminal-bot.token')
+AUTH_FILE = os.path.join(BASE, 'telegram-terminal-bot.auth')
+MENU_CMD = '/usr/local/bin/menu'
+SESSION_TTL = 12 * 60 * 60
+TERMINAL_TTL = 60 * 60
+MAX_OUTPUT = 256 * 1024
+API_TIMEOUT = 55
+
+ansi_re = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+clear_re = re.compile(rb'\x1bc|\x1b\[2J|\x1b\[H\x1b\[J|\x1b\[H\x1b\[2J|\x1b\[3J|\x1b\[\?1049[hl]')
+state_lock = threading.Lock()
+login_state = {}
+auth_sessions = {}
+terminals = {}
+last_render_message = {}
+last_text_hash = {}
+
+
+def read_token():
+    with open(TOKEN_FILE, 'r') as f:
+        token = f.readline().strip()
+    if not token:
+        raise SystemExit('Missing Telegram bot token. Run menu -> Telegram Terminal Bot first.')
+    return token
+
+
+TOKEN = read_token()
+API = 'https://api.telegram.org/bot' + TOKEN + '/'
+
+
+def api(method, data=None, retries=2):
+    payload = urllib.parse.urlencode(data or {}).encode()
+    last = None
+    for _ in range(retries + 1):
+        try:
+            req = urllib.request.Request(API + method, data=payload)
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT) as r:
+                raw = r.read().decode('utf-8', 'replace')
+                return json.loads(raw)
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise last
+
+
+def load_auth():
+    try:
+        with open(AUTH_FILE, 'r') as f:
+            line = f.readline().strip()
+        user, salt_hex, digest_hex = line.split(':', 2)
+        return user, bytes.fromhex(salt_hex), digest_hex
+    except Exception:
+        return None, None, None
+
+
+def verify_login(username, password):
+    user, salt, expected = load_auth()
+    if not user or username != user:
+        return False
+    got = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 240000).hex()
+    return hmac.compare_digest(got, expected)
+
+
+def is_authed(chat_id):
+    s = auth_sessions.get(str(chat_id))
+    if not s:
+        return False
+    if s.get('exp', 0) < time.time():
+        auth_sessions.pop(str(chat_id), None)
+        return False
+    return True
+
+
+def set_authed(chat_id, username):
+    auth_sessions[str(chat_id)] = {'u': username, 'exp': time.time() + SESSION_TTL}
+
+
+def clear_auth(chat_id):
+    auth_sessions.pop(str(chat_id), None)
+    login_state.pop(str(chat_id), None)
+    t = terminals.pop(str(chat_id), None)
+    if t:
+        t.close()
+
+
+class TerminalSession:
+    def __init__(self, chat_id):
+        self.chat_id = str(chat_id)
+        self.created = time.time()
+        self.last_seen = time.time()
+        self.lock = threading.Lock()
+        self.buffer = bytearray()
+        self.dead = False
+        self.master, slave = pty.openpty()
+        env = os.environ.copy()
+        env['TERM'] = 'xterm-256color'
+        env['LANG'] = env.get('LANG', 'C.UTF-8')
+        env['SULTAN_TELEGRAM_BOT'] = '1'
+        self.proc = subprocess.Popen([MENU_CMD], stdin=slave, stdout=slave, stderr=slave, close_fds=True, start_new_session=True, env=env)
+        os.close(slave)
+        self.reader = threading.Thread(target=self._reader, daemon=True)
+        self.reader.start()
+
+    def _append(self, data):
+        # Keep Telegram synchronized with the real terminal screen.
+        # When the bash menu clears the screen, old buttons must disappear too.
+        m = None
+        for m in clear_re.finditer(data):
+            pass
+        with self.lock:
+            if m is not None:
+                self.buffer.clear()
+                data = data[m.end():]
+            self.buffer.extend(data)
+            if len(self.buffer) > MAX_OUTPUT:
+                self.buffer = self.buffer[-MAX_OUTPUT:]
+
+    def _reader(self):
+        while True:
+            if self.dead:
+                return
+            try:
+                r, _, _ = select.select([self.master], [], [], 0.5)
+                if not r:
+                    if self.proc.poll() is not None:
+                        self._append(b'\r\n[menu exited]\r\n')
+                        self.dead = True
+                        return
+                    continue
+                data = os.read(self.master, 8192)
+                if not data:
+                    continue
+                self._append(data)
+            except OSError:
+                self.dead = True
+                return
+            except Exception as e:
+                self._append(('\r\n[terminal error: %s]\r\n' % e).encode())
+                self.dead = True
+                return
+
+    def write(self, data):
+        self.last_seen = time.time()
+        if self.dead:
+            return False
+        try:
+            os.write(self.master, data)
+            return True
+        except OSError:
+            self.dead = True
+            return False
+
+    def text(self):
+        self.last_seen = time.time()
+        with self.lock:
+            raw = bytes(self.buffer)
+        return raw.decode('utf-8', 'replace')
+
+    def close(self):
+        self.dead = True
+        try:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            os.close(self.master)
+        except Exception:
+            pass
+
+
+def get_terminal(chat_id):
+    k = str(chat_id)
+    t = terminals.get(k)
+    if not t or t.dead:
+        t = TerminalSession(chat_id)
+        terminals[k] = t
+        time.sleep(0.6)
+    return t
+
+
+def clean_text(s):
+    s = s.replace('\r', '')
+    s = ansi_re.sub('', s)
+    s = re.sub(r'\x1b\][^\x07]*(\x07|\x1b\\)', '', s)
+    return s
+
+
+def split_option_line(line):
+    found = []
+    pat = re.compile(r'([\[\(])\s*([A-Za-z0-9]{1,3})\s*([\]\)])\s*')
+    matches = list(pat.finditer(line))
+    for i, m in enumerate(matches):
+        num = m.group(2)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+        label = line[start:end].strip(' │║═─-')
+        label = re.sub(r'\s{2,}.*$', lambda x: x.group(0).strip(), label)
+        label = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', label).strip()
+        if label:
+            label = re.sub(r'\s+', ' ', label)
+            found.append((num, f'[{num}] {label[:38]}'))
+    return found
+
+
+def _last_nonempty_lines(display, limit=18):
+    lines = []
+    for line in clean_text(display).splitlines():
+        stripped = line.strip()
+        if stripped:
+            lines.append(stripped)
+    return lines[-limit:]
+
+
+def prompt_mode(display):
+    """Return menu, yesno, enter, or text based on the current terminal prompt."""
+    lines = _last_nonempty_lines(display)
+    if not lines:
+        return 'menu'
+    tail = ' '.join(lines[-4:]).lower()
+    last = lines[-1].lower()
+    if '(y/n)' in tail or ' y or n' in tail or 'yes/no' in tail or '[y/n]' in tail:
+        return 'yesno'
+    if 'press enter' in last or 'press any key' in last:
+        return 'enter'
+    if 'select:' in last or '👉 select' in last or re.search(r'(^|\s)select\s*:\s*$', last):
+        return 'menu'
+    text_prompt_re = re.compile(
+        r'(username|user name|password|confirm password|days|expire|expiration|limit|quota|traffic|domain|uuid|token|chat id|chatid|email|host|port|path|sni|server name|name|ip address|new |old |enter |input|please enter|type ).*[:?]\s*$',
+        re.I,
+    )
+    if text_prompt_re.search(lines[-1]):
+        return 'text'
+    if any(x in tail for x in ['password cannot be empty', 'passwords do not match']):
+        return 'text'
+    return 'menu'
+
+
+def control_rows(extra_first=None):
+    rows = []
+    if extra_first:
+        rows.append(extra_first)
+    rows.append([
+        {'text': '↵ Enter', 'callback_data': 'c:enter'},
+        {'text': '⌫ Backspace', 'callback_data': 'c:backspace'},
+        {'text': '🛑 Ctrl+C', 'callback_data': 'c:ctrlc'},
+    ])
+    rows.append([
+        {'text': '🔄 Refresh', 'callback_data': 'c:refresh'},
+        {'text': '🆕 New Session', 'callback_data': 'c:new'},
+        {'text': '🚪 Logout', 'callback_data': 'c:logout'},
+    ])
+    return rows
+
+
+def build_keyboard(display):
+    mode = prompt_mode(display)
+    if mode == 'yesno':
+        return {'inline_keyboard': control_rows([
+            {'text': '✅ Yes / y', 'callback_data': 'm:y'},
+            {'text': '❌ No / n', 'callback_data': 'm:n'},
+        ])}
+    if mode == 'enter':
+        return {'inline_keyboard': control_rows([
+            {'text': '↵ Press Enter', 'callback_data': 'c:enter'},
+        ])}
+    if mode == 'text':
+        return {'inline_keyboard': control_rows([
+            {'text': '✍️ اكتب الرد برسالة عادية', 'callback_data': 'c:refresh'},
+        ])}
+
+    lines = clean_text(display).splitlines()[-70:]
+    rows = []
+    seen = set()
+    for line in lines:
+        opts = split_option_line(line)
+        if not opts:
+            continue
+        row = []
+        for num, label in opts[:2]:
+            key = 'm:' + num
+            if key in seen:
+                continue
+            seen.add(key)
+            row.append({'text': label, 'callback_data': key})
+        if row:
+            rows.append(row)
+        if len(rows) >= 15:
+            break
+    if not rows:
+        rows.append([{'text': '🔄 Refresh', 'callback_data': 'c:refresh'}])
+    rows.extend(control_rows())
+    return {'inline_keyboard': rows}
+
+def send(chat_id, text, keyboard=None, parse_mode='HTML'):
+    data = {'chat_id': chat_id, 'text': text, 'disable_web_page_preview': 'true'}
+    if parse_mode:
+        data['parse_mode'] = parse_mode
+    if keyboard:
+        data['reply_markup'] = json.dumps(keyboard, separators=(',', ':'))
+    return api('sendMessage', data)
+
+
+def edit(chat_id, message_id, text, keyboard=None):
+    data = {'chat_id': chat_id, 'message_id': message_id, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': 'true'}
+    if keyboard:
+        data['reply_markup'] = json.dumps(keyboard, separators=(',', ':'))
+    try:
+        return api('editMessageText', data, retries=0)
+    except Exception:
+        return send(chat_id, text, keyboard)
+
+
+def answer_callback(callback_id, text=''):
+    try:
+        api('answerCallbackQuery', {'callback_query_id': callback_id, 'text': text})
+    except Exception:
+        pass
+
+
+def login_keyboard():
+    return {'inline_keyboard': [[{'text': '🔐 Login', 'callback_data': 'login'}]]}
+
+
+def welcome(chat_id):
+    send(chat_id, '<b>SULTAN Telegram Terminal Bot</b>\nSame /usr/local/bin/menu, same server data.\n\nPress Login and enter the username/password created from option 22.', login_keyboard())
+
+
+def render(chat_id, force_new=False):
+    t = get_terminal(chat_id)
+    txt = clean_text(t.text())
+    if not txt.strip():
+        txt = 'Starting /usr/local/bin/menu ...'
+    shown = txt[-3400:]
+    mode = prompt_mode(txt)
+    hint = 'اضغط زر الخيار عندما تظهر القائمة.'
+    if mode == 'text':
+        hint = '✍️ السكربت ينتظر كتابة: ارسل الرد برسالة عادية.'
+    elif mode == 'yesno':
+        hint = 'اختر Yes أو No من الأزرار.'
+    elif mode == 'enter':
+        hint = 'اضغط Enter للمتابعة.'
+    body = '<b>SULTAN VIP TERMINAL BOT</b>\n<pre>' + html.escape(shown) + '</pre>\n' + html.escape(hint)
+    kb = build_keyboard(txt)
+    k = str(chat_id)
+    h = hashlib.sha256((body + json.dumps(kb, sort_keys=True)).encode()).hexdigest()
+    if not force_new and last_text_hash.get(k) == h:
+        return
+    last_text_hash[k] = h
+    mid = last_render_message.get(k)
+    if mid and not force_new:
+        res = edit(chat_id, mid, body, kb)
+    else:
+        res = send(chat_id, body, kb)
+    try:
+        last_render_message[k] = res['result']['message_id']
+    except Exception:
+        pass
+
+
+def handle_login_text(chat_id, text):
+    k = str(chat_id)
+    st = login_state.get(k, {})
+    if st.get('step') == 'user':
+        st['username'] = text.strip()
+        st['step'] = 'pass'
+        login_state[k] = st
+        send(chat_id, 'Password:')
+        return True
+    if st.get('step') == 'pass':
+        username = st.get('username', '')
+        password = text.strip()
+        login_state.pop(k, None)
+        if verify_login(username, password):
+            set_authed(chat_id, username)
+            send(chat_id, '✅ Login successful. Opening the real terminal menu...')
+            render(chat_id, True)
+        else:
+            send(chat_id, '❌ Wrong username or password.', login_keyboard())
+        return True
+    return False
+
+
+def handle_message(msg):
+    chat = msg.get('chat', {})
+    chat_id = chat.get('id')
+    if chat_id is None:
+        return
+    text = msg.get('text', '') or ''
+    if text.startswith('/start'):
+        if is_authed(chat_id):
+            render(chat_id, True)
+        else:
+            welcome(chat_id)
+        return
+    if text.startswith('/logout'):
+        clear_auth(chat_id)
+        send(chat_id, 'Logged out.', login_keyboard())
+        return
+    if text.startswith('/login'):
+        parts = text.split(maxsplit=2)
+        if len(parts) == 3 and verify_login(parts[1], parts[2]):
+            set_authed(chat_id, parts[1])
+            send(chat_id, '✅ Login successful. Opening the real terminal menu...')
+            render(chat_id, True)
+        else:
+            login_state[str(chat_id)] = {'step': 'user'}
+            send(chat_id, 'Username:')
+        return
+    if handle_login_text(chat_id, text):
+        return
+    if not is_authed(chat_id):
+        welcome(chat_id)
+        return
+    t = get_terminal(chat_id)
+    t.write((text + '\r').encode())
+    time.sleep(1.1)
+    render(chat_id)
+
+
+def handle_callback(cb):
+    cid = cb.get('id')
+    msg = cb.get('message') or {}
+    chat_id = (msg.get('chat') or {}).get('id')
+    data = cb.get('data', '')
+    if chat_id is None:
+        return
+    if data == 'login':
+        answer_callback(cid)
+        login_state[str(chat_id)] = {'step': 'user'}
+        send(chat_id, 'Username:')
+        return
+    if not is_authed(chat_id):
+        answer_callback(cid, 'Login first')
+        welcome(chat_id)
+        return
+    t = get_terminal(chat_id)
+    if data.startswith('m:'):
+        val = data[2:]
+        t.write((val + '\r').encode())
+        answer_callback(cid, val)
+        time.sleep(1.1)
+        render(chat_id)
+        return
+    if data.startswith('c:'):
+        cmd = data[2:]
+        if cmd == 'enter':
+            t.write(b'\n')
+        elif cmd == 'backspace':
+            t.write(b'\x7f')
+        elif cmd == 'ctrlc':
+            t.write(b'\x03')
+        elif cmd == 'new':
+            old = terminals.pop(str(chat_id), None)
+            if old:
+                old.close()
+            last_render_message.pop(str(chat_id), None)
+            last_text_hash.pop(str(chat_id), None)
+            answer_callback(cid, 'New session')
+            render(chat_id, True)
+            return
+        elif cmd == 'logout':
+            clear_auth(chat_id)
+            answer_callback(cid, 'Logged out')
+            send(chat_id, 'Logged out.', login_keyboard())
+            return
+        elif cmd == 'refresh':
+            pass
+        answer_callback(cid)
+        time.sleep(0.8)
+        render(chat_id, cmd == 'refresh')
+
+
+def cleanup_loop():
+    while True:
+        now = time.time()
+        for k, t in list(terminals.items()):
+            if t.dead or now - t.last_seen > TERMINAL_TTL:
+                terminals.pop(k, None)
+                t.close()
+        for k, s in list(auth_sessions.items()):
+            if s.get('exp', 0) < now:
+                auth_sessions.pop(k, None)
+        time.sleep(60)
+
+
+def main():
+    if not os.path.exists(AUTH_FILE):
+        raise SystemExit('Missing Telegram bot auth. Run menu -> TELEGRAM TERMINAL BOT first.')
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+    offset = 0
+    try:
+        me = api('getMe', {})
+        username = ((me.get('result') or {}).get('username') or 'bot')
+        print('Sultan Telegram Terminal Bot running as @%s' % username, flush=True)
+    except Exception as e:
+        print('Telegram getMe failed: %s' % e, flush=True)
+    while True:
+        try:
+            res = api('getUpdates', {'timeout': 50, 'offset': offset, 'allowed_updates': json.dumps(['message', 'callback_query'])}, retries=1)
+            for upd in res.get('result', []):
+                offset = max(offset, int(upd.get('update_id', 0)) + 1)
+                if 'message' in upd:
+                    handle_message(upd['message'])
+                elif 'callback_query' in upd:
+                    handle_callback(upd['callback_query'])
+        except KeyboardInterrupt:
+            return
+        except Exception as e:
+            print('poll error: %s' % e, flush=True)
+            time.sleep(3)
+
+
+if __name__ == '__main__':
+    main()
+PYTGBOT
+  chmod 700 "$BOT_DIR/bot.py"
+}
+
+telegram_bot_write_service(){
+  cat > /etc/systemd/system/sultan-telegram-terminal-bot.service <<'EOF'
+[Unit]
+Description=SULTAN VIP Telegram Terminal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sultan-telegram-bot
+ExecStart=/usr/bin/python3 /opt/sultan-telegram-bot/bot.py
+Restart=always
+RestartSec=3
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable sultan-telegram-terminal-bot >/dev/null 2>&1 || true
+  systemctl restart sultan-telegram-terminal-bot
+}
+
+telegram_bot_print_info(){
+  local T TG_INFO
+  T="$(cat /etc/sultan/telegram-terminal-bot.token 2>/dev/null || true)"
+  echo "Service : $(systemctl is-active sultan-telegram-terminal-bot 2>/dev/null || echo inactive)"
+  if [ -n "$T" ]; then
+    TG_INFO="$(curl -fsS "https://api.telegram.org/bot$T/getMe" 2>/dev/null || true)"
+    if [ -n "$TG_INFO" ]; then
+      TG_INFO="$TG_INFO" python3 - <<'PYTGINFO' 2>/dev/null || true
+import json, os
+try:
+    data=json.loads(os.environ.get('TG_INFO','{}'))
+    r=data.get('result') or {}
+    u=r.get('username')
+    if u:
+        print('Bot URL : https://t.me/%s' % u)
+    else:
+        print('Bot URL : token saved, getMe did not return username')
+except Exception:
+    print('Bot URL : token saved')
+PYTGINFO
+    else
+      echo "Bot URL : Token saved, could not reach Telegram API now"
+    fi
+  else
+    echo "Bot URL : Token not saved"
+  fi
+}
+install_telegram_terminal_bot(){
+  refresh_screen
+  box "TELEGRAM TERMINAL BOT" "This installs a Telegram touch bot that runs the same /usr/local/bin/menu."
+  telegram_bot_token_create || { pause; return 1; }
+  telegram_bot_auth_create || { pause; return 1; }
+  telegram_bot_write_server || { echo "Failed to write Telegram bot server."; pause; return 1; }
+  telegram_bot_write_service || { echo "Failed to start Telegram bot service."; pause; return 1; }
+  echo "==========================================="
+  echo "TELEGRAM TERMINAL BOT INSTALLED"
+  telegram_bot_print_info
+  echo "Open the bot, press /start, then login with the username/password created here."
+  echo "The bot opens the same terminal menu and uses the same server data."
+  echo "==========================================="
+  systemctl --no-pager --full status sultan-telegram-terminal-bot 2>/dev/null | sed -n '1,8p' || true
+  pause
+}
+
+reset_telegram_bot_login(){
+  refresh_screen
+  box "TELEGRAM BOT LOGIN" "Reset the Telegram bot username and password."
+  telegram_bot_auth_create || { pause; return 1; }
+  systemctl restart sultan-telegram-terminal-bot 2>/dev/null || true
+  echo "Telegram bot login reset completed."
+  telegram_bot_print_info
+  pause
+}
+
+reset_telegram_bot_token(){
+  refresh_screen
+  box "TELEGRAM BOT TOKEN" "Replace the BotFather token and restart the bot."
+  telegram_bot_token_create || { pause; return 1; }
+  telegram_bot_write_server || true
+  telegram_bot_write_service || { echo "Failed to restart Telegram bot service."; pause; return 1; }
+  echo "Telegram bot token updated."
+  telegram_bot_print_info
+  pause
+}
+
+restart_telegram_terminal_bot(){
+  refresh_screen
+  box "TELEGRAM BOT RESTART" "Restarting Telegram terminal bot service."
+  telegram_bot_write_server || { echo "Failed to write Telegram bot server."; pause; return 1; }
+  telegram_bot_write_service || { echo "Failed to restart Telegram bot service."; pause; return 1; }
+  telegram_bot_print_info
+  systemctl --no-pager --full status sultan-telegram-terminal-bot 2>/dev/null | sed -n '1,12p' || true
+  pause
+}
+
+telegram_terminal_bot_menu(){
+  while true; do
+    refresh_screen
+    echo "==========================================="
+    echo "        TELEGRAM TERMINAL BOT"
+    echo "==========================================="
+    echo "[1] Install / Repair Telegram Bot"
+    echo "[2] Reset Telegram Bot Login"
+    echo "[3] Telegram Bot Status"
+    echo "[4] Reset Bot Token"
+    echo "[5] Restart / Repair Telegram Bot"
+    echo "[0] Back"
+    echo "==========================================="
+    read -p "Select: " TG
+    case "$TG" in
+      1) install_telegram_terminal_bot ;;
+      2) reset_telegram_bot_login ;;
+      3)
+        refresh_screen
+        box "TELEGRAM BOT STATUS" "Same terminal menu through Telegram buttons."
+        telegram_bot_print_info
+        systemctl --no-pager --full status sultan-telegram-terminal-bot 2>/dev/null | sed -n '1,12p' || true
+        pause
+        ;;
+      4) reset_telegram_bot_token ;;
+      5) restart_telegram_terminal_bot ;;
+      0) return ;;
+      *) echo "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+
+# ==========================================================
+# Option 22 override: Multi-server Telegram Bot Controller + Agents
+# This block only overrides TELEGRAM BOT menu behavior and keeps the rest of the panel untouched.
+# ==========================================================
+tgms_read_hidden(){
+  local prompt="$1" varname="$2" value
+  while true; do
+    printf '%s' "$prompt"
+    stty -echo 2>/dev/null || true
+    IFS= read -r value </dev/tty || IFS= read -r value
+    stty echo 2>/dev/null || true
+    echo
+    [ -n "$value" ] && break
+    echo "Value cannot be empty."
+  done
+  printf -v "$varname" '%s' "$value"
+}
+
+tgms_read_line(){
+  local prompt="$1" varname="$2" default="${3:-}" value
+  if [ -n "$default" ]; then
+    read -r -p "$prompt [$default]: " value </dev/tty || read -r -p "$prompt [$default]: " value
+    value="${value:-$default}"
+  else
+    while true; do
+      read -r -p "$prompt: " value </dev/tty || read -r -p "$prompt: " value
+      [ -n "$value" ] && break
+      echo "Value cannot be empty."
+    done
+  fi
+  printf -v "$varname" '%s' "$value"
+}
+
+tgms_default_controller_url(){
+  local IP DOM PORT
+  PORT="$(cat /etc/sultan/tg-multi/controller.port 2>/dev/null || echo 2097)"
+  DOM="$(cat /etc/sultan/domain 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  IP="$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  if [ -n "$DOM" ]; then
+    echo "http://$DOM:$PORT"
+  else
+    echo "http://$IP:$PORT"
+  fi
+}
+
+tgms_auth_create(){
+  local AUTH_DIR="/etc/sultan/tg-multi" USER PASS PASS2
+  mkdir -p "$AUTH_DIR"
+  chmod 700 "$AUTH_DIR"
+  echo "==========================================="
+  echo "    MULTI-SERVER TELEGRAM BOT LOGIN"
+  echo "==========================================="
+  tgms_read_line "Bot Admin Username" USER
+  while true; do
+    tgms_read_hidden "Bot Admin Password: " PASS
+    tgms_read_hidden "Confirm Password: " PASS2
+    [ "$PASS" = "$PASS2" ] && break
+    echo "Passwords do not match."
+  done
+  TGMS_USER="$USER" TGMS_PASS="$PASS" python3 - <<'PYAUTH'
+import hashlib, os
+base='/etc/sultan/tg-multi'
+os.makedirs(base, exist_ok=True)
+user=os.environ['TGMS_USER'].strip()
+pw=os.environ['TGMS_PASS']
+salt=os.urandom(16)
+digest=hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, 240000).hex()
+with open(os.path.join(base,'controller.auth'),'w') as f:
+    f.write(f'{user}:{salt.hex()}:{digest}\n')
+os.chmod(os.path.join(base,'controller.auth'),0o600)
+PYAUTH
+}
+
+tgms_token_create(){
+  local TOK
+  tgms_read_hidden "Telegram Bot Token from BotFather: " TOK
+  mkdir -p /etc/sultan/tg-multi
+  printf '%s\n' "$TOK" > /etc/sultan/tg-multi/bot.token
+  chmod 600 /etc/sultan/tg-multi/bot.token
+}
+
+tgms_make_register_token(){
+  mkdir -p /etc/sultan/tg-multi
+  if [ ! -s /etc/sultan/tg-multi/register.token ]; then
+    python3 - <<'PYREG'
+import secrets, os
+os.makedirs('/etc/sultan/tg-multi', exist_ok=True)
+open('/etc/sultan/tg-multi/register.token','w').write(secrets.token_urlsafe(32)+'\n')
+os.chmod('/etc/sultan/tg-multi/register.token',0o600)
+PYREG
+  fi
+}
+
+tgms_write_controller(){
+  local DIR="/opt/sultan-tg-multiserver"
+  mkdir -p "$DIR"
+  chmod 700 "$DIR"
+  cat > "$DIR/controller.py" <<'PYCTRL'
+#!/usr/bin/env python3
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BASE='/etc/sultan/tg-multi'
+DB=os.path.join(BASE,'controller.db')
+TOKEN_FILE=os.path.join(BASE,'bot.token')
+AUTH_FILE=os.path.join(BASE,'controller.auth')
+REGISTER_FILE=os.path.join(BASE,'register.token')
+PORT_FILE=os.path.join(BASE,'controller.port')
+PORT=int(open(PORT_FILE).read().strip() if os.path.exists(PORT_FILE) else '2097')
+MENU_MAX=3600
+SESSION_TTL=12*60*60
+OFFLINE_AFTER=45
+API_TIMEOUT=55
+ansi_re=re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+state_lock=threading.RLock()
+login_state={}
+auth_sessions={}
+selected_server={}
+last_message={}
+
+with open(TOKEN_FILE,'r') as f:
+    TOKEN=f.readline().strip()
+if not TOKEN:
+    raise SystemExit('Missing bot token')
+API='https://api.telegram.org/bot'+TOKEN+'/'
+
+def db():
+    con=sqlite3.connect(DB, timeout=30)
+    con.row_factory=sqlite3.Row
+    con.execute('PRAGMA journal_mode=WAL')
+    con.execute('CREATE TABLE IF NOT EXISTS servers(id TEXT PRIMARY KEY, name TEXT, host TEXT, token TEXT, last_seen REAL DEFAULT 0, snapshot TEXT DEFAULT "", created REAL DEFAULT 0)')
+    con.execute('CREATE TABLE IF NOT EXISTS commands(id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT, kind TEXT, data TEXT, created REAL DEFAULT 0, delivered INTEGER DEFAULT 0)')
+    con.commit()
+    return con
+
+def read_register_token():
+    try:
+        return open(REGISTER_FILE).read().strip()
+    except Exception:
+        return ''
+
+def api(method, data=None, retries=2):
+    payload=urllib.parse.urlencode(data or {}).encode()
+    last=None
+    for _ in range(retries+1):
+        try:
+            req=urllib.request.Request(API+method, data=payload)
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT) as r:
+                return json.loads(r.read().decode('utf-8','replace'))
+        except Exception as e:
+            last=e
+            time.sleep(1)
+    raise last
+
+def answer_callback(cid, text=''):
+    if cid:
+        try: api('answerCallbackQuery', {'callback_query_id':cid, 'text':text[:180]})
+        except Exception: pass
+
+def load_auth():
+    try:
+        line=open(AUTH_FILE).readline().strip()
+        user,salt_hex,digest_hex=line.split(':',2)
+        return user, bytes.fromhex(salt_hex), digest_hex
+    except Exception:
+        return None,None,None
+
+def verify_login(user,pw):
+    expected_user,salt,expected=load_auth()
+    if not expected_user or user != expected_user:
+        return False
+    got=hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, 240000).hex()
+    return hmac.compare_digest(got, expected)
+
+def is_authed(chat_id):
+    k=str(chat_id)
+    s=auth_sessions.get(k)
+    if not s: return False
+    if s.get('exp',0) < time.time():
+        auth_sessions.pop(k,None)
+        selected_server.pop(k,None)
+        return False
+    return True
+
+def set_authed(chat_id,user):
+    auth_sessions[str(chat_id)]={'user':user,'exp':time.time()+SESSION_TTL}
+
+def send(chat_id, text, reply_markup=None):
+    data={'chat_id':chat_id,'text':text[:4090], 'parse_mode':'HTML', 'disable_web_page_preview':'true'}
+    if reply_markup:
+        data['reply_markup']=json.dumps(reply_markup)
+    return api('sendMessage', data)
+
+def edit(chat_id, message_id, text, reply_markup=None):
+    data={'chat_id':chat_id,'message_id':message_id,'text':text[:4090], 'parse_mode':'HTML', 'disable_web_page_preview':'true'}
+    if reply_markup:
+        data['reply_markup']=json.dumps(reply_markup)
+    try:
+        return api('editMessageText', data, retries=1)
+    except Exception:
+        return send(chat_id, text, reply_markup)
+
+def clean_text(s):
+    s=s.replace('\r','')
+    s=ansi_re.sub('',s)
+    s=re.sub(r'\x1b\][^\x07]*(\x07|\x1b\\)', '', s)
+    return s
+
+def split_option_line(line):
+    found=[]
+    pat=re.compile(r'([\[\(])\s*([A-Za-z0-9]{1,3})\s*([\]\)])\s*')
+    matches=list(pat.finditer(line))
+    for i,m in enumerate(matches):
+        num=m.group(2)
+        start=m.end()
+        end=matches[i+1].start() if i+1 < len(matches) else len(line)
+        label=line[start:end].strip(' │║═─-')
+        if label:
+            label=re.sub(r'\s+', ' ', label).strip()
+            found.append((num, f'[{num}] {label[:38]}'))
+    return found
+
+def prompt_mode(display):
+    lines=[x.strip() for x in clean_text(display).splitlines() if x.strip()]
+    if not lines: return 'menu'
+    tail=' '.join(lines[-4:]).lower()
+    last=lines[-1].lower()
+    if '(y/n)' in tail or ' y or n' in tail or 'yes/no' in tail or '[y/n]' in tail:
+        return 'yesno'
+    if 'press enter' in last or 'press any key' in last:
+        return 'enter'
+    if 'select:' in last or '👉 select' in last or re.search(r'(^|\s)select\s*:\s*$', last):
+        return 'menu'
+    if re.search(r'(username|user name|password|confirm password|days|expire|limit|quota|traffic|domain|uuid|token|chat id|email|host|port|path|sni|server name|name|ip address|new |old |enter |input|please enter|type ).*[:?]\s*$', lines[-1], re.I):
+        return 'text'
+    if any(x in tail for x in ['password cannot be empty','passwords do not match']):
+        return 'text'
+    return 'menu'
+
+def control_rows(sid, first=None):
+    rows=[]
+    if first: rows.append(first)
+    rows.append([
+        {'text':'↵ Enter','callback_data':f'ctl:{sid}:enter'},
+        {'text':'⌫ Backspace','callback_data':f'ctl:{sid}:backspace'},
+        {'text':'🛑 Ctrl+C','callback_data':f'ctl:{sid}:ctrlc'},
+    ])
+    rows.append([
+        {'text':'🔄 Refresh','callback_data':f'srv:{sid}'},
+        {'text':'🆕 New Session','callback_data':f'ctl:{sid}:new'},
+        {'text':'⬅️ Servers','callback_data':'servers'},
+    ])
+    return rows
+
+def terminal_keyboard(sid, display, online=True):
+    if not online:
+        return {'inline_keyboard':[[{'text':'🔄 Refresh','callback_data':f'srv:{sid}'},{'text':'⬅️ Servers','callback_data':'servers'}]]}
+    mode=prompt_mode(display)
+    if mode=='yesno':
+        return {'inline_keyboard':control_rows(sid,[{'text':'✅ Yes / y','callback_data':f'cmd:{sid}:y'},{'text':'❌ No / n','callback_data':f'cmd:{sid}:n'}])}
+    if mode=='enter':
+        return {'inline_keyboard':control_rows(sid,[{'text':'↵ Press Enter','callback_data':f'ctl:{sid}:enter'}])}
+    if mode=='text':
+        return {'inline_keyboard':control_rows(sid,[{'text':'✍️ اكتب الرد برسالة عادية','callback_data':f'srv:{sid}'}])}
+    rows=[]; seen=set()
+    for line in clean_text(display).splitlines()[-80:]:
+        opts=split_option_line(line)
+        if not opts: continue
+        row=[]
+        for num,label in opts[:2]:
+            key=f'cmd:{sid}:{num}'
+            if key in seen: continue
+            seen.add(key)
+            row.append({'text':label,'callback_data':key})
+        if row: rows.append(row)
+    rows.extend(control_rows(sid))
+    return {'inline_keyboard':rows[-30:]}
+
+def list_servers():
+    with db() as con:
+        return con.execute('SELECT * FROM servers ORDER BY created DESC').fetchall()
+
+def get_server(sid):
+    with db() as con:
+        return con.execute('SELECT * FROM servers WHERE id=?',(sid,)).fetchone()
+
+def enqueue(sid, kind, data=''):
+    with db() as con:
+        con.execute('INSERT INTO commands(server_id,kind,data,created,delivered) VALUES(?,?,?,?,0)',(sid,kind,data,time.time()))
+        con.commit()
+
+def server_online(row):
+    return row and (time.time() - float(row['last_seen'] or 0) < OFFLINE_AFTER)
+
+def main_keyboard():
+    rows=[]
+    current=[]
+    for s in list_servers():
+        alive='🟢' if server_online(s) else '🔴'
+        text=f"{alive} {s['name'] or s['host'] or s['id'][:8]}"
+        current.append({'text':text[:45],'callback_data':'srv:'+s['id']})
+        if len(current)==2:
+            rows.append(current); current=[]
+    if current: rows.append(current)
+    rows.append([{'text':'➕ Add Server','callback_data':'add'},{'text':'🔄 Refresh','callback_data':'servers'}])
+    rows.append([{'text':'🚪 Logout','callback_data':'logout'}])
+    return {'inline_keyboard':rows}
+
+def render_servers(chat_id, force_new=False):
+    servers=list_servers()
+    body='<b>SULTAN VIP MULTI-SERVER BOT</b>\n'
+    body+='Same Telegram token · multiple VPS agents\n\n'
+    if servers:
+        for s in servers:
+            age=int(time.time()-float(s['last_seen'] or 0)) if s['last_seen'] else 999999
+            st='🟢 Online' if age < OFFLINE_AFTER else '🔴 Offline'
+            body+=f"{st} · <code>{html.escape(s['name'] or s['host'] or s['id'][:8])}</code>"
+            if age < 999999: body+=f" · {age}s ago"
+            body+='\n'
+    else:
+        body+='No connected servers yet. Press Add Server.\n'
+    k=str(chat_id); mid=last_message.get(k)
+    if mid and not force_new:
+        res=edit(chat_id, mid, body, main_keyboard())
+    else:
+        res=send(chat_id, body, main_keyboard())
+    try: last_message[k]=res['result']['message_id']
+    except Exception: pass
+
+def render_server(chat_id, sid, force_new=False):
+    s=get_server(sid)
+    if not s:
+        render_servers(chat_id, True); return
+    selected_server[str(chat_id)]=sid
+    online=server_online(s)
+    status='🟢 ONLINE' if online else '🔴 OFFLINE - bot is still running, server is not responding'
+    snap=clean_text(s['snapshot'] or '')
+    if not snap.strip(): snap='[waiting for server agent output]'
+    body=f"<b>{html.escape(s['name'] or s['host'] or sid[:8])}</b> · {status}\n"
+    body+=f"<code>{html.escape(s['host'] or '')}</code>\n\n"
+    body+='<pre>'+html.escape(snap[-MENU_MAX:])+'</pre>'
+    kb=terminal_keyboard(sid, snap, online)
+    k=str(chat_id); mid=last_message.get(k)
+    if mid and not force_new:
+        res=edit(chat_id, mid, body, kb)
+    else:
+        res=send(chat_id, body, kb)
+    try: last_message[k]=res['result']['message_id']
+    except Exception: pass
+
+def login_keyboard():
+    return {'inline_keyboard':[[{'text':'🔐 Login','callback_data':'login'}]]}
+
+def welcome(chat_id):
+    send(chat_id,'<b>SULTAN VIP MULTI-SERVER BOT</b>\nLogin with the username/password created from terminal.',login_keyboard())
+
+def add_server_text():
+    reg=read_register_token()
+    url=f'http://YOUR-CONTROLLER-IP:{PORT}'
+    return ("<b>➕ Add Server</b>\n\n"
+            "On the new VPS, install/run the script, then open:\n"
+            "<code>menu → 22 → 2 Connect This Server To Existing Bot</code>\n\n"
+            "Use this Controller URL:\n"
+            f"<code>{html.escape(url)}</code>\n\n"
+            "Use this Connect Token:\n"
+            f"<code>{html.escape(reg)}</code>\n\n"
+            "The bot never needs the VPS root password. The VPS agent connects outward to this controller.")
+
+def handle_login_text(chat_id,text):
+    k=str(chat_id); st=login_state.get(k,{})
+    if st.get('step')=='user':
+        st['username']=text.strip(); st['step']='pass'; login_state[k]=st
+        send(chat_id,'Password:')
+        return True
+    if st.get('step')=='pass':
+        user=st.get('username',''); pw=text.strip(); login_state.pop(k,None)
+        if verify_login(user,pw):
+            set_authed(chat_id,user)
+            send(chat_id,'✅ Login successful.')
+            render_servers(chat_id, True)
+        else:
+            send(chat_id,'❌ Wrong username or password.',login_keyboard())
+        return True
+    return False
+
+def handle_message(msg):
+    chat_id=(msg.get('chat') or {}).get('id')
+    text=msg.get('text','') or ''
+    if chat_id is None: return
+    if text.startswith('/start'):
+        if is_authed(chat_id): render_servers(chat_id, True)
+        else: welcome(chat_id)
+        return
+    if text.startswith('/logout'):
+        auth_sessions.pop(str(chat_id),None); selected_server.pop(str(chat_id),None); login_state.pop(str(chat_id),None)
+        send(chat_id,'Logged out.',login_keyboard()); return
+    if text.startswith('/login'):
+        login_state[str(chat_id)]={'step':'user'}; send(chat_id,'Username:'); return
+    if handle_login_text(chat_id,text): return
+    if not is_authed(chat_id): welcome(chat_id); return
+    sid=selected_server.get(str(chat_id))
+    if sid and get_server(sid) and server_online(get_server(sid)):
+        enqueue(sid,'write',text+'\r')
+        time.sleep(1.2)
+        render_server(chat_id,sid)
+    else:
+        render_servers(chat_id)
+
+def handle_callback(cb):
+    cid=cb.get('id'); msg=cb.get('message') or {}; chat_id=(msg.get('chat') or {}).get('id'); data=cb.get('data','')
+    if chat_id is None: return
+    if data=='login':
+        answer_callback(cid); login_state[str(chat_id)]={'step':'user'}; send(chat_id,'Username:'); return
+    if not is_authed(chat_id):
+        answer_callback(cid,'Login first'); welcome(chat_id); return
+    if data=='logout':
+        auth_sessions.pop(str(chat_id),None); selected_server.pop(str(chat_id),None); login_state.pop(str(chat_id),None)
+        answer_callback(cid,'Logged out'); send(chat_id,'Logged out.',login_keyboard()); return
+    if data=='servers': answer_callback(cid); render_servers(chat_id); return
+    if data=='add':
+        answer_callback(cid)
+        send(chat_id,add_server_text(),{'inline_keyboard':[[{'text':'⬅️ Servers','callback_data':'servers'}]]})
+        return
+    if data.startswith('srv:'):
+        sid=data.split(':',1)[1]; answer_callback(cid); render_server(chat_id,sid); return
+    if data.startswith('cmd:'):
+        _,sid,val=data.split(':',2); enqueue(sid,'write',val+'\r'); answer_callback(cid,val); time.sleep(1.1); render_server(chat_id,sid); return
+    if data.startswith('ctl:'):
+        _,sid,cmd=data.split(':',2)
+        if cmd=='enter': enqueue(sid,'write','\r')
+        elif cmd=='backspace': enqueue(sid,'write','\x7f')
+        elif cmd=='ctrlc': enqueue(sid,'write','\x03')
+        elif cmd=='new': enqueue(sid,'new','')
+        answer_callback(cid)
+        time.sleep(1.0); render_server(chat_id,sid); return
+
+def bot_loop():
+    offset=0
+    try:
+        me=api('getMe',{})
+        print('Telegram controller running as @%s'%((me.get('result') or {}).get('username') or 'bot'), flush=True)
+    except Exception as e:
+        print('Telegram getMe failed: %s'%e, flush=True)
+    while True:
+        try:
+            res=api('getUpdates',{'timeout':50,'offset':offset,'allowed_updates':json.dumps(['message','callback_query'])},retries=1)
+            for upd in res.get('result',[]):
+                offset=max(offset,int(upd.get('update_id',0))+1)
+                if 'message' in upd: handle_message(upd['message'])
+                elif 'callback_query' in upd: handle_callback(upd['callback_query'])
+        except Exception as e:
+            print('bot poll error: %s'%e, flush=True)
+            time.sleep(3)
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, code, obj):
+        raw=json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(raw)))
+        self.end_headers(); self.wfile.write(raw)
+    def _body(self):
+        try:
+            n=int(self.headers.get('Content-Length','0'))
+            return json.loads(self.rfile.read(n).decode('utf-8','replace') or '{}')
+        except Exception:
+            return {}
+    def log_message(self, fmt, *args):
+        return
+    def do_GET(self):
+        if self.path.startswith('/health'):
+            self._json(200,{'ok':True,'time':time.time()})
+        else:
+            self._json(404,{'ok':False})
+    def do_POST(self):
+        body=self._body()
+        if self.path.startswith('/agent/register'):
+            if body.get('register_token') != read_register_token():
+                self._json(403,{'ok':False,'error':'bad register token'}); return
+            sid=secrets.token_hex(8); tok=secrets.token_urlsafe(32)
+            name=(body.get('name') or 'server').strip()[:80]
+            host=(body.get('host') or self.client_address[0]).strip()[:120]
+            with db() as con:
+                con.execute('INSERT OR REPLACE INTO servers(id,name,host,token,last_seen,snapshot,created) VALUES(?,?,?,?,?,?,?)',(sid,name,host,tok,time.time(),'[connected - waiting for menu]',time.time()))
+                con.commit()
+            self._json(200,{'ok':True,'server_id':sid,'agent_token':tok}); return
+        if self.path.startswith('/agent/poll'):
+            sid=body.get('server_id',''); tok=body.get('agent_token','')
+            snap=(body.get('snapshot') or '')[-262144:]
+            with db() as con:
+                row=con.execute('SELECT * FROM servers WHERE id=? AND token=?',(sid,tok)).fetchone()
+                if not row:
+                    self._json(403,{'ok':False,'error':'bad agent token'}); return
+                con.execute('UPDATE servers SET last_seen=?, snapshot=?, host=COALESCE(NULLIF(?,""),host) WHERE id=?',(time.time(),snap,(body.get('host') or '')[:120],sid))
+                cmd=con.execute('SELECT * FROM commands WHERE server_id=? AND delivered=0 ORDER BY id LIMIT 1',(sid,)).fetchone()
+                if cmd:
+                    con.execute('UPDATE commands SET delivered=1 WHERE id=?',(cmd['id'],))
+                    con.commit()
+                    self._json(200,{'ok':True,'command':{'kind':cmd['kind'],'data':cmd['data']}}); return
+                con.commit()
+            self._json(200,{'ok':True,'command':None}); return
+        self._json(404,{'ok':False})
+
+def http_loop():
+    srv=ThreadingHTTPServer(('0.0.0.0',PORT), Handler)
+    print('Agent controller API listening on 0.0.0.0:%s'%PORT, flush=True)
+    srv.serve_forever()
+
+def main():
+    os.makedirs(BASE, exist_ok=True)
+    db().close()
+    threading.Thread(target=http_loop, daemon=True).start()
+    bot_loop()
+
+if __name__=='__main__':
+    main()
+PYCTRL
+  chmod 700 "$DIR/controller.py"
+}
+
+tgms_write_controller_service(){
+  cat > /etc/systemd/system/sultan-tg-multiserver-controller.service <<'EOF'
+[Unit]
+Description=SULTAN VIP Multi-Server Telegram Bot Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sultan-tg-multiserver
+ExecStart=/usr/bin/python3 /opt/sultan-tg-multiserver/controller.py
+Restart=always
+RestartSec=3
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  tgms_stop_legacy_single_bot
+  systemctl enable sultan-tg-multiserver-controller >/dev/null 2>&1 || true
+  systemctl restart sultan-tg-multiserver-controller
+}
+
+tgms_write_agent(){
+  local DIR="/opt/sultan-tg-agent"
+  mkdir -p "$DIR"
+  chmod 700 "$DIR"
+  cat > "$DIR/agent.py" <<'PYAGENT'
+#!/usr/bin/env python3
+import json
+import os
+import pty
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+BASE='/etc/sultan/tg-multi'
+CONFIG=os.path.join(BASE,'agent.json')
+MENU_CMD='/usr/local/bin/menu'
+MAX_OUTPUT=256*1024
+clear_re=re.compile(rb'\x1bc|\x1b\[2J|\x1b\[H\x1b\[J|\x1b\[H\x1b\[2J|\x1b\[3J|\x1b\[\?1049[hl]')
+
+class Terminal:
+    def __init__(self):
+        self.lock=threading.Lock(); self.buffer=bytearray(); self.dead=False; self.proc=None; self.master=None
+        self.start()
+    def start(self):
+        self.close()
+        self.dead=False; self.buffer=bytearray()
+        master,slave=pty.openpty(); self.master=master
+        env=os.environ.copy(); env['TERM']='xterm-256color'; env['LANG']=env.get('LANG','C.UTF-8'); env['SULTAN_TG_AGENT']='1'
+        self.proc=subprocess.Popen([MENU_CMD], stdin=slave, stdout=slave, stderr=slave, close_fds=True, start_new_session=True, env=env)
+        os.close(slave)
+        threading.Thread(target=self.reader,daemon=True).start()
+    def reader(self):
+        while not self.dead:
+            try:
+                r,_,_=select.select([self.master],[],[],0.5)
+                if not r:
+                    if self.proc and self.proc.poll() is not None:
+                        self.append(b'\r\n[menu exited - restarting]\r\n'); time.sleep(1); self.start(); return
+                    continue
+                data=os.read(self.master,8192)
+                if data: self.append(data)
+            except Exception as e:
+                self.append(('\r\n[agent terminal error: %s]\r\n'%e).encode()); self.dead=True; return
+    def append(self,data):
+        m=None
+        for m in clear_re.finditer(data): pass
+        with self.lock:
+            if m is not None:
+                self.buffer.clear(); data=data[m.end():]
+            self.buffer.extend(data)
+            if len(self.buffer)>MAX_OUTPUT: self.buffer=self.buffer[-MAX_OUTPUT:]
+    def text(self):
+        with self.lock: raw=bytes(self.buffer)
+        return raw.decode('utf-8','replace')
+    def write(self,data):
+        try: os.write(self.master,data.encode('utf-8','replace')); return True
+        except Exception: self.dead=True; return False
+    def close(self):
+        try:
+            if self.proc: os.killpg(self.proc.pid, signal.SIGTERM)
+        except Exception: pass
+        try:
+            if self.master is not None: os.close(self.master)
+        except Exception: pass
+
+def post(url,obj,timeout=35):
+    raw=json.dumps(obj).encode()
+    req=urllib.request.Request(url, data=raw, headers={'Content-Type':'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8','replace'))
+
+def normalize_url(u):
+    u=u.strip().rstrip('/')
+    if not u.startswith('http://') and not u.startswith('https://'):
+        u='http://'+u
+    return u
+
+def register(controller_url, reg_token, name):
+    controller_url=normalize_url(controller_url)
+    host=socket.gethostname()
+    res=post(controller_url+'/agent/register', {'register_token':reg_token,'name':name,'host':host})
+    if not res.get('ok'):
+        raise SystemExit('register failed: '+str(res))
+    os.makedirs(BASE, exist_ok=True)
+    cfg={'controller_url':controller_url,'server_id':res['server_id'],'agent_token':res['agent_token'],'name':name,'host':host}
+    open(CONFIG,'w').write(json.dumps(cfg,indent=2)+'\n')
+    os.chmod(CONFIG,0o600)
+    print('CONNECTED')
+    print('Server ID:',res['server_id'])
+
+def load_config():
+    return json.load(open(CONFIG))
+
+def run_agent():
+    cfg=load_config(); term=Terminal(); fails=0
+    while True:
+        try:
+            body={'server_id':cfg['server_id'],'agent_token':cfg['agent_token'],'name':cfg.get('name','server'),'host':socket.gethostname(),'snapshot':term.text()}
+            res=post(cfg['controller_url'].rstrip('/')+'/agent/poll', body, timeout=35)
+            cmd=res.get('command')
+            if cmd:
+                kind=cmd.get('kind'); data=cmd.get('data') or ''
+                if kind=='write': term.write(data)
+                elif kind=='new': term.start()
+            fails=0; time.sleep(0.8)
+        except Exception as e:
+            fails+=1
+            time.sleep(min(10, 2+fails))
+
+if __name__=='__main__':
+    if len(sys.argv)>=2 and sys.argv[1]=='--register':
+        if len(sys.argv)<5:
+            raise SystemExit('usage: agent.py --register CONTROLLER_URL REGISTER_TOKEN SERVER_NAME')
+        register(sys.argv[2], sys.argv[3], sys.argv[4])
+    else:
+        run_agent()
+PYAGENT
+  chmod 700 "$DIR/agent.py"
+}
+
+tgms_write_agent_service(){
+  cat > /etc/systemd/system/sultan-tg-agent.service <<'EOF'
+[Unit]
+Description=SULTAN VIP Telegram Multi-Server Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sultan-tg-agent
+ExecStart=/usr/bin/python3 /opt/sultan-tg-agent/agent.py
+Restart=always
+RestartSec=3
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable sultan-tg-agent >/dev/null 2>&1 || true
+  systemctl restart sultan-tg-agent
+}
+
+
+tgms_stop_legacy_single_bot(){
+  # Option 22 uses the same BotFather token with the multi-server controller.
+  # The old single-server Telegram bot must be stopped, otherwise Telegram updates
+  # are consumed by the old service and the bot looks unchanged.
+  systemctl disable --now sultan-telegram-terminal-bot >/dev/null 2>&1 || true
+  systemctl stop sultan-telegram-terminal-bot >/dev/null 2>&1 || true
+}
+
+tgms_clear_bot_webhook(){
+  local T
+  T="$(cat /etc/sultan/tg-multi/bot.token 2>/dev/null || true)"
+  [ -n "$T" ] || return 0
+  curl -fsS "https://api.telegram.org/bot${T}/deleteWebhook?drop_pending_updates=false" >/dev/null 2>&1 || true
+}
+
+tgms_install_controller(){
+  refresh_screen
+  box "MULTI-SERVER TELEGRAM BOT" "Install the always-on Telegram controller. Managed servers connect to it as agents."
+  local PORT DEFURL
+  tgms_token_create || { pause; return 1; }
+  tgms_stop_legacy_single_bot
+  tgms_clear_bot_webhook
+  tgms_auth_create || { pause; return 1; }
+  tgms_read_line "Controller API Port" PORT "2097"
+  mkdir -p /etc/sultan/tg-multi
+  printf '%s\n' "$PORT" > /etc/sultan/tg-multi/controller.port
+  chmod 600 /etc/sultan/tg-multi/controller.port
+  tgms_make_register_token
+  tgms_write_controller || { echo "Failed to write controller."; pause; return 1; }
+  tgms_write_controller_service || { echo "Failed to start controller."; pause; return 1; }
+  ufw allow "$PORT"/tcp >/dev/null 2>&1 || true
+  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || true
+  DEFURL="$(tgms_default_controller_url)"
+  echo "==========================================="
+  echo "MULTI-SERVER TELEGRAM CONTROLLER INSTALLED"
+  echo "Bot service    : $(systemctl is-active sultan-tg-multiserver-controller 2>/dev/null || echo inactive)"
+  echo "Controller URL : $DEFURL"
+  echo "Connect Token  : $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
+  echo "==========================================="
+  echo "Use the same bot token for all servers."
+  echo "Old single-server Telegram bot service has been stopped to avoid token conflict."
+  echo "Open Telegram and send /start after install."
+  echo "On every VPS: menu -> 22 -> 2, then paste Controller URL and Connect Token."
+  systemctl --no-pager --full status sultan-tg-multiserver-controller 2>/dev/null | sed -n '1,10p' || true
+  pause
+}
+
+tgms_connect_agent(){
+  refresh_screen
+  box "CONNECT THIS SERVER" "Connect this VPS to the always-on Telegram bot controller. No VPS password is sent to Telegram."
+  local URL REG NAME
+  tgms_read_line "Controller URL" URL "$(tgms_default_controller_url)"
+  tgms_read_line "Connect Token" REG
+  tgms_read_line "Server Name" NAME "$(hostname)"
+  tgms_write_agent || { echo "Failed to write agent."; pause; return 1; }
+  if ! python3 /opt/sultan-tg-agent/agent.py --register "$URL" "$REG" "$NAME"; then
+    echo "Failed to register this server. Check Controller URL, token, port/firewall."
+    pause
+    return 1
+  fi
+  tgms_write_agent_service || { echo "Failed to start agent."; pause; return 1; }
+  echo "==========================================="
+  echo "THIS SERVER CONNECTED TO TELEGRAM BOT"
+  echo "Agent service: $(systemctl is-active sultan-tg-agent 2>/dev/null || echo inactive)"
+  echo "Controller   : $URL"
+  echo "Server Name  : $NAME"
+  echo "==========================================="
+  systemctl --no-pager --full status sultan-tg-agent 2>/dev/null | sed -n '1,10p' || true
+  pause
+}
+
+tgms_show_connect_info(){
+  refresh_screen
+  box "CONNECT INFO" "Use this on every new VPS to attach it to the same Telegram bot."
+  tgms_make_register_token
+  echo "Controller URL : $(tgms_default_controller_url)"
+  echo "Connect Token  : $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
+  echo ""
+  echo "On the new server run this script, then:"
+  echo "menu -> 22 -> 2 Connect This Server To Existing Bot"
+  echo ""
+  echo "If a managed server stops, the bot stays online as long as this controller server stays online."
+  pause
+}
+
+tgms_reset_register_token(){
+  refresh_screen
+  box "RESET CONNECT TOKEN" "Generate a new token for adding future servers. Existing servers stay connected."
+  mkdir -p /etc/sultan/tg-multi
+  python3 - <<'PYRESETREG'
+import secrets, os
+open('/etc/sultan/tg-multi/register.token','w').write(secrets.token_urlsafe(32)+'\n')
+os.chmod('/etc/sultan/tg-multi/register.token',0o600)
+PYRESETREG
+  echo "New Connect Token: $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
+  systemctl restart sultan-tg-multiserver-controller 2>/dev/null || true
+  pause
+}
+
+tgms_status(){
+  refresh_screen
+  box "MULTI-SERVER TELEGRAM STATUS" "Controller can stay online while managed VPS agents go offline."
+  echo "Controller service : $(systemctl is-active sultan-tg-multiserver-controller 2>/dev/null || echo inactive)"
+  echo "Legacy bot service : $(systemctl is-active sultan-telegram-terminal-bot 2>/dev/null || echo inactive)"
+  echo "Agent service      : $(systemctl is-active sultan-tg-agent 2>/dev/null || echo inactive)"
+  echo "Controller URL     : $(tgms_default_controller_url)"
+  if [ -f /etc/sultan/tg-multi/register.token ]; then
+    echo "Connect Token      : $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
+  fi
+  if [ -f /etc/sultan/tg-multi/agent.json ]; then
+    echo "Agent Config       : /etc/sultan/tg-multi/agent.json"
+  fi
+  echo ""
+  echo "Controller last logs:"
+  journalctl -u sultan-tg-multiserver-controller -n 8 --no-pager 2>/dev/null || true
+  echo ""
+  echo "Agent last logs:"
+  journalctl -u sultan-tg-agent -n 8 --no-pager 2>/dev/null || true
+  pause
+}
+
+telegram_terminal_bot_menu(){
+  while true; do
+    refresh_screen
+    echo "==========================================="
+    echo "        TELEGRAM MULTI-SERVER BOT"
+    echo "==========================================="
+    echo "[1] Install / Repair Bot Controller"
+    echo "[2] Connect This Server To Existing Bot"
+    echo "[3] Show Controller URL / Connect Token"
+    echo "[4] Reset Bot Admin Login"
+    echo "[5] Reset BotFather Token"
+    echo "[6] Restart Bot Controller"
+    echo "[7] Restart This Server Agent"
+    echo "[8] Reset Connect Token"
+    echo "[9] Status / Logs"
+    echo "[0] Back"
+    echo "==========================================="
+    echo "Controller = the VPS where the bot stays online."
+    echo "Agent      = every VPS managed by the same bot token."
+    echo "==========================================="
+    read -p "Select: " TGMS
+    case "$TGMS" in
+      1) tgms_install_controller ;;
+      2) tgms_connect_agent ;;
+      3) tgms_show_connect_info ;;
+      4) tgms_auth_create; systemctl restart sultan-tg-multiserver-controller 2>/dev/null || true; pause ;;
+      5) tgms_token_create; tgms_stop_legacy_single_bot; tgms_clear_bot_webhook; tgms_write_controller; tgms_write_controller_service; pause ;;
+      6) tgms_stop_legacy_single_bot; tgms_clear_bot_webhook; tgms_write_controller; tgms_write_controller_service; tgms_status ;;
+      7) tgms_write_agent; tgms_write_agent_service; tgms_status ;;
+      8) tgms_reset_register_token ;;
+      9) tgms_status ;;
+      0) return ;;
+      *) echo "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
 main_menu(){
 while true; do
   refresh_screen
@@ -4424,7 +6038,7 @@ while true; do
   echo -e " ${CYAN}[8]${NC} UPDATE SCRIPT         ${CYAN}[18]${NC} XRAY MENU"
   echo -e " ${CYAN}[9]${NC} BACKUP RESTORE        ${CYAN}[19]${NC} FAIL2BAN MENU"
   echo -e " ${CYAN}[10]${NC} SETTING               ${CYAN}[20]${NC} BBR MENU"
-  echo -e " ${CYAN}[21]${NC} WEB PANEL"
+  echo -e " ${CYAN}[21]${NC} WEB PANEL             ${CYAN}[22]${NC} TELEGRAM BOT"
   echo ""
   echo -e " ${RED}[99]${NC} REMOVE SCRIPT"
   echo -e " ${YELLOW}[X]${NC} EXIT"
@@ -4452,6 +6066,7 @@ while true; do
     19) fail2ban_menu ;;
     20) bbr_menu ;;
     21) web_panel_menu ;;
+    22) telegram_terminal_bot_menu ;;
     99) remove_script ;;
     x|X) exit ;;
   esac
