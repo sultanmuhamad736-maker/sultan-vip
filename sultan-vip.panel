@@ -5177,6 +5177,97 @@ tgms_default_controller_url(){
   fi
 }
 
+
+tgms_public_host(){
+  local DOM IP RESOLVED
+  DOM="$(cat /etc/sultan/domain 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  IP="$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  if [ -n "$DOM" ] && [ -n "$IP" ]; then
+    RESOLVED="$(getent ahostsv4 "$DOM" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [ "$RESOLVED" = "$IP" ]; then
+      echo "$DOM"
+      return
+    fi
+  fi
+  echo "$IP"
+}
+
+tgms_make_webhook_assets(){
+  local BASE="/etc/sultan/tg-multi" HOST SAN CONF
+  mkdir -p "$BASE/tls"
+  chmod 700 "$BASE" "$BASE/tls"
+  if [ ! -s "$BASE/webhook.secret" ]; then
+    python3 - <<'PYWHSEC'
+import os, secrets
+base='/etc/sultan/tg-multi'
+os.makedirs(base, exist_ok=True)
+open(base+'/webhook.secret','w').write(secrets.token_urlsafe(36)+'\n')
+os.chmod(base+'/webhook.secret',0o600)
+PYWHSEC
+  fi
+  HOST="$(tgms_public_host)"
+  [ -n "$HOST" ] || { echo "Unable to detect public IP/domain for Telegram webhook."; return 1; }
+  if [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then SAN="IP:$HOST"; else SAN="DNS:$HOST"; fi
+  CONF="$(mktemp)"
+  cat > "$CONF" <<EOF
+[req]
+prompt = no
+distinguished_name = dn
+x509_extensions = v3_req
+[dn]
+CN = $HOST
+[v3_req]
+subjectAltName = $SAN
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+EOF
+  if ! openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3650 \
+      -keyout "$BASE/tls/webhook.key" -out "$BASE/tls/webhook.crt" \
+      -config "$CONF" >/dev/null 2>&1; then
+    rm -f "$CONF"
+    echo "Failed to generate Telegram webhook certificate."
+    return 1
+  fi
+  rm -f "$CONF"
+  chmod 600 "$BASE/tls/webhook.key" "$BASE/tls/webhook.crt"
+}
+
+tgms_write_controller_urls(){
+  local BASE="/etc/sultan/tg-multi" HOST API_PORT WH_PORT SECRET
+  mkdir -p "$BASE"
+  HOST="$(tgms_public_host)"
+  API_PORT="$(cat "$BASE/controller.port" 2>/dev/null || echo 2097)"
+  WH_PORT="$(cat "$BASE/webhook.port" 2>/dev/null || echo 88)"
+  SECRET="$(cat "$BASE/webhook.secret" 2>/dev/null)"
+  [ -n "$HOST" ] && printf 'http://%s:%s\n' "$HOST" "$API_PORT" > "$BASE/controller.url"
+  [ -n "$HOST" ] && [ -n "$SECRET" ] && printf 'https://%s:%s/tg/%s\n' "$HOST" "$WH_PORT" "$SECRET" > "$BASE/webhook.url"
+  chmod 600 "$BASE/controller.url" "$BASE/webhook.url" 2>/dev/null || true
+}
+
+tgms_set_webhook(){
+  local BASE="/etc/sultan/tg-multi" T URL SECRET CERT RES
+  T="$(cat "$BASE/bot.token" 2>/dev/null || true)"
+  URL="$(cat "$BASE/webhook.url" 2>/dev/null || true)"
+  SECRET="$(cat "$BASE/webhook.secret" 2>/dev/null || true)"
+  CERT="$BASE/tls/webhook.crt"
+  [ -n "$T" ] && [ -n "$URL" ] && [ -n "$SECRET" ] && [ -s "$CERT" ] || { echo "Telegram webhook files are incomplete."; return 1; }
+  RES="$(curl -sS --max-time 30 -X POST "https://api.telegram.org/bot${T}/setWebhook" \
+      -F "url=${URL}" -F "certificate=@${CERT}" -F "secret_token=${SECRET}" \
+      -F 'allowed_updates=["message","callback_query"]' -F 'drop_pending_updates=false' 2>&1)" || {
+    echo "Failed to contact Telegram Bot API: $RES"; return 1;
+  }
+  TGMS_WEBHOOK_RESPONSE="$RES" python3 - <<'PYWHCHK'
+import json, os
+raw=os.environ.get('TGMS_WEBHOOK_RESPONSE','')
+try: obj=json.loads(raw)
+except Exception:
+    print('Invalid Telegram response:',raw); raise SystemExit(1)
+if not obj.get('ok'):
+    print('Telegram rejected webhook:',obj.get('description') or raw); raise SystemExit(1)
+print('Telegram webhook activated. This VPS is now the primary bot controller.')
+PYWHCHK
+}
+
 tgms_auth_create(){
   local AUTH_DIR="/etc/sultan/tg-multi" USER PASS PASS2
   mkdir -p "$AUTH_DIR"
@@ -5262,6 +5353,7 @@ import os
 import re
 import secrets
 import sqlite3
+import ssl
 import threading
 import time
 import urllib.parse
@@ -5274,7 +5366,15 @@ TOKEN_FILE=os.path.join(BASE,'bot.token')
 AUTH_FILE=os.path.join(BASE,'controller.auth')
 REGISTER_FILE=os.path.join(BASE,'register.token')
 PORT_FILE=os.path.join(BASE,'controller.port')
+PUBLIC_URL_FILE=os.path.join(BASE,'controller.url')
+WEBHOOK_URL_FILE=os.path.join(BASE,'webhook.url')
+WEBHOOK_SECRET_FILE=os.path.join(BASE,'webhook.secret')
+WEBHOOK_PORT_FILE=os.path.join(BASE,'webhook.port')
+TLS_CERT=os.path.join(BASE,'tls','webhook.crt')
+TLS_KEY=os.path.join(BASE,'tls','webhook.key')
 PORT=int(open(PORT_FILE).read().strip() if os.path.exists(PORT_FILE) else '2097')
+WEBHOOK_PORT=int(open(WEBHOOK_PORT_FILE).read().strip() if os.path.exists(WEBHOOK_PORT_FILE) else '88')
+WEBHOOK_SECRET=open(WEBHOOK_SECRET_FILE).read().strip() if os.path.exists(WEBHOOK_SECRET_FILE) else ''
 MENU_MAX=3600
 SESSION_TTL=12*60*60
 OFFLINE_AFTER=45
@@ -5522,17 +5622,27 @@ def login_keyboard():
 def welcome(chat_id):
     send(chat_id,'<b>SULTAN VIP MULTI-SERVER BOT</b>\nLogin with the username/password created from terminal.',login_keyboard())
 
+def read_text_file(path, default=''):
+    try:
+        return open(path).read().strip() or default
+    except Exception:
+        return default
+
 def add_server_text():
     reg=read_register_token()
-    url=f'http://YOUR-CONTROLLER-IP:{PORT}'
-    return ("<b>➕ Add Server</b>\n\n"
-            "On the new VPS, install/run the script, then open:\n"
+    url=read_text_file(PUBLIC_URL_FILE, f'http://SERVER-IP:{PORT}')
+    return ("<b>➕ ADD A NEW SERVER</b>\n\n"
+            "<b>1)</b> Install/run the same script on the new VPS.\n"
+            "<b>2)</b> Open:\n"
             "<code>menu → 22 → 2 Connect This Server To Existing Bot</code>\n\n"
-            "Use this Controller URL:\n"
+            "<b>3) Controller URL — tap to copy:</b>\n"
             f"<code>{html.escape(url)}</code>\n\n"
-            "Use this Connect Token:\n"
+            "<b>4) Connect Token — tap to copy:</b>\n"
             f"<code>{html.escape(reg)}</code>\n\n"
-            "The bot never needs the VPS root password. The VPS agent connects outward to this controller.")
+            "<b>5)</b> Enter any Server Name, then finish.\n\n"
+            "✅ No VPS root password is sent to Telegram.\n"
+            "✅ The new server appears automatically after its agent connects.\n\n"
+            "<i>Controller takeover:</i> Installing 22 → 1 on another VPS with the same BotFather token makes the newest VPS the primary bot controller.")
 
 def handle_login_text(chat_id,text):
     k=str(chat_id); st=login_state.get(k,{})
@@ -5602,23 +5712,14 @@ def handle_callback(cb):
         answer_callback(cid)
         time.sleep(1.0); render_server(chat_id,sid); return
 
-def bot_loop():
-    offset=0
+def dispatch_update(upd):
     try:
-        me=api('getMe',{})
-        print('Telegram controller running as @%s'%((me.get('result') or {}).get('username') or 'bot'), flush=True)
+        if 'message' in upd:
+            handle_message(upd['message'])
+        elif 'callback_query' in upd:
+            handle_callback(upd['callback_query'])
     except Exception as e:
-        print('Telegram getMe failed: %s'%e, flush=True)
-    while True:
-        try:
-            res=api('getUpdates',{'timeout':50,'offset':offset,'allowed_updates':json.dumps(['message','callback_query'])},retries=1)
-            for upd in res.get('result',[]):
-                offset=max(offset,int(upd.get('update_id',0))+1)
-                if 'message' in upd: handle_message(upd['message'])
-                elif 'callback_query' in upd: handle_callback(upd['callback_query'])
-        except Exception as e:
-            print('bot poll error: %s'%e, flush=True)
-            time.sleep(3)
+        print('update handler error: %s'%e, flush=True)
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
@@ -5669,19 +5770,62 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200,{'ok':True,'command':None}); return
         self._json(404,{'ok':False})
 
+class WebhookHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+    def _reply(self, code=200):
+        raw=b'{"ok":true}'
+        self.send_response(code)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+    def do_GET(self):
+        self._reply(200 if self.path == '/health' else 404)
+    def do_POST(self):
+        expected='/tg/'+WEBHOOK_SECRET
+        supplied=self.headers.get('X-Telegram-Bot-Api-Secret-Token','')
+        if not WEBHOOK_SECRET or self.path != expected or not hmac.compare_digest(supplied,WEBHOOK_SECRET):
+            self._reply(403)
+            return
+        try:
+            n=int(self.headers.get('Content-Length','0'))
+            upd=json.loads(self.rfile.read(n).decode('utf-8','replace') or '{}')
+        except Exception:
+            self._reply(400)
+            return
+        self._reply(200)
+        threading.Thread(target=dispatch_update,args=(upd,),daemon=True).start()
+
 def http_loop():
     srv=ThreadingHTTPServer(('0.0.0.0',PORT), Handler)
     print('Agent controller API listening on 0.0.0.0:%s'%PORT, flush=True)
+    srv.serve_forever()
+
+def webhook_loop():
+    if not WEBHOOK_SECRET or not os.path.exists(TLS_CERT) or not os.path.exists(TLS_KEY):
+        raise SystemExit('Telegram webhook TLS/secret files are missing')
+    srv=ThreadingHTTPServer(('0.0.0.0',WEBHOOK_PORT), WebhookHandler)
+    ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(TLS_CERT,TLS_KEY)
+    srv.socket=ctx.wrap_socket(srv.socket,server_side=True)
+    print('Telegram webhook listening on 0.0.0.0:%s'%WEBHOOK_PORT, flush=True)
+    try:
+        me=api('getMe',{})
+        print('Primary Telegram controller running as @%s'%((me.get('result') or {}).get('username') or 'bot'), flush=True)
+    except Exception as e:
+        print('Telegram getMe failed: %s'%e, flush=True)
     srv.serve_forever()
 
 def main():
     os.makedirs(BASE, exist_ok=True)
     db().close()
     threading.Thread(target=http_loop, daemon=True).start()
-    bot_loop()
+    webhook_loop()
 
 if __name__=='__main__':
     main()
+
 PYCTRL
   chmod 700 "$DIR/controller.py"
 }
@@ -5880,32 +6024,52 @@ tgms_clear_bot_webhook(){
 
 tgms_install_controller(){
   refresh_screen
-  box "MULTI-SERVER TELEGRAM BOT" "Install the always-on Telegram controller. Managed servers connect to it as agents."
-  local PORT DEFURL
+  box "MULTI-SERVER TELEGRAM BOT" "Install or take over the bot controller. The newest VPS using the same BotFather token becomes primary automatically."
+  local PORT WHPORT DEFURL WHURL
   tgms_token_create || { pause; return 1; }
   tgms_stop_legacy_single_bot
-  tgms_clear_bot_webhook
   tgms_auth_create || { pause; return 1; }
   tgms_read_line "Controller API Port" PORT "2097"
+  tgms_read_line "Telegram Webhook HTTPS Port (88 or 8443)" WHPORT "88"
+  case "$WHPORT" in 88|8443) ;; *) echo "Telegram supports webhook ports 88 or 8443 here."; pause; return 1 ;; esac
+
   mkdir -p /etc/sultan/tg-multi
   printf '%s\n' "$PORT" > /etc/sultan/tg-multi/controller.port
-  chmod 600 /etc/sultan/tg-multi/controller.port
+  printf '%s\n' "$WHPORT" > /etc/sultan/tg-multi/webhook.port
+  chmod 600 /etc/sultan/tg-multi/controller.port /etc/sultan/tg-multi/webhook.port
   tgms_make_register_token
+  tgms_make_webhook_assets || { pause; return 1; }
+  tgms_write_controller_urls
   tgms_write_controller || { echo "Failed to write controller."; pause; return 1; }
   tgms_write_controller_service || { echo "Failed to start controller."; pause; return 1; }
+
   ufw allow "$PORT"/tcp >/dev/null 2>&1 || true
-  iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || true
-  DEFURL="$(tgms_default_controller_url)"
+  ufw allow "$WHPORT"/tcp >/dev/null 2>&1 || true
+  iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || true
+  iptables -C INPUT -p tcp --dport "$WHPORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$WHPORT" -j ACCEPT >/dev/null 2>&1 || true
+
+  sleep 2
+  if ! tgms_set_webhook; then
+    echo "Failed to activate Telegram webhook. Check public IP, firewall, and port $WHPORT."
+    systemctl --no-pager --full status sultan-tg-multiserver-controller 2>/dev/null | sed -n '1,14p' || true
+    pause
+    return 1
+  fi
+
+  DEFURL="$(cat /etc/sultan/tg-multi/controller.url 2>/dev/null || tgms_default_controller_url)"
+  WHURL="$(cat /etc/sultan/tg-multi/webhook.url 2>/dev/null)"
   echo "==========================================="
   echo "MULTI-SERVER TELEGRAM CONTROLLER INSTALLED"
-  echo "Bot service    : $(systemctl is-active sultan-tg-multiserver-controller 2>/dev/null || echo inactive)"
-  echo "Controller URL : $DEFURL"
-  echo "Connect Token  : $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
+  echo "Bot service     : $(systemctl is-active sultan-tg-multiserver-controller 2>/dev/null || echo inactive)"
+  echo "Controller URL  : $DEFURL"
+  echo "Connect Token   : $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
+  echo "Telegram Webhook: $WHURL"
   echo "==========================================="
-  echo "Use the same bot token for all servers."
-  echo "Old single-server Telegram bot service has been stopped to avoid token conflict."
-  echo "Open Telegram and send /start after install."
-  echo "On every VPS: menu -> 22 -> 2, then paste Controller URL and Connect Token."
+  echo "This VPS is now the PRIMARY controller for this BotFather token."
+  echo "Installing option 22 -> 1 on another VPS with the same token transfers the bot to that VPS."
+  echo "The previous controller stops receiving Telegram updates automatically."
+  echo "Open Telegram and send /start."
+  echo "Press Add Server in the bot to copy the ready Controller URL and Connect Token."
   systemctl --no-pager --full status sultan-tg-multiserver-controller 2>/dev/null | sed -n '1,10p' || true
   pause
 }
@@ -5938,7 +6102,8 @@ tgms_show_connect_info(){
   refresh_screen
   box "CONNECT INFO" "Use this on every new VPS to attach it to the same Telegram bot."
   tgms_make_register_token
-  echo "Controller URL : $(tgms_default_controller_url)"
+  tgms_write_controller_urls
+  echo "Controller URL : $(cat /etc/sultan/tg-multi/controller.url 2>/dev/null || tgms_default_controller_url)"
   echo "Connect Token  : $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
   echo ""
   echo "On the new server run this script, then:"
@@ -5968,7 +6133,9 @@ tgms_status(){
   echo "Controller service : $(systemctl is-active sultan-tg-multiserver-controller 2>/dev/null || echo inactive)"
   echo "Legacy bot service : $(systemctl is-active sultan-telegram-terminal-bot 2>/dev/null || echo inactive)"
   echo "Agent service      : $(systemctl is-active sultan-tg-agent 2>/dev/null || echo inactive)"
-  echo "Controller URL     : $(tgms_default_controller_url)"
+  tgms_write_controller_urls
+  echo "Controller URL     : $(cat /etc/sultan/tg-multi/controller.url 2>/dev/null || tgms_default_controller_url)"
+  echo "Webhook URL        : $(cat /etc/sultan/tg-multi/webhook.url 2>/dev/null || echo not-configured)"
   if [ -f /etc/sultan/tg-multi/register.token ]; then
     echo "Connect Token      : $(cat /etc/sultan/tg-multi/register.token 2>/dev/null)"
   fi
@@ -5990,7 +6157,7 @@ telegram_terminal_bot_menu(){
     echo "==========================================="
     echo "        TELEGRAM MULTI-SERVER BOT"
     echo "==========================================="
-    echo "[1] Install / Repair Bot Controller"
+    echo "[1] Install / Take Over Bot Controller"
     echo "[2] Connect This Server To Existing Bot"
     echo "[3] Show Controller URL / Connect Token"
     echo "[4] Reset Bot Admin Login"
@@ -6002,7 +6169,7 @@ telegram_terminal_bot_menu(){
     echo "[10] How To Get BotFather Token"
     echo "[0] Back"
     echo "==========================================="
-    echo "Controller = the VPS where the bot stays online."
+    echo "Controller = newest VPS installed with the same token becomes primary."
     echo "Agent      = every VPS managed by the same bot token."
     echo "==========================================="
     read -p "Select: " TGMS
@@ -6011,8 +6178,8 @@ telegram_terminal_bot_menu(){
       2) tgms_connect_agent ;;
       3) tgms_show_connect_info ;;
       4) tgms_auth_create; systemctl restart sultan-tg-multiserver-controller 2>/dev/null || true; pause ;;
-      5) tgms_token_create; tgms_stop_legacy_single_bot; tgms_clear_bot_webhook; tgms_write_controller; tgms_write_controller_service; pause ;;
-      6) tgms_stop_legacy_single_bot; tgms_clear_bot_webhook; tgms_write_controller; tgms_write_controller_service; tgms_status ;;
+      5) tgms_token_create; tgms_stop_legacy_single_bot; tgms_make_webhook_assets; tgms_write_controller_urls; tgms_write_controller; tgms_write_controller_service; sleep 2; tgms_set_webhook; pause ;;
+      6) tgms_stop_legacy_single_bot; tgms_make_webhook_assets; tgms_write_controller_urls; tgms_write_controller; tgms_write_controller_service; sleep 2; tgms_set_webhook; tgms_status ;;
       7) tgms_write_agent; tgms_write_agent_service; tgms_status ;;
       8) tgms_reset_register_token ;;
       9) tgms_status ;;
