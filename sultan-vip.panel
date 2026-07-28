@@ -341,12 +341,21 @@ handle_existing_xray_users_before_ready(){
   echo "n = preserve/restore users with the same UUID/password"
 
   while true; do
+    READ_FAILED=0
     if [ -r /dev/tty ] && [ -w /dev/tty ]; then
       printf 'Delete existing V2Ray users? (y/n): ' > /dev/tty
-      IFS= read -r ANSWER < /dev/tty || ANSWER=""
-    else
+      IFS= read -r ANSWER < /dev/tty || READ_FAILED=1
+    elif [ -t 0 ]; then
       printf 'Delete existing V2Ray users? (y/n): '
-      IFS= read -r ANSWER || ANSWER=""
+      IFS= read -r ANSWER || READ_FAILED=1
+    else
+      READ_FAILED=1
+    fi
+
+    if [ "$READ_FAILED" -eq 1 ]; then
+      ANSWER="n"
+      echo "n"
+      echo "No interactive input detected; preserving existing V2Ray users."
     fi
 
     case "$ANSWER" in
@@ -3863,7 +3872,9 @@ button:active { transform:scale(.98); }
 <div class="wrap">
   <main class="panelbox">
     <div class="sectiontitle">Live Terminal <span>/usr/local/bin/menu</span></div>
-    <div id="term" class="terminal"><pre id="termText" class="termtext"></pre><div id="touchChoices" class="touchChoices"><div class="empty">Waiting for the real script menu...</div></div></div>
+    <div id="term" class="terminal"><pre id="termText" class="termtext"></pre></div>
+    <div class="sectiontitle" style="margin-top:14px">Current Touch Buttons <span>From Script</span></div>
+    <div id="touchChoices" class="touchChoices"><div class="empty">Waiting for the real script menu...</div></div>
     <div class="controls">
       <div id="promptHint" class="promptHint"></div>
       <div id="inputrow" class="inputrow"><input id="cmd" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Input"><button onclick="sendText()">Send</button></div>
@@ -3872,9 +3883,6 @@ button:active { transform:scale(.98); }
     </div>
   </main>
   <aside class="panelbox">
-    <div class="sectiontitle">Current Touch Buttons <span>From Script</span></div>
-    <div class="shortcuts" id="sideChoices"><div class="empty">Waiting for menu options...</div></div>
-    <div style="height:12px"></div>
     <div class="sectiontitle">Number Pad <span>Manual Select</span></div>
     <div class="grid" id="keys"></div>
     <div style="height:12px"></div>
@@ -3896,7 +3904,6 @@ let fullText = '';
 const term = document.getElementById('term');
 const termText = document.getElementById('termText');
 const touchChoices = document.getElementById('touchChoices');
-const sideChoices = document.getElementById('sideChoices');
 const cmd = document.getElementById('cmd');
 const conn = document.getElementById('conn');
 const inputrow = document.getElementById('inputrow');
@@ -3911,8 +3918,7 @@ function append(s) {
   if(!out) return updateTouch();
   fullText += out;
   if(fullText.length > 140000) fullText = fullText.slice(-110000);
-  termText.textContent += out;
-  if(termText.textContent.length > 140000) termText.textContent = termText.textContent.slice(-110000);
+  termText.textContent = panelDisplayText();
   updateTouch();
   term.scrollTop = term.scrollHeight;
 }
@@ -3955,6 +3961,35 @@ function lastPrompt() {
   }
   if(/press enter/i.test(joined)) return 'Press Enter';
   return '';
+}
+function isMenuOptionLine(raw) {
+  const s = cleanLabel(String(raw || ''));
+  return /^(?:\[\s*(?:[0-9]{1,3}|[xXqQ])\s*\]|\(\s*(?:[0-9]{1,3}|[xXqQ])\s*\))/.test(s);
+}
+function isSeparatorLine(raw) {
+  const s = String(raw || '').trim();
+  return !!s && !/[A-Za-z0-9\u0600-\u06ff]/.test(s);
+}
+function panelDisplayText() {
+  const lines = visibleTail().split('\n').map(x=>x.trim()).filter(Boolean);
+  if(!lines.length) return '';
+  const prompt = lastPrompt();
+  const last = lines[lines.length - 1] || '';
+  const joined = lines.slice(-4).join(' ');
+  const textPrompt = /(username|user name|password|confirm password|days|expire|expiration|limit|quota|traffic|domain|uuid|token|chat id|chatid|email|host|port|path|sni|server name|name|ip address|new |old |enter |input|please enter|type |اكتب)/i;
+  const menuPrompt = /(^|\s)(?:👉\s*)?(?:select|choice|option|اختر|اختار)\s*[:?؟.]?\s*$/i;
+  const yesNo = /(\(\s*y\s*\/\s*n\s*\)|\[\s*y\s*\/\s*n\s*\]|yes\s*\/\s*no|are you sure)/i;
+
+  if(prompt && textPrompt.test(prompt) && !menuPrompt.test(prompt) && !yesNo.test(joined)) {
+    return prompt;
+  }
+  const hasMenu = menuPrompt.test(last) || lines.slice(-80).some(isMenuOptionLine);
+  if(hasMenu) {
+    const kept = lines.filter(line => !isMenuOptionLine(line) && !isSeparatorLine(line) && !menuPrompt.test(line));
+    return kept.slice(-18).join('\n') || 'Choose an option below';
+  }
+  const useful = lines.filter(line => !isMenuOptionLine(line) && !isSeparatorLine(line));
+  return useful.slice(-24).join('\n');
 }
 function classifyButton(value, label) {
   const t = (label || '').toLowerCase();
@@ -4028,8 +4063,10 @@ function renderButtons(target, choices, compact) {
 }
 function updatePrompt(prompt, hasButtons) {
   const p = prompt || '';
-  const needsText = /(enter|input|type|username|user name|password|confirm password|domain|uuid|limit|traffic|expire|days|port|path|email|name|select|choice|option|اكتب|اختر|اختار)/i.test(p) && !(/\(\s*y\s*\/\s*n\s*\)|y\/n|yes\/no/i.test(p));
-  if(needsText || (!hasButtons && p)) {
+  const isYesNo = /(\(\s*y\s*\/\s*n\s*\)|y\/n|yes\/no|are you sure)/i.test(p);
+  const isMenu = /(^|\s)(?:👉\s*)?(?:select|choice|option|اختر|اختار)\s*[:?؟.]?\s*$/i.test(p);
+  const needsText = /(enter|input|type|username|user name|password|confirm password|domain|uuid|limit|traffic|expire|days|port|path|email|name|اكتب)/i.test(p) && !isYesNo && !isMenu;
+  if(needsText || (!hasButtons && p && !isMenu && !isYesNo)) {
     inputrow.classList.add('show');
     promptHint.classList.add('show');
     promptHint.textContent = p;
@@ -4044,7 +4081,7 @@ function updatePrompt(prompt, hasButtons) {
 function updateTouch() {
   const choices = parseChoices();
   renderButtons(touchChoices, choices, false);
-  renderButtons(sideChoices, choices, true);
+  termText.textContent = panelDisplayText();
   updatePrompt(lastPrompt(), choices.length > 0);
 }
 const labels = ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','0','y','n','x'];
@@ -5350,6 +5387,7 @@ import hmac
 import html
 import json
 import os
+import queue
 import re
 import secrets
 import sqlite3
@@ -5385,6 +5423,7 @@ login_state={}
 auth_sessions={}
 selected_server={}
 last_message={}
+update_queue=queue.Queue()
 
 with open(TOKEN_FILE,'r') as f:
     TOKEN=f.readline().strip()
@@ -5474,6 +5513,36 @@ def clean_text(s):
     s=re.sub(r'\x1b\][^\x07]*(\x07|\x1b\\)', '', s)
     return s
 
+def is_separator(line):
+    t=line.strip()
+    return bool(t) and not re.search(r'[A-Za-z0-9\u0600-\u06ff]',t)
+
+def is_menu_option_line(line):
+    t=line.strip()
+    if not t:
+        return False
+    return bool(re.match(r'^[\[(]\s*[A-Za-z0-9]{1,3}\s*[\])]',t)) and bool(split_option_line(t))
+
+def visible_screen(display):
+    clean=clean_text(display)
+    lines=[x.strip() for x in clean.splitlines() if x.strip()]
+    if not lines:
+        return '[waiting for server agent output]'
+    mode=prompt_mode(clean)
+    if mode=='text':
+        return lines[-1]
+    if mode=='menu':
+        kept=[]
+        for line in lines:
+            if is_menu_option_line(line) or is_separator(line):
+                continue
+            if re.search(r'(^|\s)(👉\s*)?select\s*:\s*$',line,re.I):
+                continue
+            kept.append(line)
+        return '\n'.join(kept[-18:]).strip() or 'Choose an option below'
+    useful=[x for x in lines if not is_separator(x) and not is_menu_option_line(x)]
+    return '\n'.join(useful[-24:]).strip()
+
 def split_option_line(line):
     found=[]
     pat=re.compile(r'([\[\(])\s*([A-Za-z0-9]{1,3})\s*([\]\)])\s*')
@@ -5518,11 +5587,17 @@ def control_rows(sid, first=None):
         {'text':'🆕 New Session','callback_data':f'ctl:{sid}:new'},
         {'text':'⬅️ Servers','callback_data':'servers'},
     ])
+    rows.append([
+        {'text':'🗑 حذف السيرفر','callback_data':f'delask:{sid}'},
+    ])
     return rows
 
 def terminal_keyboard(sid, display, online=True):
     if not online:
-        return {'inline_keyboard':[[{'text':'🔄 Refresh','callback_data':f'srv:{sid}'},{'text':'⬅️ Servers','callback_data':'servers'}]]}
+        return {'inline_keyboard':[
+            [{'text':'🔄 Refresh','callback_data':f'srv:{sid}'},{'text':'⬅️ Servers','callback_data':'servers'}],
+            [{'text':'🗑 حذف السيرفر','callback_data':f'delask:{sid}'}],
+        ]}
     mode=prompt_mode(display)
     if mode=='yesno':
         return {'inline_keyboard':control_rows(sid,[{'text':'✅ Yes / y','callback_data':f'cmd:{sid}:y'},{'text':'❌ No / n','callback_data':f'cmd:{sid}:n'}])}
@@ -5554,8 +5629,42 @@ def get_server(sid):
 
 def enqueue(sid, kind, data=''):
     with db() as con:
-        con.execute('INSERT INTO commands(server_id,kind,data,created,delivered) VALUES(?,?,?,?,0)',(sid,kind,data,time.time()))
+        cur=con.execute('INSERT INTO commands(server_id,kind,data,created,delivered) VALUES(?,?,?,?,0)',(sid,kind,data,time.time()))
         con.commit()
+        return int(cur.lastrowid)
+
+def command_state(command_id):
+    with db() as con:
+        row=con.execute('SELECT delivered FROM commands WHERE id=?',(command_id,)).fetchone()
+        return int(row['delivered']) if row else -1
+
+def send_command_wait(sid, kind, data='', timeout=8.0):
+    before_row=get_server(sid)
+    before_snapshot=(before_row['snapshot'] or '') if before_row else ''
+    command_id=enqueue(sid,kind,data)
+    deadline=time.time()+timeout
+    delivered=False
+    while time.time()<deadline:
+        state=command_state(command_id)
+        if state>=1:
+            delivered=True
+            row=get_server(sid)
+            if row and (row['snapshot'] or '') != before_snapshot:
+                return True
+        row=get_server(sid)
+        if not server_online(row):
+            break
+        time.sleep(0.10)
+    return delivered
+
+def delete_server(sid):
+    with db() as con:
+        con.execute('DELETE FROM commands WHERE server_id=?',(sid,))
+        con.execute('DELETE FROM servers WHERE id=?',(sid,))
+        con.commit()
+    for chat_key,current in list(selected_server.items()):
+        if current==sid:
+            selected_server.pop(chat_key,None)
 
 def server_online(row):
     return row and (time.time() - float(row['last_seen'] or 0) < OFFLINE_AFTER)
@@ -5604,9 +5713,11 @@ def render_server(chat_id, sid, force_new=False):
     status='🟢 ONLINE' if online else '🔴 OFFLINE - bot is still running, server is not responding'
     snap=clean_text(s['snapshot'] or '')
     if not snap.strip(): snap='[waiting for server agent output]'
+    shown=visible_screen(snap)
     body=f"<b>{html.escape(s['name'] or s['host'] or sid[:8])}</b> · {status}\n"
     body+=f"<code>{html.escape(s['host'] or '')}</code>\n\n"
-    body+='<pre>'+html.escape(snap[-MENU_MAX:])+'</pre>'
+    if shown.strip():
+        body+='<pre>'+html.escape(shown[-MENU_MAX:])+'</pre>'
     kb=terminal_keyboard(sid, snap, online)
     k=str(chat_id); mid=last_message.get(k)
     if mid and not force_new:
@@ -5678,8 +5789,7 @@ def handle_message(msg):
     if not is_authed(chat_id): welcome(chat_id); return
     sid=selected_server.get(str(chat_id))
     if sid and get_server(sid) and server_online(get_server(sid)):
-        enqueue(sid,'write',text+'\r')
-        time.sleep(1.2)
+        send_command_wait(sid,'write',text+'\r')
         render_server(chat_id,sid)
     else:
         render_servers(chat_id)
@@ -5701,16 +5811,42 @@ def handle_callback(cb):
         return
     if data.startswith('srv:'):
         sid=data.split(':',1)[1]; answer_callback(cid); render_server(chat_id,sid); return
+    if data.startswith('delask:'):
+        sid=data.split(':',1)[1]
+        server=get_server(sid)
+        answer_callback(cid)
+        if not server:
+            render_servers(chat_id); return
+        name=html.escape(server['name'] or server['host'] or sid[:8])
+        kb={'inline_keyboard':[
+            [{'text':'✅ نعم، احذف السيرفر','callback_data':f'delgo:{sid}'}],
+            [{'text':'❌ إلغاء','callback_data':f'delcancel:{sid}'}],
+        ]}
+        send(chat_id,f'<b>حذف السيرفر؟</b>\n\nسيُحذف <code>{name}</code> من البوت فقط.',kb)
+        return
+    if data.startswith('delcancel:'):
+        sid=data.split(':',1)[1]; answer_callback(cid,'تم الإلغاء'); render_server(chat_id,sid); return
+    if data.startswith('delgo:'):
+        sid=data.split(':',1)[1]
+        delete_server(sid)
+        answer_callback(cid,'تم حذف السيرفر')
+        send(chat_id,'✅ تم حذف السيرفر من البوت.')
+        render_servers(chat_id,True)
+        return
     if data.startswith('cmd:'):
-        _,sid,val=data.split(':',2); enqueue(sid,'write',val+'\r'); answer_callback(cid,val); time.sleep(1.1); render_server(chat_id,sid); return
+        _,sid,val=data.split(':',2)
+        answer_callback(cid,'جارٍ التنفيذ…')
+        send_command_wait(sid,'write',val+'\r')
+        render_server(chat_id,sid)
+        return
     if data.startswith('ctl:'):
         _,sid,cmd=data.split(':',2)
-        if cmd=='enter': enqueue(sid,'write','\r')
-        elif cmd=='backspace': enqueue(sid,'write','\x7f')
-        elif cmd=='ctrlc': enqueue(sid,'write','\x03')
-        elif cmd=='new': enqueue(sid,'new','')
-        answer_callback(cid)
-        time.sleep(1.0); render_server(chat_id,sid); return
+        answer_callback(cid,'جارٍ التنفيذ…')
+        if cmd=='enter': send_command_wait(sid,'write','\r')
+        elif cmd=='backspace': send_command_wait(sid,'write','\x7f',timeout=3.0)
+        elif cmd=='ctrlc': send_command_wait(sid,'write','\x03')
+        elif cmd=='new': send_command_wait(sid,'new','')
+        render_server(chat_id,sid); return
 
 def dispatch_update(upd):
     try:
@@ -5720,6 +5856,14 @@ def dispatch_update(upd):
             handle_callback(upd['callback_query'])
     except Exception as e:
         print('update handler error: %s'%e, flush=True)
+
+def update_loop():
+    while True:
+        upd=update_queue.get()
+        try:
+            dispatch_update(upd)
+        finally:
+            update_queue.task_done()
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
@@ -5794,8 +5938,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         except Exception:
             self._reply(400)
             return
+        update_queue.put(upd)
         self._reply(200)
-        threading.Thread(target=dispatch_update,args=(upd,),daemon=True).start()
 
 def http_loop():
     srv=ThreadingHTTPServer(('0.0.0.0',PORT), Handler)
@@ -5820,6 +5964,7 @@ def webhook_loop():
 def main():
     os.makedirs(BASE, exist_ok=True)
     db().close()
+    threading.Thread(target=update_loop, daemon=True).start()
     threading.Thread(target=http_loop, daemon=True).start()
     webhook_loop()
 
