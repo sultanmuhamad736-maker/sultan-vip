@@ -1,4 +1,4 @@
-##!/bin/bash
+#!/bin/bash
 # ==========================================================
 # SULTAN VIP FULL PURPLE MENU INSTALL
 # Full verified installer + full panel + SSL/TLS/SNI/WS/V2Ray WebSocket
@@ -152,20 +152,36 @@ done
 # the SULTAN SSH users database. Xray users and all other installer features are untouched.
 handle_existing_users_before_final(){
   local USERS_FILE ANSWER U OLD_LINE OLD_PASS OLD_EXP OLD_QUOTA OLD_LOGIN
-  local SHADOW_EXPIRE EXP TMP TMP2 FILE IMPORTED=0 DELETED=0
+  local SHADOW_EXPIRE EXP TMP TMP2 FILE IMPORTED=0 DELETED=0 FAILED=0
   local SSH_CHECK_MARK="$BASE/.ssh-users-check-done"
-  [ -f "$SSH_CHECK_MARK" ] && return 0
 
   USERS_FILE="$(mktemp "$BASE/.existing-users.XXXXXX")" || return 1
   awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd | sort -u > "$USERS_FILE"
+
+  # If the check was completed before and there are no normal SSH users left,
+  # skip silently. If users still exist, DO NOT skip; ask again and delete/import for real.
+  if [ -f "$SSH_CHECK_MARK" ] && [ ! -s "$USERS_FILE" ]; then
+    rm -f "$USERS_FILE"
+    return 0
+  fi
 
   echo "==========================================="
   echo "[Existing SSH users check]"
   echo "Command: awk -F: '\''$3>=1000 && $1!=\"nobody\"{print $1}'\'' /etc/passwd"
   echo "-------------------------------------------"
-  awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd
-  [ -s "$USERS_FILE" ] || echo "(no users found)"
+  if [ -s "$USERS_FILE" ]; then
+    cat "$USERS_FILE"
+  else
+    echo "(no users found)"
+  fi
   echo "==========================================="
+
+  if [ ! -s "$USERS_FILE" ]; then
+    : > "$SSH_CHECK_MARK"
+    chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
+    rm -f "$USERS_FILE"
+    return 0
+  fi
 
   while true; do
     if [ -r /dev/tty ] && [ -w /dev/tty ]; then
@@ -178,13 +194,41 @@ handle_existing_users_before_final(){
 
     case "$ANSWER" in
       y|Y)
-        for U in $(awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd); do
-          userdel -r "$U" 2>/dev/null || true
-          rm -rf "/run/sultan-login-slots/$U" 2>/dev/null || true
-          DELETED=$((DELETED + 1))
-        done
+        DELETED=0
+        FAILED=0
+        while IFS= read -r U; do
+          [ -n "$U" ] || continue
+          id "$U" >/dev/null 2>&1 || continue
 
-        # Remove only deleted SSH names from SULTAN records, allowing those
+          echo "Deleting SSH user: $U"
+          loginctl terminate-user "$U" >/dev/null 2>&1 || true
+          pkill -KILL -u "$U" >/dev/null 2>&1 || true
+          rm -rf "/run/sultan-login-slots/$U" "/run/user/$(id -u "$U" 2>/dev/null || echo 0)" 2>/dev/null || true
+          crontab -r -u "$U" >/dev/null 2>&1 || true
+          passwd -l "$U" >/dev/null 2>&1 || true
+
+          userdel -f -r "$U" >/dev/null 2>&1 || userdel -r "$U" >/dev/null 2>&1 || true
+
+          # If userdel failed because of a corrupted/locked account state, remove
+          # the account records as a last-resort cleanup. The username comes from
+          # /etc/passwd UID>=1000 and is filtered before use.
+          if id "$U" >/dev/null 2>&1; then
+            if [[ "$U" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]]; then
+              sed -i "/^${U}:/d" /etc/passwd /etc/shadow /etc/group /etc/gshadow 2>/dev/null || true
+              rm -rf "/home/$U" "/var/mail/$U" "/var/spool/mail/$U" 2>/dev/null || true
+            fi
+          fi
+
+          if id "$U" >/dev/null 2>&1; then
+            echo "FAILED to delete SSH user: $U"
+            FAILED=$((FAILED + 1))
+          else
+            echo "Deleted SSH user: $U"
+            DELETED=$((DELETED + 1))
+          fi
+        done < "$USERS_FILE"
+
+        # Remove only the requested SSH names from SULTAN records, allowing those
         # usernames to be created again later without stale database entries.
         for FILE in "$DB" \
                     "$LIMIT_DIR/usage.db" \
@@ -204,10 +248,17 @@ handle_existing_users_before_final(){
         done
 
         rm -f "$USERS_FILE"
-        : > "$SSH_CHECK_MARK"
-        chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
+        if [ "$FAILED" -eq 0 ]; then
+          : > "$SSH_CHECK_MARK"
+          chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
+          echo "Deleted users: $DELETED"
+          return 0
+        fi
+        rm -f "$SSH_CHECK_MARK"
         echo "Deleted users: $DELETED"
-        return 0
+        echo "Failed users: $FAILED"
+        echo "Run this command to see remaining normal users: awk -F: '$3>=1000 && $1!=\"nobody\"{print $1}' /etc/passwd"
+        return 1
         ;;
 
       n|N)
@@ -236,8 +287,6 @@ handle_existing_users_before_final(){
             ""|0|Unlimited|unlimited|UNLIMITED) OLD_LOGIN="Unlimited" ;;
           esac
 
-          # Preserve a stored SULTAN expiry when present. Otherwise import the
-          # system account expiry; no expiry is stored as the literal value 0.
           if [ -n "$OLD_LINE" ]; then
             EXP="$OLD_EXP"
           else
@@ -275,12 +324,6 @@ handle_existing_users_before_final(){
         ;;
     esac
   done
-}
-
-echo "[SSH users check before install]"
-handle_existing_users_before_final || {
-  echo "SSH user preservation/delete check failed."
-  exit 1
 }
 
 # ==========================================================
