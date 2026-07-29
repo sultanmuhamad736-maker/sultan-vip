@@ -1,4 +1,4 @@
-#!/bin/bash
+##!/bin/bash
 # ==========================================================
 # SULTAN VIP FULL PURPLE MENU INSTALL
 # Full verified installer + full panel + SSL/TLS/SNI/WS/V2Ray WebSocket
@@ -35,9 +35,9 @@ PANEL="/usr/local/bin/menu"
 LIMIT_DIR="$BASE/limits"
 
 mkdir -p "$BASE" "$XDB" "$LIMIT_DIR"
-touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db"
+touch "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db" "$XDB/disabled.db" "$XDB/limit-events.log"
 chmod 700 "$BASE" "$XDB" "$LIMIT_DIR"
-chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db"
+chmod 600 "$DB" "$LIMIT_DIR/usage.db" "$LIMIT_DIR/blocked.db" "$LIMIT_DIR/quota-locked.db" "$LIMIT_DIR/devices.db" "$LIMIT_DIR/device_sessions.log" "$LIMIT_DIR/device_usage.db" "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db" "$XDB/disabled.db" "$XDB/limit-events.log"
 
 
 # Store unlimited quota/login limits as the literal numeric value 0.
@@ -153,6 +153,8 @@ done
 handle_existing_users_before_final(){
   local USERS_FILE ANSWER U OLD_LINE OLD_PASS OLD_EXP OLD_QUOTA OLD_LOGIN
   local SHADOW_EXPIRE EXP TMP TMP2 FILE IMPORTED=0 DELETED=0
+  local SSH_CHECK_MARK="$BASE/.ssh-users-check-done"
+  [ -f "$SSH_CHECK_MARK" ] && return 0
 
   USERS_FILE="$(mktemp "$BASE/.existing-users.XXXXXX")" || return 1
   awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd | sort -u > "$USERS_FILE"
@@ -202,6 +204,8 @@ handle_existing_users_before_final(){
         done
 
         rm -f "$USERS_FILE"
+        : > "$SSH_CHECK_MARK"
+        chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
         echo "Deleted users: $DELETED"
         return 0
         ;;
@@ -260,6 +264,8 @@ handle_existing_users_before_final(){
         mv -f "$TMP" "$DB"
         rm -f "$USERS_FILE"
         /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 || true
+        : > "$SSH_CHECK_MARK"
+        chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
         echo "Imported existing users into SULTAN: $IMPORTED"
         return 0
         ;;
@@ -269,6 +275,12 @@ handle_existing_users_before_final(){
         ;;
     esac
   done
+}
+
+echo "[SSH users check before install]"
+handle_existing_users_before_final || {
+  echo "SSH user preservation/delete check failed."
+  exit 1
 }
 
 # ==========================================================
@@ -920,6 +932,11 @@ GSSAPIAuthentication no
 AllowTcpForwarding yes
 PermitTunnel no
 X11Forwarding no
+LoginGraceTime 15
+MaxStartups 100:30:200
+ClientAliveInterval 15
+ClientAliveCountMax 2
+TCPKeepAlive yes
 EOF
 while IFS='|' read -r EXISTING_USER _; do
   [ -n "$EXISTING_USER" ] || continue
@@ -1288,8 +1305,8 @@ Description=SULTAN quota checker
 
 [Timer]
 OnBootSec=10s
-OnUnitActiveSec=10s
-AccuracySec=2s
+OnUnitActiveSec=3s
+AccuracySec=1s
 Persistent=true
 
 [Install]
@@ -1458,26 +1475,30 @@ for TAG in vmess-ws vless-ws trojan-ws; do
     [ "$ONLINE_DAY" = "$TODAY" ] || ONLINE_PEAK=0
     ONLINE_CURRENT=0
 
-    if [ "$ONLINE_API_OK" = "1" ]; then
-      # Count unique Xray IPs only when the same IP still has a live public
-      # port-443 socket. A dead/replaced IP disappears instead of remaining in
-      # the total and being counted again on every reconnect.
+    # HARD REAL LOGIN COUNTER:
+    # Count the active Xray connections for this exact user email/UUID.
+    # This is the value needed for Users/Login Limit. IP-only counting is not
+    # reliable behind Nginx/HAProxy because Xray may only see the proxy.
+    ONLINE_STAT_NAME="user>>>${EMAIL}>>>online"
+    ONLINE_ROW="$(awk -F'\t' -v n="$ONLINE_STAT_NAME" '$1==n{found=1;s+=$2} END{if(found) printf "1|%.0f",s+0; else printf "0|0"}' "$PARSED")"
+    HAS_ONLINE_STAT="${ONLINE_ROW%%|*}"
+    ONLINE_STAT_VALUE="${ONLINE_ROW#*|}"
+    [[ "$ONLINE_STAT_VALUE" =~ ^[0-9]+$ ]] || ONLINE_STAT_VALUE=0
+
+    if [ "$HAS_ONLINE_STAT" = "1" ]; then
+      ONLINE_CURRENT="$ONLINE_STAT_VALUE"
+    elif [ "$ONLINE_API_OK" = "1" ]; then
+      # Fallback only when this Xray core lacks statsUserOnline.
       ONLINE_CURRENT="$(awk -F'\t' -v e="$EMAIL" '
         NR==FNR {if($1!="") live[$1]=1; next}
-        $1==e && live[$2] && !seen[$2]++ {n++}
+        $1==e && $2!="" && live[$2] && !seen[$2]++ {n++}
         END {print n+0}
       ' "$LIVE_PUBLIC_IPS" "$ONLINE_IP_ROWS")"
       [[ "$ONLINE_CURRENT" =~ ^[0-9]+$ ]] || ONLINE_CURRENT=0
-
-      # Some reverse-proxy/core combinations cannot expose the real client IP.
-      # Fresh traffic is still authoritative proof that this account is online.
       if [ "$ONLINE_CURRENT" -eq 0 ] && [ "$DELTA" -gt 0 ]; then
         ONLINE_CURRENT=1
       fi
     else
-      # Old cores without the bulk IP API are never trusted for an increasing
-      # counter. Report one only when this account produced traffic in the
-      # current scan; this prevents an old stale map from climbing forever.
       [ "$DELTA" -gt 0 ] && ONLINE_CURRENT=1 || ONLINE_CURRENT=0
     fi
 
@@ -1541,8 +1562,371 @@ Description=SULTAN Xray statistics collector
 
 [Timer]
 OnBootSec=2s
-OnUnitActiveSec=2s
-AccuracySec=1s
+OnUnitActiveSec=1s
+AccuracySec=300ms
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+
+# ==========================================================
+# Real V2Ray/Xray limit enforcer
+# ==========================================================
+# This is the active enforcement layer for VMess/VLESS/Trojan. The stats
+# collector only measures traffic and online counters; this service actually
+# removes expired, over-quota, or over-login users from the live Xray config.
+cat >/usr/local/sbin/sultan-xray-limit-enforcer <<'XRAY_LIMIT_ENFORCER'
+#!/bin/bash
+set -u
+umask 077
+
+XDB="/etc/sultan/xray"
+CFG="/usr/local/etc/xray/config.json"
+USAGE="$XDB/usage.db"
+USER_ONLINE="$XDB/user-online.db"
+DISABLED="$XDB/disabled.db"
+EVENTS="$XDB/limit-events.log"
+LOCK="/run/lock/sultan-xray-limit-enforcer.lock"
+COOLDOWN="${SULTAN_XRAY_LOGIN_COOLDOWN:-30}"
+
+mkdir -p "$XDB" /run/lock /usr/local/etc/xray
+touch "$USAGE" "$USER_ONLINE" "$DISABLED" "$EVENTS"
+chmod 600 "$USAGE" "$USER_ONLINE" "$DISABLED" "$EVENTS" 2>/dev/null || true
+[ -s "$CFG" ] || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+exec 9>"$LOCK"
+flock -n -x 9 || exit 0
+
+/usr/local/sbin/sultan-xray-stats-sync >/dev/null 2>&1 || true
+
+BIN=""
+for B in /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
+  if [ -x "$B" ]; then BIN="$B"; break; fi
+done
+[ -n "$BIN" ] || exit 0
+
+TMP_CFG="$(mktemp --suffix=.json "$XDB/.enforced-config.XXXXXX")" || exit 1
+TMP_DISABLED="$(mktemp "$XDB/.disabled.XXXXXX")" || { rm -f "$TMP_CFG"; exit 1; }
+TMP_REPORT="$(mktemp "$XDB/.enforce-report.XXXXXX")" || { rm -f "$TMP_CFG" "$TMP_DISABLED"; exit 1; }
+trap 'rm -f "$TMP_CFG" "$TMP_DISABLED" "$TMP_REPORT"' EXIT
+
+set +e
+python3 - "$XDB" "$CFG" "$USAGE" "$USER_ONLINE" "$DISABLED" "$TMP_CFG" "$TMP_DISABLED" "$TMP_REPORT" "$COOLDOWN" <<'PYENFORCE'
+import copy
+import datetime as dt
+import json
+import os
+import sys
+import time
+
+xdb, cfg_path, usage_path, online_path, disabled_path, tmp_cfg, tmp_disabled, tmp_report, cooldown_s = sys.argv[1:]
+try:
+    cooldown = int(cooldown_s)
+except Exception:
+    cooldown = 30
+if cooldown < 5:
+    cooldown = 5
+now = int(time.time())
+today = dt.date.today()
+
+def clean(v):
+    return (v or '').replace('\r', '').strip()
+
+def is_unlimited(v):
+    return clean(v).lower() in ('', '0', 'unlimited')
+
+def quota_bytes(v):
+    v = clean(v)
+    if is_unlimited(v):
+        return 0
+    low = v.lower()
+    try:
+        if low.endswith('gb'):
+            return int(v[:-2]) * 1000 * 1000 * 1000
+        if low.endswith('mb'):
+            return int(v[:-2]) * 1000 * 1000
+        if low.endswith('tb'):
+            return int(v[:-2]) * 1000 * 1000 * 1000 * 1000
+        return int(v) * 1000 * 1000 * 1000
+    except Exception:
+        return 0
+
+def int_limit(v):
+    v = clean(v)
+    if is_unlimited(v):
+        return 0
+    return int(v) if v.isdigit() else 0
+
+def expired(exp):
+    exp = clean(exp)
+    if is_unlimited(exp):
+        return False
+    try:
+        d = dt.datetime.strptime(exp, '%Y-%m-%d').date()
+    except Exception:
+        return False
+    # Same behavior as the panel display: the account remains valid until
+    # 23:59:59 on its expiry date, then expires the next day.
+    return today > d
+
+def read_usage():
+    data = {}
+    try:
+        with open(usage_path, encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                p = line.rstrip('\n').split('|')
+                if len(p) >= 3 and p[2].isdigit():
+                    data[(p[0], p[1])] = int(p[2])
+    except FileNotFoundError:
+        pass
+    return data
+
+def read_online():
+    data = {}
+    try:
+        with open(online_path, encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                p = line.rstrip('\n').split('|')
+                if len(p) >= 6:
+                    try:
+                        val = int(p[4])
+                        updated = int(p[5])
+                    except Exception:
+                        continue
+                    data[(p[0], p[1])] = val if now - updated <= 6 else 0
+    except FileNotFoundError:
+        pass
+    return data
+
+def read_disabled():
+    data = {}
+    try:
+        with open(disabled_path, encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                p = line.rstrip('\n').split('|')
+                if len(p) >= 5:
+                    tag, user = p[0], p[1]
+                    try:
+                        until = int(p[4])
+                    except Exception:
+                        until = 0
+                    data[(tag, user)] = {'reason': p[2], 'since': p[3], 'until': until, 'raw': p}
+    except FileNotFoundError:
+        pass
+    return data
+
+def read_users(tag):
+    path = os.path.join(xdb, f'{tag}.db')
+    rows = []
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                p = line.rstrip('\n').split('|')
+                while len(p) < 14:
+                    p.append('')
+                user, value = clean(p[0]), clean(p[1])
+                if not user or not value:
+                    continue
+                rows.append({
+                    'tag': tag,
+                    'user': user,
+                    'value': value,
+                    'proto': clean(p[2]),
+                    'expire': clean(p[6]),
+                    'quota': clean(p[7]),
+                    'login': clean(p[8]),
+                })
+    except FileNotFoundError:
+        pass
+    return rows
+
+usage = read_usage()
+online = read_online()
+disabled_old = read_disabled()
+active = {'vless-ws': [], 'vmess-ws': [], 'trojan-ws': []}
+disabled_new = {}
+report_lines = []
+
+for tag in ('vless-ws', 'vmess-ws', 'trojan-ws'):
+    for row in read_users(tag):
+        key = (tag, row['user'])
+        used = usage.get(key, 0)
+        cur_online = online.get(key, 0)
+        qlimit = quota_bytes(row['quota'])
+        llimit = int_limit(row['login'])
+        reason = ''
+        until = 0
+        if expired(row['expire']):
+            reason = 'expired'
+        elif qlimit > 0 and used >= qlimit:
+            reason = 'quota'
+        elif llimit > 0 and cur_online > llimit:
+            reason = 'login-limit'
+            until = now + cooldown
+        else:
+            old = disabled_old.get(key)
+            if old and old.get('reason') == 'login-limit' and old.get('until', 0) > now:
+                # Keep the account absent briefly so all extra sockets die and
+                # phone/client reconnect storms do not immediately bypass limit 1.
+                reason = 'login-cooldown'
+                until = old['until']
+
+        if reason:
+            if not until:
+                until = 0
+            disabled_new[key] = {
+                'reason': reason,
+                'since': disabled_old.get(key, {}).get('since', str(now)),
+                'until': until,
+                'used': used,
+                'limit': qlimit,
+                'online': cur_online,
+                'maxlogin': llimit,
+            }
+            report_lines.append(f'DISABLE|{tag}|{row["user"]}|{reason}|online={cur_online}|max={llimit}|used={used}|limit={qlimit}')
+        else:
+            active[tag].append(row)
+            if key in disabled_old:
+                report_lines.append(f'ENABLE|{tag}|{row["user"]}|ok|online={cur_online}|max={llimit}|used={used}|limit={qlimit}')
+
+with open(cfg_path, encoding='utf-8') as fh:
+    cfg = json.load(fh)
+new_cfg = copy.deepcopy(cfg)
+
+for inbound in new_cfg.get('inbounds', []):
+    tag = inbound.get('tag')
+    if tag not in active:
+        continue
+    settings = inbound.setdefault('settings', {})
+    old_clients = settings.get('clients')
+    if not isinstance(old_clients, list):
+        old_clients = []
+    placeholders = []
+    by_email = {}
+    by_value = {}
+    for c in old_clients:
+        if not isinstance(c, dict):
+            continue
+        email = c.get('email', '')
+        if isinstance(email, str) and email.startswith('_sultan_placeholder_'):
+            placeholders.append(c)
+            continue
+        if isinstance(email, str) and email:
+            by_email[email] = c
+        val = c.get('password') if tag == 'trojan-ws' else c.get('id')
+        if isinstance(val, str) and val:
+            by_value[val] = c
+    new_clients = list(placeholders)
+    seen = set()
+    for row in active[tag]:
+        email = f'{tag}:{row["user"]}'
+        base = by_email.get(email) or by_value.get(row['value']) or {}
+        c = copy.deepcopy(base) if isinstance(base, dict) else {}
+        if tag == 'trojan-ws':
+            c['password'] = row['value']
+        else:
+            c['id'] = row['value']
+        c['email'] = email
+        c['level'] = 0
+        val = c.get('password') if tag == 'trojan-ws' else c.get('id')
+        key = (email, val)
+        if key in seen:
+            continue
+        seen.add(key)
+        new_clients.append(c)
+    settings['clients'] = new_clients
+    if tag == 'vless-ws':
+        settings['decryption'] = 'none'
+
+with open(tmp_disabled, 'w', encoding='utf-8') as fh:
+    for (tag, user), d in sorted(disabled_new.items()):
+        fh.write('|'.join([
+            tag, user, str(d['reason']), str(d['since']), str(d['until']),
+            str(d['used']), str(d['limit']), str(d['online']), str(d['maxlogin'])
+        ]) + '\n')
+
+with open(tmp_report, 'w', encoding='utf-8') as fh:
+    for line in report_lines:
+        fh.write(line + '\n')
+
+changed = json.dumps(cfg, sort_keys=True, separators=(',', ':')) != json.dumps(new_cfg, sort_keys=True, separators=(',', ':'))
+with open(tmp_cfg, 'w', encoding='utf-8') as fh:
+    json.dump(new_cfg, fh, ensure_ascii=False, indent=2)
+    fh.write('\n')
+raise SystemExit(10 if changed else 0)
+PYENFORCE
+PY_STATUS=$?
+set -e
+
+if [ "$PY_STATUS" -ne 0 ] && [ "$PY_STATUS" -ne 10 ]; then
+  exit 0
+fi
+
+TEST_OK=0
+if [ "$PY_STATUS" -eq 10 ]; then
+  if "$BIN" run -test -config "$TMP_CFG" >/dev/null 2>&1 || \
+     "$BIN" run -test -c "$TMP_CFG" >/dev/null 2>&1 || \
+     "$BIN" test -config "$TMP_CFG" >/dev/null 2>&1 || \
+     "$BIN" -test -config "$TMP_CFG" >/dev/null 2>&1; then
+    TEST_OK=1
+  fi
+  [ "$TEST_OK" -eq 1 ] || exit 0
+fi
+
+if [ -s "$TMP_REPORT" ]; then
+  while IFS= read -r LINE; do
+    [ -n "$LINE" ] || continue
+    printf '%s|%s\n' "$(date +%s)" "$LINE" >> "$EVENTS"
+    logger -t sultan-xray-limit "$LINE" 2>/dev/null || true
+  done < "$TMP_REPORT"
+  tail -n 2000 "$EVENTS" > "$EVENTS.tmp" 2>/dev/null && mv -f "$EVENTS.tmp" "$EVENTS" || true
+  chmod 600 "$EVENTS" 2>/dev/null || true
+fi
+
+chmod 600 "$TMP_DISABLED"
+mv -f "$TMP_DISABLED" "$DISABLED"
+
+if [ "$PY_STATUS" -eq 10 ]; then
+  cp -a "$CFG" "$CFG.enforcer.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  chmod 600 "$TMP_CFG"
+  mv -f "$TMP_CFG" "$CFG"
+  chown root:root "$CFG" 2>/dev/null || true
+  chmod 600 "$CFG" 2>/dev/null || true
+  systemctl restart xray >/dev/null 2>&1 || true
+fi
+
+trap - EXIT
+rm -f "$TMP_CFG" "$TMP_REPORT"
+exit 0
+XRAY_LIMIT_ENFORCER
+
+chmod 700 /usr/local/sbin/sultan-xray-limit-enforcer
+chown root:root /usr/local/sbin/sultan-xray-limit-enforcer
+
+cat >/etc/systemd/system/sultan-xray-limit-enforcer.service <<'EOF'
+[Unit]
+Description=SULTAN real V2Ray/Xray user limit enforcer
+After=xray.service sultan-xray-stats.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sultan-xray-limit-enforcer
+EOF
+
+cat >/etc/systemd/system/sultan-xray-limit-enforcer.timer <<'EOF'
+[Unit]
+Description=SULTAN V2Ray/Xray real login/quota/expiry enforcer
+
+[Timer]
+OnBootSec=3s
+OnUnitActiveSec=1s
+AccuracySec=500ms
 Persistent=true
 
 [Install]
@@ -1580,14 +1964,16 @@ XRAY_USAGE_DB="$XDB/usage.db"
 XRAY_OVERVIEW_DB="$XDB/overview.db"
 XRAY_USER_ONLINE_DB="$XDB/user-online.db"
 XRAY_ONLINE_SESSIONS_DB="$XDB/online-sessions.db"
+XRAY_DISABLED_DB="$XDB/disabled.db"
+XRAY_LIMIT_EVENTS_DB="$XDB/limit-events.log"
 WS_TOKEN_FILE="$BASE/ws_token"
 
 mkdir -p "$BASE" "$XDB" "$BASE/limits"
-touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" "$XRAY_ONLINE_SESSIONS_DB"
+touch "$DB" "$USAGE_DB" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" "$XRAY_ONLINE_SESSIONS_DB" "$XRAY_DISABLED_DB" "$XRAY_LIMIT_EVENTS_DB"
 touch "$BASE/limits/blocked.db"
 touch "$BASE/limits/quota-locked.db"
 chmod 700 "$BASE" "$XDB" "$BASE/limits" 2>/dev/null || true
-chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" "$XRAY_ONLINE_SESSIONS_DB" 2>/dev/null || true
+chmod 600 "$DB" "$USAGE_DB" "$BASE/limits/blocked.db" "$BASE/limits/quota-locked.db" "$DEVICE_DB" "$DEVICE_USAGE_DB" "$DEVICE_SESSIONS" "$XRAY_USAGE_DB" "$XRAY_OVERVIEW_DB" "$XRAY_USER_ONLINE_DB" "$XRAY_ONLINE_SESSIONS_DB" "$XRAY_DISABLED_DB" "$XRAY_LIMIT_EVENTS_DB" 2>/dev/null || true
 
 
 DB_LOCK="/run/lock/sultan-db.lock"
@@ -1888,6 +2274,28 @@ normalize_ws_path(){
   printf '%s\n' "$P"
 }
 
+# Per-user limited links. This keeps the Xray inbound on the normal protocol
+# WebSocket path, but gives limited accounts a private public path so Nginx can
+# reject extra simultaneous WebSocket connections before they reach Xray.
+xray_user_limited_path(){
+  local BASE="$1" USER="$2" VALUE="$3" SAFE HASH CAND
+  BASE="$(normalize_ws_path "$BASE" 2>/dev/null || echo /xray-ws)"
+  BASE="${BASE%/}"
+  SAFE="$(printf '%s' "$USER" | tr -cd 'A-Za-z0-9._~-')"
+  [ -n "$SAFE" ] || SAFE="user"
+  HASH="$(printf '%s' "$USER|$VALUE" | sha256sum | awk '{print substr($1,1,10)}')"
+  CAND="$BASE/$SAFE-$HASH"
+  if [ "${#CAND}" -gt 128 ]; then
+    SAFE="${SAFE:0:32}"
+    CAND="$BASE/$SAFE-$HASH"
+  fi
+  if ! validate_ws_path "$CAND"; then
+    CAND="$BASE/$HASH"
+  fi
+  validate_ws_path "$CAND" || CAND="/xray-$HASH"
+  printf '%s\n' "$CAND"
+}
+
 xray_default_path(){
   case "$1" in
     vless-ws) echo "/vless-ws" ;;
@@ -2079,24 +2487,53 @@ CYAN="\e[36m"
 WHITE="\e[97m"
 NC="\e[0m"
 
-refresh_screen(){ printf '\033c'; printf '\033[2J\033[3J\033[H'; clear; }
+# Fast UI mode keeps menu response snappy. Set SULTAN_FAST_UI=0 to restore
+# the old blocking Press-Enter behavior.
+: "${SULTAN_FAST_UI:=1}"
+: "${SULTAN_PAUSE_TIMEOUT:=0.35}"
+refresh_screen(){
+  if [ "${SULTAN_FAST_UI:-1}" = "1" ]; then
+    printf '[H[2J'
+  else
+    printf 'c'; printf '[2J[3J[H'; clear
+  fi
+}
 pause(){
   echo ""
   [ "${SULTAN_NONINTERACTIVE:-0}" = "1" ] && return 0
 
-  # Do not return automatically while the user is copying a link or
-  # reading account details. Wait for a real Enter key from the terminal.
+  if [ "${SULTAN_FAST_UI:-1}" = "1" ]; then
+    if [ -r /dev/tty ]; then
+      IFS= read -r -t "${SULTAN_PAUSE_TIMEOUT:-0.35}" -p "Press Enter..." x </dev/tty || true
+    elif [ -t 0 ]; then
+      IFS= read -r -t "${SULTAN_PAUSE_TIMEOUT:-0.35}" -p "Press Enter..." x || true
+    fi
+    echo ""
+    return 0
+  fi
+
   if [ -r /dev/tty ]; then
     IFS= read -r -p "Press Enter..." x </dev/tty || true
   elif [ -t 0 ]; then
     IFS= read -r -p "Press Enter..." x || true
-  else
-    return 0
   fi
 
   echo ""
   return 0
 }
+
+pause_wait(){
+  echo ""
+  [ "${SULTAN_NONINTERACTIVE:-0}" = "1" ] && return 0
+  if [ -r /dev/tty ]; then
+    IFS= read -r -p "Press Enter..." x </dev/tty || true
+  elif [ -t 0 ]; then
+    IFS= read -r -p "Press Enter..." x || true
+  fi
+  echo ""
+  return 0
+}
+
 box(){ printf "%-16s :      [ %s ]\n" "$1" "$2"; }
 svc(){ systemctl is-active --quiet "$1" 2>/dev/null && echo ACTIVE || echo OFFLINE; }
 
@@ -3291,6 +3728,10 @@ xray_stats_email(){
 
 xray_stats_sync(){
   /usr/local/sbin/sultan-xray-stats-sync >/dev/null 2>&1 || true
+}
+
+xray_limit_enforce_now(){
+  /usr/local/sbin/sultan-xray-limit-enforcer >/dev/null 2>&1 || true
 }
 
 xray_usage_remove_user(){
@@ -6363,6 +6804,7 @@ while true; do
   echo -e " ${WHITE}SSH${NC}           : $(svc_badge ssh)"
   echo -e " ${WHITE}Fail2Ban${NC}      : $(svc_badge fail2ban)"
   echo -e " ${WHITE}Quota Engine${NC}  : $(svc_badge sultan-quota.timer)"
+  echo -e " ${WHITE}Xray Limits${NC}   : $(svc_badge sultan-xray-limit-enforcer.timer)"
   echo -e " ${WHITE}BBR${NC}           : $(badge "$(bbr_status)")"
   echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e " ${CYAN}[1]${NC} SSH MENU              ${CYAN}[11]${NC} REBOOT VPS"
@@ -6764,27 +7206,28 @@ xray_config_ok(){
 
 xray_restart_safe(){
   local I
-  /usr/local/sbin/sultan-xray-stats-sync >/dev/null 2>&1 || true
+  timeout 1 /usr/local/sbin/sultan-xray-stats-sync >/dev/null 2>&1 || true
   xray_fix_service_access
   if ! xray_config_ok; then
     echo "Xray config error. Restart skipped."
-    [ -n "${XRAY_TEST_ERROR:-}" ] && printf '%s\n' "$XRAY_TEST_ERROR"
+    [ -n "${XRAY_TEST_ERROR:-}" ] && printf '%s
+' "$XRAY_TEST_ERROR"
     return 1
   fi
   systemctl reset-failed xray >/dev/null 2>&1 || true
-  if ! systemctl restart xray; then
+  if ! systemctl restart xray >/dev/null 2>&1; then
     echo "Xray service failed to restart."
     systemctl status xray --no-pager -l 2>/dev/null || true
-    journalctl -u xray -n 30 --no-pager 2>/dev/null || true
+    journalctl -u xray -n 20 --no-pager 2>/dev/null || true
     return 1
   fi
-  for I in {1..10}; do
+  for I in {1..12}; do
     systemctl is-active --quiet xray 2>/dev/null && return 0
-    sleep 1
+    sleep 0.25
   done
   echo "Xray stopped after restart."
   systemctl status xray --no-pager -l 2>/dev/null || true
-  journalctl -u xray -n 30 --no-pager 2>/dev/null || true
+  journalctl -u xray -n 20 --no-pager 2>/dev/null || true
   return 1
 }
 
@@ -6895,7 +7338,7 @@ write_xray_ws_config(){
 {
   "log": {"loglevel": "warning"},
   "stats": {},
-  "api": {"tag": "api", "listen": "127.0.0.1:10090", "services": ["StatsService"]},
+  "api": {"tag": "api", "listen": "127.0.0.1:10090", "services": ["StatsService", "HandlerService"]},
   "policy": {
     "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true, "statsUserOnline": true}},
     "system": {"statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true}
@@ -6926,7 +7369,7 @@ write_xray_ws_config(){
       "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "$TROJAN_PATH"}}
     }
   ],
-  "outbounds": [{"tag": "direct", "protocol": "direct", "settings": {}}]
+  "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}]
 }
 EOF
   else
@@ -6959,7 +7402,7 @@ EOF
       "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "$TROJAN_PATH"}}
     }
   ],
-  "outbounds": [{"tag": "direct", "protocol": "direct", "settings": {}}]
+  "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}]
 }
 EOF
   fi
@@ -7130,10 +7573,10 @@ cfg["inbounds"] = kept + canonical
 
 outbounds = cfg.get("outbounds")
 if not isinstance(outbounds, list) or not outbounds:
-    cfg["outbounds"] = [{"tag": "direct", "protocol": "direct", "settings": {}}]
+    cfg["outbounds"] = [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}]
 
 cfg["stats"] = cfg.get("stats") if isinstance(cfg.get("stats"), dict) else {}
-cfg["api"] = {"tag": "api", "listen": "127.0.0.1:10090", "services": ["StatsService"]}
+cfg["api"] = {"tag": "api", "listen": "127.0.0.1:10090", "services": ["StatsService", "HandlerService"]}
 policy = cfg.get("policy")
 policy = copy.deepcopy(policy) if isinstance(policy, dict) else {}
 levels = policy.get("levels")
@@ -7481,6 +7924,12 @@ create_xray_user(){
     FILTER='(.inbounds[]|select(.tag==$tag)|.settings.clients)+=[{"id":$value,"email":$email,"level":0}]'
   fi
 
+  # If Users/Login Limit is set, give this account a private public WS path.
+  # Nginx uses that path to enforce the login limit immediately.
+  if [ "$MAXLOGIN" -gt 0 ]; then
+    PATHX="$(xray_user_limited_path "$PATHX" "$USER" "$VALUE")"
+  fi
+
   BACKUP="$(mktemp --suffix=.json "/usr/local/etc/xray/.rollback.XXXXXX")" || { echo "Rollback temp failed."; pause; return; }
   cp -a "$XRAY_CONFIG" "$BACKUP"
 
@@ -7541,8 +7990,16 @@ create_xray_user(){
     return
   fi
 
+  # Rebuild proxy after the user row exists, so the private limited path is live.
+  if ! refresh_proxy_config_from_current; then
+    echo "Proxy reload failed after applying the user limit path."
+    echo "The account was created in Xray, but the limited path may not be reachable until Nginx is fixed."
+    pause
+  fi
+
   rm -f "$BACKUP"
   xray_usage_remove_user "$TAG" "$USER" >/dev/null 2>&1 || true
+  xray_limit_enforce_now
   LINK="$(xray_link "$PROTO" "$USER" "$VALUE" "$CLIENT_ADDR" "$PATHX" "$CLIENT_HOST" "$CLIENT_SNI" "$ALLOW_INSECURE")"
   LINK80="$(xray_link_80 "$PROTO" "$USER" "$VALUE" "$CLIENT_ADDR" "$PATHX" "$CLIENT_HOST")"
 
@@ -7551,7 +8008,11 @@ create_xray_user(){
   echo "        ${PROTO^^} WS USER CREATED"
   echo "==================================="
   box "Username" "$USER"
-  box "ID/Password" "$VALUE"
+  if [ "$PROTO" = "trojan" ]; then
+    box "Password" "$VALUE"
+  else
+    box "UUID" "$VALUE"
+  fi
   box "Expire" "$EXP"
   box "Quota" "$QUOTA_TEXT"
   box "Users Limit" "$LOGIN_TEXT"
@@ -7569,7 +8030,7 @@ create_xray_user(){
   echo "Ready Link 80 HTTP:"
   echo "$LINK80"
   echo "-----------------------------------"
-  pause
+  pause_wait
 }
 
 delete_xray_user(){
@@ -7827,6 +8288,7 @@ show_xray_traffic_statistics(){
 
 change_xray_user_menu(){
   local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db" ACTION GB MAXLOGIN DAYS EXP QUOTA_TEXT LOGIN_TEXT
+  local LINE VALUE PATHX CANON NEWPATH
   refresh_screen
   select_xray_user "$DBF" "${PROTO^^}" || { pause; return; }
   while true; do
@@ -7847,6 +8309,7 @@ change_xray_user_menu(){
         GB=$((10#$GB))
         [ "$GB" = "0" ] && QUOTA_TEXT="0" || QUOTA_TEXT="${GB}GB"
         xray_db_update_field "$DBF" "$USER" 8 "$QUOTA_TEXT" || { echo "Update failed."; pause; continue; }
+        xray_limit_enforce_now
         echo "Quota changed to $QUOTA_TEXT"; pause
         ;;
       2)
@@ -7855,6 +8318,19 @@ change_xray_user_menu(){
         MAXLOGIN=$((10#$MAXLOGIN))
         [ "$MAXLOGIN" = "0" ] && LOGIN_TEXT="0" || LOGIN_TEXT="$MAXLOGIN"
         xray_db_update_field "$DBF" "$USER" 9 "$LOGIN_TEXT" || { echo "Update failed."; pause; continue; }
+        if [ "$MAXLOGIN" -gt 0 ]; then
+          LINE="$(awk -F'|' -v u="$USER" '$1==u{print;exit}' "$DBF" 2>/dev/null || true)"
+          VALUE="$(printf '%s\n' "$LINE" | awk -F'|' '{print $2}')"
+          PATHX="$(printf '%s\n' "$LINE" | awk -F'|' '{print $6}')"
+          CANON="$(xray_current_path "$TAG" "$(xray_default_path "$TAG")")"
+          if [ -n "$VALUE" ] && { [ -z "$PATHX" ] || [ "$PATHX" = "$CANON" ]; }; then
+            NEWPATH="$(xray_user_limited_path "$CANON" "$USER" "$VALUE")"
+            xray_db_update_field "$DBF" "$USER" 6 "$NEWPATH" >/dev/null 2>&1 || true
+            echo "Limited WS path changed to $NEWPATH"
+          fi
+          refresh_proxy_config_from_current >/dev/null 2>&1 || true
+        fi
+        xray_limit_enforce_now
         echo "Users limit changed to $LOGIN_TEXT"; pause
         ;;
       3)
@@ -7863,6 +8339,7 @@ change_xray_user_menu(){
         DAYS=$((10#$DAYS))
         [ "$DAYS" = "0" ] && EXP="0" || EXP="$(date -d "+$DAYS days" +%Y-%m-%d)"
         xray_db_update_field "$DBF" "$USER" 7 "$EXP" || { echo "Update failed."; pause; continue; }
+        xray_limit_enforce_now
         echo "Expire changed to $EXP"; pause
         ;;
       4) show_xray_user_statistics "$PROTO" "$TAG" ;;
@@ -7909,6 +8386,54 @@ change_xray_path_menu(){
   pause
 }
 
+
+
+reset_xray_user_traffic(){
+  local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db" TMP
+  refresh_screen
+  select_xray_user "$DBF" "${PROTO^^}" || { pause; return; }
+  echo "==================================="
+  echo "        RESET ${PROTO^^} TRAFFIC"
+  echo "==================================="
+  echo "Username: $USER"
+  echo "This resets real Xray saved usage for this user."
+  read -p "Type YES to reset: " CONFIRM
+  [ "$CONFIRM" = "YES" ] || { echo "Cancelled."; pause; return; }
+
+  xray_usage_remove_user "$TAG" "$USER" >/dev/null 2>&1 || true
+  if [ -f "$XDB/disabled.db" ]; then
+    TMP="$(mktemp "$XDB/.disabled-reset.XXXXXX")" || { echo "Reset failed."; pause; return; }
+    awk -F'|' -v t="$TAG" -v u="$USER" '!($1==t && $2==u)' "$XDB/disabled.db" > "$TMP" 2>/dev/null || true
+    chmod 600 "$TMP"
+    mv -f "$TMP" "$XDB/disabled.db"
+  fi
+  xray_stats_sync >/dev/null 2>&1 || true
+  xray_limit_enforce_now
+  echo "Traffic reset for $USER."
+  pause
+}
+
+change_xray_uuid_menu(){
+  local PROTO="$1" TAG="$2" DBF="$XDB/$TAG.db"
+  refresh_screen
+  echo "Current ${PROTO^^} users:"
+  awk -F'|' 'NF{print $1}' "$DBF" 2>/dev/null
+  echo ""
+  read -p "Username: " USER
+  [ -n "$USER" ] || { echo "Invalid user"; pause; return; }
+  grep -q "^${USER}|" "$DBF" || { echo "User not found"; pause; return; }
+  NEW_UUID="$(uuidgen)"
+  TMP="$(mktemp)"
+  awk -F'|' -v u="$USER" -v id="$NEW_UUID" 'BEGIN{OFS="|"}{if($1==u){$2=id}print}' "$DBF" > "$TMP"
+  chmod 600 "$TMP"
+  mv "$TMP" "$DBF"
+  echo "UUID changed successfully"
+  echo "New UUID: $NEW_UUID"
+  xray_restart_safe
+  xray_limit_enforce_now
+  pause
+}
+
 xray_proto_menu(){
   local PROTO="$1" TAG="$2" PATHX="$3" FIELD="$4"
   mkdir -p "$XDB"
@@ -7930,6 +8455,8 @@ xray_proto_menu(){
     echo "[7] Change WebSocket Path"
     echo "[8] ${PROTO^^} User Statistics"
     echo "[9] List Links"
+    echo "[10] Reset User Traffic"
+    echo "[11] Change UUID"
     echo "[0] Back"
     read -p "Select: " x
     case "$x" in
@@ -7941,6 +8468,8 @@ xray_proto_menu(){
       6) xray_quick_user_report "$PROTO" "$TAG" ;;
       7) change_xray_path_menu "$PROTO" "$TAG" "$PATHX" ;;
       8) show_xray_traffic_statistics "$PROTO" "$TAG" ;;
+      10) reset_xray_user_traffic "$PROTO" "$TAG" ;;
+      11) change_xray_uuid_menu "$PROTO" "$TAG" ;;
       9)
         refresh_screen
         while IFS='|' read -r U VALUE P NET DOMAIN PATHX_DB EXP QUOTA LOGIN CREATED CLIENT_HOST CLIENT_SNI ALLOW_INSECURE CLIENT_ADDR REST; do
@@ -8012,19 +8541,20 @@ import base64
 import hashlib
 import hmac
 import os
+import socket
 import struct
 import urllib.parse
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HEADER = 65536
 MAX_FRAME = 1048576
-MAX_CONNECTIONS = 128
+MAX_CONNECTIONS = int(os.environ.get("SULTAN_WS_MAX_CONNECTIONS", "2048"))
 LISTEN_PORT = int(os.environ.get("SULTAN_WS_LISTEN_PORT", "8080"))
 MAP_DIR = "/run/sultan-ws-map"
 semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
 
 async def read_http_header(reader):
-    return await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=8)
+    return await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
 
 def parse_headers(raw):
     lines = raw.decode("latin1", errors="strict").split("\r\n")
@@ -8079,6 +8609,17 @@ def write_port_map(port, ip, ua):
         return None
 
 
+def tune_socket(writer):
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+
+
 async def send_frame(writer, payload, opcode=2):
     length = len(payload)
     first = 0x80 | opcode
@@ -8129,7 +8670,7 @@ async def websocket_to_ssh(client_reader, client_writer, ssh_writer):
 
 async def ssh_to_websocket(ssh_reader, client_writer):
     while True:
-        data = await ssh_reader.read(16384)
+        data = await ssh_reader.read(65536)
         if not data:
             return
         await send_frame(client_writer, data, 2)
@@ -8139,6 +8680,7 @@ async def handle(client_reader, client_writer):
     port_map = None
     try:
         async with semaphore:
+            tune_socket(client_writer)
             raw = await read_http_header(client_reader)
             if len(raw) > MAX_HEADER:
                 raise ValueError("header too large")
@@ -8176,7 +8718,8 @@ async def handle(client_reader, client_writer):
             )
             await client_writer.drain()
 
-            ssh_reader, ssh_writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", 22), timeout=8)
+            ssh_reader, ssh_writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", 22), timeout=2)
+            tune_socket(ssh_writer)
             sock = ssh_writer.get_extra_info("socket")
             if sock is not None:
                 local_port = sock.getsockname()[1]
@@ -8240,6 +8783,7 @@ Wants=ssh.service
 [Service]
 Environment=SULTAN_WS_TOKEN_FILE=/etc/sultan/ws_token
 Environment=SULTAN_WS_LISTEN_PORT=8080
+Environment=SULTAN_WS_MAX_CONNECTIONS=2048
 ExecStart=/usr/local/bin/sultan-ssh-ws
 Restart=always
 RestartSec=2
@@ -8423,10 +8967,33 @@ open_main_ports(){
 
 nginx_xray_alias_locations(){
   local VLESS_PATH="$1" VMESS_PATH="$2" TROJAN_PATH="$3"
-  local FILE="$XDB/preserved-ws-aliases.db" TAG ALIAS CANON PORT
-  [ -s "$FILE" ] || return 0
+  local PRESERVED="$XDB/preserved-ws-aliases.db" TMP TAG ALIAS LOGIN CANON PORT LIMIT_LINE
+  TMP="$(mktemp "$XDB/.nginx-xray-aliases.XXXXXX")" || return 0
 
-  while IFS='|' read -r TAG ALIAS; do
+  # Legacy aliases are preserved without a hard connection limit.
+  if [ -s "$PRESERVED" ]; then
+    awk -F'|' 'NF>=2 && $1!="" && $2!="" {print $1"|"$2"|0"}' "$PRESERVED" >> "$TMP" 2>/dev/null || true
+  fi
+
+  # Current user DB paths. If a user has a numeric login limit, the matching
+  # Nginx exact-location applies that limit to this user's private WS path.
+  for TAG in vless-ws vmess-ws trojan-ws; do
+    DBF="$XDB/$TAG.db"
+    [ -f "$DBF" ] || continue
+    awk -F'|' -v t="$TAG" 'NF>=9 && $6!="" {print t"|"$6"|"$9}' "$DBF" >> "$TMP" 2>/dev/null || true
+  done
+
+  awk -F'|' '
+    function lim(v){ return (v ~ /^[0-9]+$/) ? v+0 : 0 }
+    NF>=2 && $1!="" && $2!="" {
+      key=$1 FS $2
+      v=lim($3)
+      if(!(key in seen) || (v>0 && (best[key]==0 || v<best[key]))){
+        seen[key]=1; tag[key]=$1; alias[key]=$2; best[key]=v
+      }
+    }
+    END{for(k in seen) print tag[k]"|"alias[k]"|"best[k]}
+  ' "$TMP" | sort -u | while IFS='|' read -r TAG ALIAS LOGIN; do
     validate_ws_path "$ALIAS" || continue
     case "$TAG" in
       vless-ws) CANON="$VLESS_PATH"; PORT=10000 ;;
@@ -8435,18 +9002,27 @@ nginx_xray_alias_locations(){
       *) continue ;;
     esac
     [ "$ALIAS" = "$CANON" ] && continue
+    LIMIT_LINE=""
+    if [[ "$LOGIN" =~ ^[0-9]+$ ]] && [ "$LOGIN" -gt 0 ]; then
+      LIMIT_LINE="        limit_conn sultan_v2ray_user $LOGIN;"
+    fi
     cat <<EOF
-    # Preserved legacy V2Ray link path. The client keeps the old path exactly.
+    # Per-user / preserved V2Ray link path. Limited users are blocked here
+    # before the connection reaches Xray.
     location = $ALIAS {
+$LIMIT_LINE
         rewrite ^ $CANON break;
         proxy_pass http://127.0.0.1:$PORT;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 86400;
@@ -8454,7 +9030,8 @@ nginx_xray_alias_locations(){
     }
 
 EOF
-  done < <(sort -u "$FILE")
+  done
+  rm -f "$TMP"
 }
 
 nginx_web_panel_location(){
@@ -8497,6 +9074,14 @@ write_nginx_config(){
   mkdir -p /var/www/sultan-acme /etc/nginx/conf.d
   chmod 755 /var/www/sultan-acme
   cat >/etc/nginx/conf.d/sultan-ready.conf <<EOF
+limit_conn_zone \$request_uri zone=sultan_v2ray_user:20m;
+proxy_connect_timeout 1s;
+proxy_socket_keepalive on;
+proxy_next_upstream off;
+tcp_nodelay on;
+keepalive_timeout 30s;
+
+
 upstream sultan_ssh_ws_backend {
     server 127.0.0.1:8080 max_fails=1 fail_timeout=1s;
     keepalive 32;
@@ -8515,6 +9100,9 @@ server {
     location = $VLESS_PATH {
         proxy_pass http://127.0.0.1:10000;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8530,6 +9118,9 @@ server {
     location = $VMESS_PATH {
         proxy_pass http://127.0.0.1:10085;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8545,6 +9136,9 @@ server {
     location = $TROJAN_PATH {
         proxy_pass http://127.0.0.1:10086;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8570,10 +9164,16 @@ server {
     server_name $D;
     ssl_certificate $CERT;
     ssl_certificate_key $KEY;
+    ssl_session_cache shared:SULTANSSL:20m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets on;
 
     location = $VLESS_PATH {
         proxy_pass http://127.0.0.1:10000;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8589,6 +9189,9 @@ server {
     location = $VMESS_PATH {
         proxy_pass http://127.0.0.1:10085;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8604,6 +9207,9 @@ server {
     location = $TROJAN_PATH {
         proxy_pass http://127.0.0.1:10086;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8623,6 +9229,9 @@ $WEB_PANEL_LOCATION
     location = /sshws-$WS_TOKEN {
         proxy_pass http://sultan_ssh_ws_backend;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8639,6 +9248,9 @@ $WEB_PANEL_LOCATION
         
         proxy_pass http://sultan_ssh_ws_backend;
         proxy_http_version 1.1;
+        proxy_connect_timeout 1s;
+        proxy_socket_keepalive on;
+        tcp_nodelay on;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -8661,25 +9273,27 @@ write_haproxy_config(){
 # SULTAN MANAGED
 global
     daemon
-    maxconn 4096
+    maxconn 65535
+    tune.bufsize 32768
 
 defaults
     mode tcp
-    timeout connect 10s
+    option clitcpka
+    option srvtcpka
+    timeout connect 2s
+    timeout queue 2s
     timeout client 7d
     timeout server 7d
     timeout tunnel 7d
     timeout client-fin 1s
     timeout server-fin 1s
-    option clitcpka
-    option srvtcpka
 
 frontend sultan_tls_443
     bind *:443
     default_backend sultan_nginx_tls
 
 backend sultan_nginx_tls
-    server nginx_tls 127.0.0.1:8443 check
+    server nginx_tls 127.0.0.1:8443 check inter 1s fastinter 500ms rise 1 fall 2
 EOF
 }
 
@@ -8688,7 +9302,7 @@ wait_service_active(){
   local SERVICE="$1" TRY
   for TRY in {1..20}; do
     systemctl is-active --quiet "$SERVICE" 2>/dev/null && return 0
-    sleep 1
+    sleep 0.25
   done
   echo "Service did not become active: $SERVICE"
   systemctl status "$SERVICE" --no-pager 2>/dev/null || true
@@ -8943,7 +9557,7 @@ mandatory_502_preinstall_fix(){
         # Proxy reload was already queued by nginx_haproxy_restart_safe().
         # Queue a diagnostic after logout, without touching this connection.
         defer_command_until_logout "502-postcheck" \
-          "sleep 5; /usr/local/bin/menu --health-check >/var/log/sultan-502-postcheck.log 2>&1 || true" \
+          "sleep 1; /usr/local/bin/menu --health-check >/var/log/sultan-502-postcheck.log 2>&1 || true" \
           || true
         echo ""
         echo "Mandatory direct HTTP 101 checks passed."
@@ -9392,7 +10006,7 @@ v2ray_ws_verify_or_repair(){
 
 full_install_self_test(){
   local D="$1" SERVICE FAILED=0
-  for SERVICE in sultan-ws udp-custom xray nginx haproxy fail2ban sultan-quota.timer sultan-xray-stats.timer; do
+  for SERVICE in sultan-ws udp-custom xray nginx haproxy fail2ban sultan-quota.timer sultan-xray-stats.timer sultan-xray-limit-enforcer.timer; do
     wait_service_active "$SERVICE" || FAILED=1
   done
   if ! systemctl is-active --quiet ssh 2>/dev/null && ! systemctl is-active --quiet sshd 2>/dev/null; then
@@ -10086,13 +10700,13 @@ backup_menu(){
       tar -czf "$BP" \
         /etc/sultan /usr/local/etc/xray /usr/local/bin/menu \
         /usr/local/bin/sultan-ssh-ws /usr/local/bin/sultan-udp-relay \
-        /usr/local/sbin/sultan-login-limit /usr/local/sbin/sultan-quota-sync /usr/local/sbin/sultan-xray-stats-sync /usr/local/sbin/sultan-tunnel-shell \
+        /usr/local/sbin/sultan-login-limit /usr/local/sbin/sultan-quota-sync /usr/local/sbin/sultan-xray-stats-sync /usr/local/sbin/sultan-xray-limit-enforcer /usr/local/sbin/sultan-tunnel-shell \
         /etc/systemd/system/sultan-ws.service /etc/systemd/system/udp-custom.service \
         /etc/systemd/system/sultan-quota.service /etc/systemd/system/sultan-quota.timer \
-        /etc/systemd/system/sultan-xray-stats.service /etc/systemd/system/sultan-xray-stats.timer \
+        /etc/systemd/system/sultan-xray-stats.service /etc/systemd/system/sultan-xray-stats.timer /etc/systemd/system/sultan-xray-limit-enforcer.service /etc/systemd/system/sultan-xray-limit-enforcer.timer \
         /etc/nginx/conf.d/sultan-ready.conf /etc/haproxy/haproxy.cfg \
         /etc/ssh/sshd_config.d/98-sultan-legacy-login.conf /etc/ssh/sshd_config.d/99-sultan-users.conf /etc/fail2ban/jail.d/sultan-sshd.conf \
-        /etc/sysctl.d/99-sultan-bbr.conf 2>/dev/null ||
+        /etc/sysctl.d/99-sultan-bbr.conf /etc/sysctl.d/97-sultan-fast-network.conf 2>/dev/null ||
         { echo "Backup failed."; pause; return; }
       chmod 600 "$BP"
       echo "Backup created: $BP"
@@ -10468,13 +11082,15 @@ remove_script(){
   done < "$TMP_USERS"
   rm -f "$TMP_USERS"
 
-  systemctl disable --now sultan-ws udp-custom sultan-quota.timer sultan-quota.service sultan-xray-stats.timer sultan-xray-stats.service xray 2>/dev/null || true
+  systemctl disable --now sultan-ws udp-custom sultan-quota.timer sultan-quota.service sultan-xray-stats.timer sultan-xray-stats.service sultan-xray-limit-enforcer.timer sultan-xray-limit-enforcer.service xray 2>/dev/null || true
   rm -f /etc/systemd/system/sultan-ws.service
   rm -f /etc/systemd/system/udp-custom.service
   rm -f /etc/systemd/system/sultan-quota.service
   rm -f /etc/systemd/system/sultan-quota.timer
   rm -f /etc/systemd/system/sultan-xray-stats.service
   rm -f /etc/systemd/system/sultan-xray-stats.timer
+  rm -f /etc/systemd/system/sultan-xray-limit-enforcer.service
+  rm -f /etc/systemd/system/sultan-xray-limit-enforcer.timer
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
   rm -rf /etc/systemd/system/xray.service.d
   rm -f /usr/local/bin/xray /usr/local/share/xray/geoip.dat /usr/local/share/xray/geosite.dat
@@ -10484,6 +11100,7 @@ remove_script(){
   rm -f /usr/local/sbin/sultan-login-limit
   rm -f /usr/local/sbin/sultan-quota-sync
   rm -f /usr/local/sbin/sultan-xray-stats-sync
+  rm -f /usr/local/sbin/sultan-xray-limit-enforcer
   rm -f /usr/local/sbin/sultan-tunnel-shell
   sed -i '\|/usr/local/sbin/sultan-tunnel-shell|d' /etc/shells 2>/dev/null || true
   rm -f /etc/systemd/system/user-.slice.d/50-sultan-ipaccounting.conf
@@ -10493,7 +11110,7 @@ remove_script(){
   rm -f /etc/letsencrypt/renewal-hooks/deploy/sultan-reload.sh
   rm -f /etc/fail2ban/jail.d/sultan-sshd.conf
   rm -f /etc/sysctl.d/99-sultan-bbr.conf
-  rm -f /etc/sysctl.d/98-sultan-online-detection.conf
+  rm -f /etc/sysctl.d/98-sultan-online-detection.conf /etc/sysctl.d/97-sultan-fast-network.conf
   sysctl --system >/dev/null 2>&1 || true
   nft delete table inet sultan_quota 2>/dev/null || true
   nft delete table inet sultan_limits 2>/dev/null || true
@@ -10532,9 +11149,10 @@ chmod +x "$PANEL"
 
 echo "[5/6] Enabling services..."
 systemctl daemon-reload
-systemctl enable sultan-quota.timer sultan-xray-stats.timer >/dev/null 2>&1 || true
+systemctl enable sultan-quota.timer sultan-xray-stats.timer sultan-xray-limit-enforcer.timer >/dev/null 2>&1 || true
 systemctl restart sultan-quota.timer
 systemctl restart sultan-xray-stats.timer
+systemctl restart sultan-xray-limit-enforcer.timer
 systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
 systemctl enable nginx haproxy vnstat fail2ban 2>/dev/null || true
 if sshd -t; then
@@ -10573,6 +11191,23 @@ else
 fi
 [ -n "$CURRENT_SSH_IP" ] && fail2ban-client set sshd unbanip "$CURRENT_SSH_IP" >/dev/null 2>&1 || true
 
+cat >/etc/sysctl.d/97-sultan-fast-network.conf <<'EOF'
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=250000
+net.ipv4.tcp_max_syn_backlog=65535
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_keepalive_time=5
+net.ipv4.tcp_keepalive_intvl=2
+net.ipv4.tcp_keepalive_probes=2
+EOF
+sysctl -p /etc/sysctl.d/97-sultan-fast-network.conf >/dev/null 2>&1 || true
+
 modprobe tcp_bbr 2>/dev/null || true
 cat >/etc/sysctl.d/99-sultan-bbr.conf <<'EOF'
 net.core.default_qdisc=fq
@@ -10591,6 +11226,8 @@ EOF
 sysctl -p /etc/sysctl.d/98-sultan-online-detection.conf >/dev/null 2>&1 || true
 
 /usr/local/sbin/sultan-quota-sync || true
+/usr/local/sbin/sultan-xray-stats-sync || true
+/usr/local/sbin/sultan-xray-limit-enforcer || true
 
 echo "[Before V2Ray setup] Checking existing VMess/VLESS/Trojan users..."
 if ! handle_existing_xray_users_before_ready; then
