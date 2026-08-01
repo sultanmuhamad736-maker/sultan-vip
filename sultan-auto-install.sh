@@ -1261,3 +1261,23 @@ fi
 ROLLBACK=0
 trap - ERR INT TERM
 echo "Backup: $BACKUP_DIR"
+
+sudo bash -c 'systemctl stop sultan-tunnel-health.timer udp-custom badvpn-udpgw 2>/dev/null || true; systemctl disable badvpn-udpgw 2>/dev/null || true; pkill -9 -x badvpn-udpgw 2>/dev/null || true; rm -f /etc/systemd/system/udp-custom.service /etc/systemd/system/badvpn-udpgw.service; id badvpn >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin badvpn; cat >/etc/systemd/system/udp-custom.service <<EOF
+[Unit]
+Description=BadVPN UDPGW for SSH games
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 512 --max-connections-for-client 32
+User=badvpn
+Group=badvpn
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload; systemctl enable --now udp-custom; systemctl start sultan-tunnel-health.timer 2>/dev/null || true; sleep 2; echo "STATUS:"; systemctl is-active udp-custom; echo "PORT:"; ss -lntp "sport = :7300"'
