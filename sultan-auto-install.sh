@@ -2,7 +2,7 @@
 # ==========================================================
 # SULTAN VIP AUTO INSTALL — NO PANEL / NO MENU
 # نفس التثبيت التلقائي الموجود في السكربت الأصلي
-# الإضافات المطلوبة فقط: HTTP 200 tunnel + auto-repair + UDPGW
+# الإضافات المطلوبة فقط: HTTP 200 tunnel + auto-repair + Hysteria 2 UDP/QUIC
 # ==========================================================
 
 # Sourcing this installer would apply `set -e` to the parent shell and may
@@ -27,7 +27,7 @@ DB="$BASE/users.db"
 DOMAIN_FILE="$BASE/domain"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 HTTP200_PORT=8080
-UDPGW_VERSION="1.999.130"
+HYSTERIA_PORT="36712"
 
 mkdir -p "$BASE" "$XDB"
 
@@ -374,55 +374,74 @@ EOF
     systemctl restart xray 2>/dev/null || true
 }
 
-install_badvpn_udpgw_binary(){
-    local FOUND WORKDIR ARCHIVE SRC BUILD
+install_hysteria2_binary(){
+    local ARCH DOWNLOAD_ARCH
+    ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+    case "$ARCH" in
+        amd64|x86_64) DOWNLOAD_ARCH="amd64" ;;
+        arm64|aarch64) DOWNLOAD_ARCH="arm64" ;;
+        *) echo "Unsupported Hysteria 2 architecture: $ARCH"; return 1 ;;
+    esac
 
-    FOUND="$(command -v badvpn-udpgw 2>/dev/null || true)"
-    if [ -n "$FOUND" ]; then
-        [ "$FOUND" = "/usr/local/bin/badvpn-udpgw" ] || install -m 0755 "$FOUND" /usr/local/bin/badvpn-udpgw
-        return 0
-    fi
-
-    echo "Building BadVPN UDPGW ${UDPGW_VERSION}..."
-    WORKDIR="$(mktemp -d /tmp/sultan-badvpn.XXXXXX)"
-    ARCHIVE="$WORKDIR/badvpn.tar.gz"
-    curl -fL --retry 3 --connect-timeout 20 \
-        "https://github.com/ambrop72/badvpn/archive/refs/tags/${UDPGW_VERSION}.tar.gz" \
-        -o "$ARCHIVE"
-    tar -xzf "$ARCHIVE" -C "$WORKDIR"
-    SRC="$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d -name 'badvpn-*' | head -n1)"
-    [ -n "$SRC" ] || { rm -rf "$WORKDIR"; return 1; }
-    BUILD="$WORKDIR/build"
-    cmake -S "$SRC" -B "$BUILD" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-        -DBUILD_NOTHING_BY_DEFAULT=1 \
-        -DBUILD_UDPGW=1
-    cmake --build "$BUILD" --parallel "$(nproc)"
-    install -m 0755 "$BUILD/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
-    rm -rf "$WORKDIR"
+    echo "Installing latest official Hysteria 2 binary..."
+    curl -fL --retry 5 --connect-timeout 20 \
+        "https://download.hysteria.network/app/latest/hysteria-linux-${DOWNLOAD_ARCH}" \
+        -o /usr/local/bin/hysteria
+    chmod 0755 /usr/local/bin/hysteria
 }
 
 reinstall_udp(){
+    local D CERT KEY PASSWORD PASSWORD_FILE
     systemctl stop udp-custom 2>/dev/null || true
     systemctl disable udp-custom 2>/dev/null || true
     rm -f /etc/systemd/system/udp-custom.service
 
-    install_badvpn_udpgw_binary
+    install_hysteria2_binary
+    D="$(get_domain)"
+    CERT="$(cert_file_for_domain "$D")"
+    KEY="$(key_file_for_domain "$D")"
+    PASSWORD_FILE="$BASE/hysteria-password"
+    if [ -s "$PASSWORD_FILE" ]; then
+        PASSWORD="$(cat "$PASSWORD_FILE")"
+    else
+        PASSWORD="$(openssl rand -hex 16)"
+        printf '%s\n' "$PASSWORD" >"$PASSWORD_FILE"
+        chmod 600 "$PASSWORD_FILE"
+    fi
+
+    mkdir -p /etc/hysteria
+    cat >/etc/hysteria/config.yaml <<EOF
+listen: :${HYSTERIA_PORT}
+tls:
+  cert: ${CERT}
+  key: ${KEY}
+auth:
+  type: password
+  password: ${PASSWORD}
+disableUDP: false
+udpIdleTimeout: 60s
+masquerade:
+  type: string
+  string:
+    content: SULTAN UDP READY
+    headers:
+      content-type: text/plain
+    statusCode: 200
+EOF
+    chmod 600 /etc/hysteria/config.yaml
 
     cat >/etc/systemd/system/udp-custom.service <<'EOF'
 [Unit]
-Description=BadVPN UDPGW for SSH game UDP
+Description=Hysteria 2 UDP QUIC service
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 512 --max-connections-for-client 32
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=always
 RestartSec=2
-User=nobody
-Group=nogroup
+User=root
 NoNewPrivileges=true
 LimitNOFILE=65535
 
@@ -433,7 +452,6 @@ EOF
     systemctl enable udp-custom
     systemctl restart udp-custom
 }
-
 write_ready_nginx_haproxy(){
     local D="$1"
     local CERT KEY
@@ -614,7 +632,7 @@ if ! probe_http200_tunnel; then
 fi
 
 if ! systemctl is-active --quiet udp-custom 2>/dev/null || \
-   ! ss -H -ltn 'sport = :7300' 2>/dev/null | grep -q .; then
+   ! ss -H -lun 'sport = :36712' 2>/dev/null | grep -q .; then
     systemctl restart udp-custom 2>/dev/null || true
 fi
 
@@ -630,7 +648,7 @@ HEALTH
 
     cat >/etc/systemd/system/sultan-tunnel-health.service <<'EOF'
 [Unit]
-Description=SULTAN HTTP 200 and UDPGW self-repair
+Description=SULTAN HTTP 200 and Hysteria 2 self-repair
 After=network-online.target ssh.service sultan-ws.service udp-custom.service
 
 [Service]
@@ -663,6 +681,221 @@ EOF
     fi
 }
 
+vpn_session_in_use(){
+    if current_session_via_tunnel; then
+        return 0
+    fi
+
+    local REMOTE DEV
+    REMOTE="${SSH_CONNECTION%% *}"
+    [ -n "$REMOTE" ] || return 1
+    DEV="$(ip route get "$REMOTE" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
+    case "$DEV" in
+        wg*|tun*|tap*|ppp*|tailscale*|zt*|ipsec*|vpn*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+full_vpn_cleanup(){
+    local VPN_NAME_RE
+    local UNIT PROC PKG PATH_ITEM CONTAINER_ID NETWORK_NAME
+    local -a FOUND_UNITS INSTALLED_PACKAGES
+    local -a VPN_PACKAGES VPN_PROCESSES VPN_PATHS VPN_BINARIES
+
+    echo "==================================="
+    echo "   CLEANING OLD VPN/PROXY SERVICES"
+    echo "==================================="
+
+    if vpn_session_in_use; then
+        echo -e "${RED}The current SSH session is using a VPN/tunnel interface.${NC}"
+        echo "Reconnect directly to the server SSH port, then run the installer again."
+        echo "Cleanup was cancelled to prevent losing access to the VPS."
+        exit 1
+    fi
+
+    VPN_NAME_RE='(^|[-_.@])(sultan|xray|v2ray|sing-box|singbox|hysteria|trojan|trojan-go|shadowsocks|ss-server|ss-local|ss-redir|ss-tunnel|openvpn|wg-quick|wireguard|strongswan|ipsec|charon|ocserv|softether|vpnserver|vpnbridge|xl2tpd|pptpd|sstp|badvpn|udpgw|udp-custom|slowdns|dnstt|tuic|naiveproxy|naive|brook|gost|tailscale|zerotier|headscale|nebula|stunnel|squid|3proxy|nginx|haproxy|x-ui|3x-ui|s-ui|marzban|hiddify|outline|pivpn|amnezia)([-_.@]|$)'
+
+    mapfile -t FOUND_UNITS < <(
+        systemctl list-unit-files --no-legend 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -Ei "$VPN_NAME_RE" \
+        | sort -u || true
+    )
+
+    for UNIT in "${FOUND_UNITS[@]}"; do
+        [ -n "$UNIT" ] || continue
+        systemctl stop "$UNIT" 2>/dev/null || true
+        systemctl disable "$UNIT" 2>/dev/null || true
+        systemctl unmask "$UNIT" 2>/dev/null || true
+    done
+
+    VPN_PROCESSES=(
+        xray v2ray sing-box hysteria trojan trojan-go
+        ss-server ss-local ss-redir ss-tunnel
+        openvpn wg-quick charon charon-systemd starter stroke
+        ocserv vpnserver vpnbridge xl2tpd pptpd
+        badvpn-udpgw udpgw dnstt-server dnstt-client
+        tuic-server tuic-client naive brook gost
+        tailscaled zerotier-one nebula stunnel4 squid 3proxy
+        x-ui s-ui marzban hiddify-cli
+        sultan-ssh-ws sultan-tunnel-health
+        nginx haproxy
+    )
+    for PROC in "${VPN_PROCESSES[@]}"; do
+        pkill -TERM -x "$PROC" 2>/dev/null || true
+    done
+    sleep 1
+    for PROC in "${VPN_PROCESSES[@]}"; do
+        pkill -KILL -x "$PROC" 2>/dev/null || true
+    done
+
+    if command -v docker >/dev/null 2>&1; then
+        while read -r CONTAINER_ID; do
+            [ -n "$CONTAINER_ID" ] && docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
+        done < <(
+            docker ps -a --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null \
+            | grep -Ei "$VPN_NAME_RE" \
+            | awk '{print $1}' || true
+        )
+        while read -r NETWORK_NAME; do
+            [ -n "$NETWORK_NAME" ] && docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
+        done < <(
+            docker network ls --format '{{.Name}}' 2>/dev/null \
+            | grep -Ei "$VPN_NAME_RE" || true
+        )
+    fi
+
+    if command -v podman >/dev/null 2>&1; then
+        while read -r CONTAINER_ID; do
+            [ -n "$CONTAINER_ID" ] && podman rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
+        done < <(
+            podman ps -a --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null \
+            | grep -Ei "$VPN_NAME_RE" \
+            | awk '{print $1}' || true
+        )
+    fi
+
+    VPN_PACKAGES=(
+        xray v2ray sing-box hysteria trojan trojan-go
+        shadowsocks-libev shadowsocks-rust
+        openvpn openvpn-systemd-resolved
+        wireguard wireguard-tools
+        strongswan strongswan-starter strongswan-swanctl
+        charon-systemd libcharon-extra-plugins
+        ocserv softether-vpnserver
+        xl2tpd pptpd
+        badvpn stunnel4 squid squid-common 3proxy dante-server
+        tailscale zerotier-one
+        nginx nginx-common nginx-core nginx-full nginx-light nginx-extras
+        haproxy
+    )
+    INSTALLED_PACKAGES=()
+    for PKG in "${VPN_PACKAGES[@]}"; do
+        if dpkg-query -W -f='${db:Status-Abbrev}' "$PKG" 2>/dev/null | grep -q '^ii'; then
+            INSTALLED_PACKAGES+=("$PKG")
+        fi
+    done
+    if [ "${#INSTALLED_PACKAGES[@]}" -gt 0 ]; then
+        apt-get purge -y "${INSTALLED_PACKAGES[@]}" || true
+    fi
+
+    if command -v snap >/dev/null 2>&1; then
+        while read -r PKG; do
+            [ -n "$PKG" ] && snap remove --purge "$PKG" >/dev/null 2>&1 || true
+        done < <(
+            snap list 2>/dev/null \
+            | awk 'NR>1 {print $1}' \
+            | grep -Ei "$VPN_NAME_RE" || true
+        )
+    fi
+
+    VPN_PATHS=(
+        /etc/sultan
+        /etc/xray /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+        /etc/v2ray /usr/local/etc/v2ray /usr/local/share/v2ray /var/log/v2ray
+        /etc/sing-box /var/lib/sing-box /var/log/sing-box
+        /etc/hysteria /var/lib/hysteria /var/log/hysteria
+        /etc/trojan /etc/trojan-go /var/log/trojan
+        /etc/shadowsocks /etc/shadowsocks-libev /var/log/shadowsocks
+        /etc/openvpn /var/log/openvpn
+        /etc/wireguard
+        /etc/strongswan.d /etc/ipsec.d
+        /etc/ocserv
+        /etc/softether /usr/local/vpnserver /opt/softether-vpnserver
+        /etc/xl2tpd /etc/ppp
+        /etc/badvpn
+        /etc/slowdns /etc/dnstt
+        /etc/tuic
+        /etc/naiveproxy /etc/naive
+        /etc/brook
+        /etc/gost
+        /etc/tailscale /var/lib/tailscale
+        /var/lib/zerotier-one
+        /etc/headscale /var/lib/headscale
+        /etc/nebula
+        /etc/stunnel
+        /etc/squid /var/spool/squid /var/log/squid
+        /etc/3proxy /var/log/3proxy
+        /etc/x-ui /usr/local/x-ui
+        /etc/3x-ui /usr/local/3x-ui
+        /etc/s-ui /usr/local/s-ui
+        /etc/marzban /opt/marzban /var/lib/marzban
+        /etc/hiddify /opt/hiddify-manager /opt/hiddify-config
+        /etc/outline /opt/outline
+        /etc/pivpn /opt/pivpn
+        /etc/amnezia /opt/amnezia
+        /etc/nginx /var/lib/nginx /var/log/nginx
+        /etc/haproxy /var/lib/haproxy /var/log/haproxy
+    )
+    for PATH_ITEM in "${VPN_PATHS[@]}"; do
+        rm -rf -- "$PATH_ITEM"
+    done
+
+    VPN_BINARIES=(
+        /usr/local/bin/xray /usr/bin/xray
+        /usr/local/bin/v2ray /usr/bin/v2ray
+        /usr/local/bin/sing-box /usr/bin/sing-box
+        /usr/local/bin/hysteria /usr/bin/hysteria
+        /usr/local/bin/trojan /usr/local/bin/trojan-go
+        /usr/local/bin/tuic-server /usr/local/bin/tuic-client
+        /usr/local/bin/naive /usr/local/bin/brook /usr/local/bin/gost
+        /usr/local/bin/badvpn-udpgw /usr/bin/badvpn-udpgw
+        /usr/local/bin/dnstt-server /usr/local/bin/dnstt-client
+        /usr/local/bin/sultan-ssh-ws
+        /usr/local/sbin/sultan-tunnel-health
+        /usr/bin/x-ui /usr/bin/s-ui
+    )
+    rm -f -- "${VPN_BINARIES[@]}"
+
+    for PATH_ITEM in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+        [ -d "$PATH_ITEM" ] || continue
+        while IFS= read -r -d '' UNIT; do
+            if [[ "$(basename "$UNIT")" =~ $VPN_NAME_RE ]]; then
+                rm -f -- "$UNIT"
+            fi
+        done < <(find "$PATH_ITEM" -maxdepth 3 \( -type f -o -type l \) -print0 2>/dev/null)
+    done
+
+    for PATH_ITEM in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+        [ -d "$PATH_ITEM" ] || continue
+        while IFS= read -r -d '' UNIT; do
+            if [[ "$(basename "$UNIT")" =~ $VPN_NAME_RE ]]; then
+                rm -f -- "$UNIT"
+            fi
+        done < <(find "$PATH_ITEM" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+    done
+
+    rm -f /etc/rc.local.d/*xray* /etc/rc.local.d/*v2ray* \
+          /etc/rc.local.d/*hysteria* /etc/rc.local.d/*vpn* 2>/dev/null || true
+
+    systemctl daemon-reload
+    systemctl reset-failed 2>/dev/null || true
+    mkdir -p "$BASE" "$XDB"
+
+    echo -e "${GREEN}Old VPN/proxy services and their files were removed.${NC}"
+    echo "SSH, the current SSH port, firewall rules and the base network configuration were preserved."
+}
+
 enable_bbr(){
     grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
     grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
@@ -680,7 +913,7 @@ show_payloads(){
     box "Port TLS" "443"
     box "SSH WS Path" "/"
     box "HTTP 200 Port" "8080 (TLS OFF)"
-    box "UDPGW" "127.0.0.1:7300 via SSH"
+    box "Hysteria 2" "$D:${HYSTERIA_PORT}/UDP"
     box "VLESS XHTTP" "/vless-xhttp"
     box "VMESS XHTTP" "/vmess-xhttp"
     box "TROJAN XHTTP" "/trojan-xhttp"
@@ -692,7 +925,7 @@ show_payloads(){
     echo "GET /ssh200 HTTP/1.1[crlf]Host: $D[crlf]Connection: keep-alive[crlf][crlf]"
     echo "Expected Response: HTTP/1.1 200 OK"
     echo ""
-    echo "For game UDP, enable UDPGW in the client: 127.0.0.1:7300"
+    echo "Hysteria 2: $D:${HYSTERIA_PORT}/UDP  Password: $(cat "$BASE/hysteria-password" 2>/dev/null || echo Not-Set)"
     echo "VLESS  XHTTP: $D:443  TLS ON  SNI $D  Path /vless-xhttp"
     echo "VMESS  XHTTP: $D:443  TLS ON  SNI $D  Path /vmess-xhttp"
     echo "TROJAN XHTTP: $D:443  TLS ON  SNI $D  Path /trojan-xhttp"
@@ -709,7 +942,7 @@ show_status(){
     printf "%-16s : [ %s ]\n" "VMESS" "$(svc xray)"
     printf "%-16s : [ %s ]\n" "VLESS" "$(svc xray)"
     printf "%-16s : [ %s ]\n" "TROJAN" "$(svc xray)"
-    printf "%-16s : [ %s ]\n" "UDP Custom" "$(svc udp-custom)"
+    printf "%-16s : [ %s ]\n" "Hysteria 2" "$(svc udp-custom)"
     if current_session_via_tunnel; then
         printf "%-16s : [ DEFERRED ]\n" "Auto Repair"
     else
@@ -756,6 +989,8 @@ setup_ready_ssl_ws_xhttp(){
         exit 1
     fi
 
+    full_vpn_cleanup
+
     echo "$D" > "$DOMAIN_FILE"
 
     SERVER_IP="$(get_ip)"
@@ -765,7 +1000,7 @@ setup_ready_ssl_ws_xhttp(){
 
     echo "[1/8] Installing required packages..."
     apt update -y
-    apt install -y curl wget nginx haproxy openssh-server python3 certbot ufw socat jq uuid-runtime psmisc openssl ca-certificates dnsutils iproute2 tar gzip lsb-release bc vnstat fail2ban speedtest-cli build-essential cmake
+    apt install -y curl wget nginx haproxy openssh-server python3 certbot ufw socat jq uuid-runtime psmisc openssl ca-certificates dnsutils iproute2 tar gzip lsb-release bc vnstat fail2ban speedtest-cli
 
     echo "[2/8] Enabling SSH, Fail2Ban, vnStat and BBR..."
     systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
@@ -781,6 +1016,7 @@ setup_ready_ssl_ws_xhttp(){
     ufw allow 22/tcp 2>/dev/null || true
     ufw allow 80/tcp 2>/dev/null || true
     ufw allow 443/tcp 2>/dev/null || true
+    ufw allow "${HYSTERIA_PORT}/udp" 2>/dev/null || true
     ufw allow 8080/tcp 2>/dev/null || true
     ufw --force enable 2>/dev/null || true
 
@@ -813,7 +1049,7 @@ setup_ready_ssl_ws_xhttp(){
     install_xray_core_auto
     write_ready_xray_config
 
-    echo "[7/8] Installing UDPGW for game UDP..."
+    echo "[7/8] Installing Hysteria 2 UDP/QUIC..."
     reinstall_udp
 
     echo "[8/8] Configuring Nginx and HAProxy..."
@@ -830,7 +1066,7 @@ setup_ready_ssl_ws_xhttp(){
     if current_session_via_tunnel; then
         echo "Live tunnel health check is deferred until logout to keep this VPS session connected."
     elif ! /usr/local/sbin/sultan-tunnel-health; then
-        echo -e "${RED}HTTP 200/UDPGW automatic repair did not pass. Check: journalctl -u sultan-tunnel-health --no-pager${NC}"
+        echo -e "${RED}HTTP 200/Hysteria 2 automatic repair did not pass. Check: journalctl -u sultan-tunnel-health --no-pager${NC}"
         exit 1
     fi
 
@@ -838,7 +1074,7 @@ setup_ready_ssl_ws_xhttp(){
     show_payloads
 
     echo "===== PORTS ====="
-    ss -tulpn | grep -E ':22|:80|:443|:7300|:8080|:8443|:10000|:10085|:10086' || true
+    ss -tulpn | grep -E ':22|:80|:443|:36712|:8080|:8443|:10000|:10085|:10086' || true
 }
 
 echo "==========================================="
@@ -1193,7 +1429,7 @@ if ! probe_ws101_tunnel; then
 fi
 
 if ! systemctl is-active --quiet udp-custom 2>/dev/null || \
-   ! ss -H -ltn 'sport = :7300' 2>/dev/null | grep -q .; then
+   ! ss -H -lun 'sport = :36712' 2>/dev/null | grep -q .; then
     systemctl restart udp-custom 2>/dev/null || true
 fi
 
@@ -1210,7 +1446,7 @@ chmod 700 "$HEALTH_FILE"
 
 if [ -f "$HEALTH_SERVICE" ]; then
     sed -i \
-        's/^Description=.*/Description=SULTAN WebSocket 101 and UDPGW self-repair/' \
+        's/^Description=.*/Description=SULTAN WebSocket 101 and Hysteria 2 self-repair/' \
         "$HEALTH_SERVICE"
 fi
 
@@ -1262,16 +1498,15 @@ ROLLBACK=0
 trap - ERR INT TERM
 echo "Backup: $BACKUP_DIR"
 
-sudo bash -c 'systemctl stop sultan-tunnel-health.timer udp-custom badvpn-udpgw 2>/dev/null || true; systemctl disable badvpn-udpgw 2>/dev/null || true; pkill -9 -x badvpn-udpgw 2>/dev/null || true; rm -f /etc/systemd/system/udp-custom.service /etc/systemd/system/badvpn-udpgw.service; id badvpn >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin badvpn; cat >/etc/systemd/system/udp-custom.service <<EOF
+sudo bash -c 'systemctl stop sultan-tunnel-health.timer udp-custom 2>/dev/null || true; pkill -9 -x hysteria 2>/dev/null || true; cat >/etc/systemd/system/udp-custom.service <<EOF
 [Unit]
-Description=BadVPN UDPGW for SSH games
+Description=Hysteria 2 UDP QUIC service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 512 --max-connections-for-client 32
-User=badvpn
-Group=badvpn
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+User=root
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
@@ -1280,4 +1515,4 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload; systemctl enable --now udp-custom; systemctl start sultan-tunnel-health.timer 2>/dev/null || true; sleep 2; echo "STATUS:"; systemctl is-active udp-custom; echo "PORT:"; ss -lntp "sport = :7300"'
+systemctl daemon-reload; systemctl enable --now udp-custom; systemctl start sultan-tunnel-health.timer 2>/dev/null || true; sleep 2; echo "STATUS:"; systemctl is-active udp-custom; echo "PORT:"; ss -lunp "sport = :36712"'
