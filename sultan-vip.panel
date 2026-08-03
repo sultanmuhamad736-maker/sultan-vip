@@ -1,8 +1,8 @@
-#!/bin/bash
+ب٤#!/bin/bash
 # ==========================================================
 # SULTAN VIP FULL PURPLE MENU INSTALL
 # Full verified installer + full panel + SSL/TLS/SNI/WS/V2Ray WebSocket
-# Build: v33-VMESS-LINK V33-BASE + REAL-VMESS-LINK-MENU + REAL-PER-USER-LOGIN-STATS + LIVE-PRESERVED-XRAY + ORDERED-ONLINE-USERS + EXACT-N-LIVE-LINKS + LIVE-ONLINE-DECREMENT
+# Build: v35-STABLE-ENTER-MENU-SAFE-MINI  V33-BASE + REAL-VMESS-LINK-MENU + REAL-PER-USER-LOGIN-STATS + LIVE-PRESERVED-XRAY + ORDERED-ONLINE-USERS + EXACT-N-LIVE-LINKS + LIVE-ONLINE-DECREMENT
 # Integrated real SSH login limit + per-user GB quota
 # Quick reports show current/peak logins for the selected account, not server-wide totals.
 # 0 Max Login = Unlimited
@@ -26,6 +26,17 @@ if [ "$(id -u)" != "0" ]; then
   echo "Run as root."
   exit 1
 fi
+
+# Keep a persistent installation log without changing interactive input.
+# Prompts still read directly from /dev/tty.
+mkdir -p /var/log
+SULTAN_INSTALL_LOG="/var/log/sultan-vip-install.log"
+touch "$SULTAN_INSTALL_LOG"
+chmod 600 "$SULTAN_INSTALL_LOG" 2>/dev/null || true
+exec > >(tee -a "$SULTAN_INSTALL_LOG") 2>&1
+printf '
+===== SULTAN install started: %s =====
+' "$(date -Is 2>/dev/null || date)"
 
 BASE="/etc/sultan"
 XDB="$BASE/xray"
@@ -103,72 +114,257 @@ for LEGACY_XRAY_DB in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db";
   [ -f "$LEGACY_XRAY_DB" ] && normalize_limit_fields_zero "$LEGACY_XRAY_DB" 7 8 9
 done
 
-echo "==========================================="
-echo "        SULTAN VIP FULL PURPLE MENU INSTALL"
-echo "==========================================="
-echo "[1/6] Installing required packages..."
+# Discard keystrokes entered before a prompt becomes visible. This prevents a
+# fast/double Enter on mobile SSH clients from accepting the next prompt.
+drain_pending_tty_input(){
+  [ -r /dev/tty ] || return 0
+  while IFS= read -r -s -n 1 -t 0.03 _ch < /dev/tty; do :; done
+  return 0
+}
 
-if [ ! -r /etc/os-release ]; then
-  echo "Unsupported system: /etc/os-release is missing."
-  exit 1
-fi
-. /etc/os-release
-case "${ID:-}" in
-  debian|ubuntu) ;;
-  *)
-    echo "Unsupported system: ${PRETTY_NAME:-unknown}. Use Debian or Ubuntu."
-    exit 1
-    ;;
-esac
-
-apt_retry(){
-  local TRY
-  for TRY in 1 2 3; do
-    if apt-get "$@"; then
-      return 0
-    fi
-    echo "APT attempt $TRY failed; retrying..."
-    sleep $((TRY * 3))
+# Return the original account that owns this SSH login when root was reached
+# through sudo/su. The active management account must never be killed during
+# the pre-install user cleanup.
+current_login_account(){
+  local CANDIDATE UIDN
+  for CANDIDATE in "${SUDO_USER:-}" "$(logname 2>/dev/null || true)" "$(who am i 2>/dev/null | awk '{print $1}')"; do
+    [ -n "$CANDIDATE" ] || continue
+    [ "$CANDIDATE" != "root" ] || continue
+    UIDN="$(id -u "$CANDIDATE" 2>/dev/null || true)"
+    [[ "$UIDN" =~ ^[0-9]+$ ]] || continue
+    [ "$UIDN" -ge 1000 ] || continue
+    printf '%s\n' "$CANDIDATE"
+    return 0
   done
   return 1
 }
 
-apt_retry update
-apt_retry install -y curl wget nginx haproxy openssh-server python3 \
-  certbot python3-certbot-nginx ufw socat lsb-release bc jq uuid-runtime vnstat \
-  fail2ban openssl speedtest-cli dnsutils iproute2 tar gzip ca-certificates psmisc \
-  nftables procps gawk util-linux coreutils grep sed findutils passwd login
-apt_retry install -y unzip
+current_sshd_pid_installer(){
+  local P="${PPID:-0}" C NEXT I
+  for I in {1..40}; do
+    [[ "$P" =~ ^[0-9]+$ ]] || return 1
+    [ "$P" -gt 1 ] || return 1
+    C="$(cat "/proc/$P/comm" 2>/dev/null || true)"
+    if [ "$C" = "sshd" ]; then
+      printf '%s\n' "$P"
+      return 0
+    fi
+    NEXT="$(awk '{print $4}' "/proc/$P/stat" 2>/dev/null || true)"
+    [ -n "$NEXT" ] && [ "$NEXT" != "$P" ] || return 1
+    P="$NEXT"
+  done
+  return 1
+}
 
-for CMD in curl nginx haproxy sshd python3 certbot ufw jq nft flock openssl systemctl; do
-  command -v "$CMD" >/dev/null 2>&1 || {
-    echo "Required command was not installed: $CMD"
-    exit 1
-  }
-done
+current_session_transport_sensitive(){
+  local REMOTE LOCAL_PORT DEV SSH_PORTS
+  REMOTE="${SSH_CONNECTION%% *}"
+  LOCAL_PORT="${SSH_CONNECTION##* }"
+  case "$REMOTE" in
+    127.0.0.1|::1|localhost) return 0 ;;
+  esac
+  case "$LOCAL_PORT" in
+    80|443|8080|8443|2095|2096) return 0 ;;
+  esac
+  if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]]; then
+    SSH_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u || true)"
+    if [ -n "$SSH_PORTS" ] && ! printf '%s\n' "$SSH_PORTS" | grep -qx "$LOCAL_PORT"; then
+      return 0
+    fi
+  fi
+  if [ -n "$REMOTE" ]; then
+    DEV="$(ip route get "$REMOTE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    case "$DEV" in
+      wg*|tun*|tap*|ppp*|tailscale*|zt*|ipsec*|vpn*) return 0 ;;
+    esac
+  fi
+  return 1
+}
 
-# Ask once before the final installation stage about existing normal users.
-# y deletes them; n keeps them exactly as system accounts and imports them into
-# the SULTAN SSH users database. Xray users and all other installer features are untouched.
-handle_existing_users_before_final(){
-  local USERS_FILE ANSWER U OLD_LINE OLD_PASS OLD_EXP OLD_QUOTA OLD_LOGIN
+# Keep install-mini.sh in the chain, but make its child auto-installer safe when
+# it is called from the full panel installer.
+run_install_mini_chained_safely(){
+  local TMPDIR MINI AUTO STATUS
+  TMPDIR="$(mktemp -d /tmp/sultan-mini-safe.XXXXXX)" || return 1
+  MINI="$TMPDIR/install-mini.sh"
+  AUTO="$TMPDIR/sultan-auto-install.sh"
+
+  curl -fsSL --retry 3 --connect-timeout 20 \
+    https://raw.githubusercontent.com/sultanmuhamad736-maker/sultan-vip/main/install-mini.sh \
+    -o "$MINI" || { rm -rf "$TMPDIR"; return 1; }
+  curl -fsSL --retry 3 --connect-timeout 20 \
+    https://raw.githubusercontent.com/sultanmuhamad736-maker/sultan-vip/main/sultan-auto-install.sh \
+    -o "$AUTO" || { rm -rf "$TMPDIR"; return 1; }
+
+  if ! python3 - "$AUTO" <<'PYSAFE'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+s = path.read_text()
+
+old_func = r'''current_session_via_tunnel(){
+    local REMOTE="${SSH_CONNECTION%% *}"
+    case "$REMOTE" in
+        127.0.0.1|::1|localhost) return 0 ;;
+        *) return 1 ;;
+    esac
+}'''
+new_func = r'''current_session_via_tunnel(){
+    local REMOTE LOCAL_PORT DEV SSH_PORTS
+    REMOTE="${SSH_CONNECTION%% *}"
+    LOCAL_PORT="${SSH_CONNECTION##* }"
+    case "$REMOTE" in
+        127.0.0.1|::1|localhost) return 0 ;;
+    esac
+    case "$LOCAL_PORT" in
+        80|443|8080|8443|2095|2096) return 0 ;;
+    esac
+    if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]]; then
+        SSH_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u || true)"
+        if [ -n "$SSH_PORTS" ] && ! printf '%s\\n' "$SSH_PORTS" | grep -qx "$LOCAL_PORT"; then
+            return 0
+        fi
+    fi
+    if [ -n "$REMOTE" ]; then
+        DEV="$(ip route get "$REMOTE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+        case "$DEV" in
+            wg*|tun*|tap*|ppp*|tailscale*|zt*|ipsec*|vpn*) return 0 ;;
+        esac
+    fi
+    return 1
+}'''
+if old_func not in s:
+    raise SystemExit('install-mini child: tunnel detector not found')
+s = s.replace(old_func, new_func, 1)
+
+old_cleanup = '    full_vpn_cleanup\n'
+new_cleanup = '''    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ]; then
+        echo "Chained mode: preserving the installed panel, users and live SSH transport."
+    else
+        full_vpn_cleanup
+    fi
+'''
+if old_cleanup not in s:
+    raise SystemExit('install-mini child: cleanup call not found')
+s = s.replace(old_cleanup, new_cleanup, 1)
+
+old_via = '''REMOTE_IP="${SSH_CONNECTION%% *}"
+VIA_TUNNEL=0
+case "$REMOTE_IP" in
+    127.0.0.1|::1|localhost) VIA_TUNNEL=1 ;;
+esac'''
+new_via = '''REMOTE_IP="${SSH_CONNECTION%% *}"
+VIA_TUNNEL=0
+current_session_via_tunnel && VIA_TUNNEL=1'''
+if old_via not in s:
+    raise SystemExit('install-mini child: second tunnel detector not found')
+s = s.replace(old_via, new_via, 1)
+
+s = s.replace("sudo bash -c '", "bash -c '", 1)
+
+# In chained mode, install-mini remains fully invoked, but it must not erase the
+# full panel's live Xray users/configuration or replace its Nginx/HAProxy layout.
+old_stage6 = '''    echo "[6/8] Installing Xray and XHTTP configuration..."
+    install_xray_core_auto
+    write_ready_xray_config
+'''
+new_stage6 = '''    echo "[6/8] Installing Xray support..."
+    install_xray_core_auto
+    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ] && [ -s "$XRAY_CONFIG" ]; then
+        echo "Chained mode: preserving the full panel Xray configuration and users."
+    else
+        write_ready_xray_config
+    fi
+'''
+if old_stage6 not in s:
+    raise SystemExit('install-mini child: Xray stage not found')
+s = s.replace(old_stage6, new_stage6, 1)
+
+old_stage8 = '''    echo "[8/8] Configuring Nginx and HAProxy..."
+    write_ready_nginx_haproxy "$D"
+    install_tunnel_autorepair
+'''
+new_stage8 = '''    echo "[8/8] Configuring Nginx and HAProxy..."
+    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ]; then
+        echo "Chained mode: preserving the full panel Nginx/HAProxy configuration."
+        nginx -t
+        haproxy -c -f /etc/haproxy/haproxy.cfg
+    else
+        write_ready_nginx_haproxy "$D"
+    fi
+    install_tunnel_autorepair
+'''
+if old_stage8 not in s:
+    raise SystemExit('install-mini child: proxy stage not found')
+s = s.replace(old_stage8, new_stage8, 1)
+
+old_xray_restart = '''    activate_sultan_ws_safely
+    systemctl restart xray 2>/dev/null || true
+    systemctl restart udp-custom 2>/dev/null || true
+'''
+new_xray_restart = '''    activate_sultan_ws_safely
+    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ]; then
+        echo "Chained mode: Xray service was left on the full panel configuration."
+    elif current_session_via_tunnel; then
+        defer_command_until_logout "xray-restart" "systemctl restart xray" || true
+        echo "Xray restart was deferred until logout to protect this SSH session."
+    else
+        systemctl restart xray 2>/dev/null || true
+    fi
+    systemctl restart udp-custom 2>/dev/null || true
+'''
+if old_xray_restart not in s:
+    raise SystemExit('install-mini child: Xray restart stage not found')
+s = s.replace(old_xray_restart, new_xray_restart, 1)
+
+path.write_text(s)
+PYSAFE
+  then
+    rm -rf "$TMPDIR"
+    return 1
+  fi
+
+  sed -i "s#^SCRIPT_URL=.*#SCRIPT_URL=\"file://$AUTO\"#" "$MINI"
+  chmod 700 "$MINI" "$AUTO"
+  if ! bash -n "$MINI" || ! bash -n "$AUTO"; then
+    echo "Downloaded install-mini scripts failed syntax validation."
+    rm -rf "$TMPDIR"
+    return 1
+  fi
+  STATUS=0
+  SULTAN_MINI_CHAINED=1 bash "$MINI" || STATUS=$?
+  rm -rf "$TMPDIR"
+  return "$STATUS"
+}
+
+# Ask once before any package/service installation about all existing users.
+# y deletes all SSH and V2Ray users; n preserves/imports all SSH and V2Ray users.
+SULTAN_EXISTING_USERS_ACTION=""
+handle_existing_users_before_install(){
+  local USERS_FILE DELETED_USERS_FILE ANSWER U UIDN OLD_LINE OLD_PASS OLD_EXP OLD_QUOTA OLD_LOGIN
   local SHADOW_EXPIRE EXP TMP TMP2 FILE IMPORTED=0 DELETED=0 FAILED=0
-  local SSH_CHECK_MARK="$BASE/.ssh-users-check-done"
+  local PROTECTED_USER=""
+  local SSH_CHECK_MARK="$BASE/.ssh-users-preinstall-check-done"
 
   USERS_FILE="$(mktemp "$BASE/.existing-users.XXXXXX")" || return 1
-  awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd | sort -u > "$USERS_FILE"
-
-  # If the check was completed before and there are no normal SSH users left,
-  # skip silently. If users still exist, DO NOT skip; ask again and delete/import for real.
-  if [ -f "$SSH_CHECK_MARK" ] && [ ! -s "$USERS_FILE" ]; then
-    rm -f "$USERS_FILE"
-    return 0
+  {
+    awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd
+    awk -F'|' 'NF && $1!="" && $1!="root" && $1!="nobody"{print $1}' "$DB" 2>/dev/null || true
+  } | awk 'NF && !seen[$0]++' | sort -u > "$USERS_FILE"
+  PROTECTED_USER="$(current_login_account || true)"
+  if [ -n "$PROTECTED_USER" ] && grep -Fxq "$PROTECTED_USER" "$USERS_FILE"; then
+    sed -i "\|^${PROTECTED_USER}$|d" "$USERS_FILE"
   fi
 
   echo "==========================================="
   echo "[Existing SSH users check]"
   echo "Command: awk -F: '\''$3>=1000 && $1!=\"nobody\"{print $1}'\'' /etc/passwd"
   echo "-------------------------------------------"
+  if [ -n "$PROTECTED_USER" ]; then
+    echo "Protected active SSH account (not deleted): $PROTECTED_USER"
+    echo "-------------------------------------------"
+  fi
   if [ -s "$USERS_FILE" ]; then
     cat "$USERS_FILE"
   else
@@ -176,19 +372,16 @@ handle_existing_users_before_final(){
   fi
   echo "==========================================="
 
-  if [ ! -s "$USERS_FILE" ]; then
-    : > "$SSH_CHECK_MARK"
-    chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
-    rm -f "$USERS_FILE"
-    return 0
-  fi
+  echo "y = delete all existing SSH and V2Ray users"
+  echo "n = preserve/import all existing SSH and V2Ray users"
 
   while true; do
     if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-      printf 'Are you sure you want to delete these users? (y/n): ' > /dev/tty
+      drain_pending_tty_input
+      printf 'Delete all existing SSH and V2Ray users? (y/n): ' > /dev/tty
       IFS= read -r ANSWER < /dev/tty || ANSWER=""
     else
-      printf 'Are you sure you want to delete these users? (y/n): '
+      printf 'Delete all existing SSH and V2Ray users? (y/n): '
       IFS= read -r ANSWER || ANSWER=""
     fi
 
@@ -196,27 +389,34 @@ handle_existing_users_before_final(){
       y|Y)
         DELETED=0
         FAILED=0
+        DELETED_USERS_FILE="$(mktemp "$BASE/.deleted-users.XXXXXX")" || { rm -f "$USERS_FILE"; return 1; }
         while IFS= read -r U; do
           [ -n "$U" ] || continue
-          id "$U" >/dev/null 2>&1 || continue
+
+          if ! id "$U" >/dev/null 2>&1; then
+            echo "Removed stale SSH record: $U"
+            printf '%s\n' "$U" >> "$DELETED_USERS_FILE"
+            DELETED=$((DELETED + 1))
+            continue
+          fi
 
           echo "Deleting SSH user: $U"
+          UIDN="$(id -u "$U" 2>/dev/null || true)"
           loginctl terminate-user "$U" >/dev/null 2>&1 || true
+          loginctl disable-linger "$U" >/dev/null 2>&1 || true
+          [ -n "$UIDN" ] && systemctl stop "user-${UIDN}.slice" >/dev/null 2>&1 || true
           pkill -KILL -u "$U" >/dev/null 2>&1 || true
-          rm -rf "/run/sultan-login-slots/$U" "/run/user/$(id -u "$U" 2>/dev/null || echo 0)" 2>/dev/null || true
+          rm -rf "/run/sultan-login-slots/$U" "/run/user/${UIDN:-0}" 2>/dev/null || true
           crontab -r -u "$U" >/dev/null 2>&1 || true
           passwd -l "$U" >/dev/null 2>&1 || true
 
-          userdel -f -r "$U" >/dev/null 2>&1 || userdel -r "$U" >/dev/null 2>&1 || true
-
-          # If userdel failed because of a corrupted/locked account state, remove
-          # the account records as a last-resort cleanup. The username comes from
-          # /etc/passwd UID>=1000 and is filtered before use.
-          if id "$U" >/dev/null 2>&1; then
-            if [[ "$U" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]]; then
-              sed -i "/^${U}:/d" /etc/passwd /etc/shadow /etc/group /etc/gshadow 2>/dev/null || true
-              rm -rf "/home/$U" "/var/mail/$U" "/var/spool/mail/$U" 2>/dev/null || true
-            fi
+          # Delete through account-management tools only. Never edit
+          # /etc/passwd, /etc/shadow or group databases with sed.
+          if ! userdel -f -r "$U" >/dev/null 2>&1; then
+            userdel -r "$U" >/dev/null 2>&1 || true
+          fi
+          if id "$U" >/dev/null 2>&1 && command -v deluser >/dev/null 2>&1; then
+            deluser --remove-home "$U" >/dev/null 2>&1 || true
           fi
 
           if id "$U" >/dev/null 2>&1; then
@@ -224,38 +424,42 @@ handle_existing_users_before_final(){
             FAILED=$((FAILED + 1))
           else
             echo "Deleted SSH user: $U"
+            printf '%s\n' "$U" >> "$DELETED_USERS_FILE"
             DELETED=$((DELETED + 1))
           fi
         done < "$USERS_FILE"
 
-        # Remove only the requested SSH names from SULTAN records, allowing those
-        # usernames to be created again later without stale database entries.
-        for FILE in "$DB" \
-                    "$LIMIT_DIR/usage.db" \
-                    "$LIMIT_DIR/blocked.db" \
-                    "$LIMIT_DIR/quota-locked.db" \
-                    "$LIMIT_DIR/devices.db" \
-                    "$LIMIT_DIR/device_sessions.log" \
-                    "$LIMIT_DIR/device_usage.db"; do
-          [ -f "$FILE" ] || continue
-          TMP="$(mktemp "${FILE}.cleanup.XXXXXX")" || { rm -f "$USERS_FILE"; return 1; }
-          awk -F'|' 'NR==FNR{drop[$1]=1;next} !($1 in drop)' "$USERS_FILE" "$FILE" > "$TMP" || {
-            rm -f "$TMP" "$USERS_FILE"
-            return 1
-          }
-          chmod 600 "$TMP"
-          mv -f "$TMP" "$FILE"
-        done
+        # Remove records only for users that were really deleted. A failed
+        # system-account deletion must never leave a hidden account outside the panel.
+        if [ -s "$DELETED_USERS_FILE" ]; then
+          for FILE in "$DB" \
+                      "$LIMIT_DIR/usage.db" \
+                      "$LIMIT_DIR/blocked.db" \
+                      "$LIMIT_DIR/quota-locked.db" \
+                      "$LIMIT_DIR/devices.db" \
+                      "$LIMIT_DIR/device_sessions.log" \
+                      "$LIMIT_DIR/device_usage.db"; do
+            [ -f "$FILE" ] || continue
+            TMP="$(mktemp "${FILE}.cleanup.XXXXXX")" || { rm -f "$USERS_FILE" "$DELETED_USERS_FILE"; return 1; }
+            awk -F'|' 'FILENAME==ARGV[1]{drop[$1]=1;next} !($1 in drop)' "$DELETED_USERS_FILE" "$FILE" > "$TMP" || {
+              rm -f "$TMP" "$USERS_FILE" "$DELETED_USERS_FILE"
+              return 1
+            }
+            chmod 600 "$TMP"
+            mv -f "$TMP" "$FILE"
+          done
+        fi
 
-        rm -f "$USERS_FILE"
+        rm -f "$USERS_FILE" "$DELETED_USERS_FILE"
         if [ "$FAILED" -eq 0 ]; then
+          SULTAN_EXISTING_USERS_ACTION="y"
           : > "$SSH_CHECK_MARK"
           chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
-          echo "Deleted users: $DELETED"
+          echo "Deleted SSH users: $DELETED"
           return 0
         fi
         rm -f "$SSH_CHECK_MARK"
-        echo "Deleted users: $DELETED"
+        echo "Deleted SSH users: $DELETED"
         echo "Failed users: $FAILED"
         echo "Run this command to see remaining normal users: awk -F: '$3>=1000 && $1!=\"nobody\"{print $1}' /etc/passwd"
         return 1
@@ -315,6 +519,7 @@ handle_existing_users_before_final(){
         /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 || true
         : > "$SSH_CHECK_MARK"
         chmod 600 "$SSH_CHECK_MARK" 2>/dev/null || true
+        SULTAN_EXISTING_USERS_ACTION="n"
         echo "Imported existing users into SULTAN: $IMPORTED"
         return 0
         ;;
@@ -325,6 +530,55 @@ handle_existing_users_before_final(){
     esac
   done
 }
+
+echo "==========================================="
+echo "        SULTAN VIP FULL PURPLE MENU INSTALL"
+echo "==========================================="
+if [ ! -r /etc/os-release ]; then
+  echo "Unsupported system: /etc/os-release is missing."
+  exit 1
+fi
+. /etc/os-release
+case "${ID:-}" in
+  debian|ubuntu) ;;
+  *)
+    echo "Unsupported system: ${PRETTY_NAME:-unknown}. Use Debian or Ubuntu."
+    exit 1
+    ;;
+esac
+
+echo "[0/7] Checking existing SSH users before installation..."
+if ! handle_existing_users_before_install; then
+  echo "Existing SSH user delete/import step failed. Installation was not started."
+  exit 1
+fi
+
+echo "[1/7] Installing required packages..."
+apt_retry(){
+  local TRY
+  for TRY in 1 2 3; do
+    if apt-get "$@"; then
+      return 0
+    fi
+    echo "APT attempt $TRY failed; retrying..."
+    sleep $((TRY * 3))
+  done
+  return 1
+}
+
+apt_retry update
+apt_retry install -y curl wget nginx haproxy openssh-server python3 \
+  certbot python3-certbot-nginx ufw socat lsb-release bc jq uuid-runtime vnstat \
+  fail2ban openssl speedtest-cli dnsutils iproute2 tar gzip ca-certificates psmisc \
+  nftables procps gawk util-linux coreutils grep sed findutils passwd login
+apt_retry install -y unzip
+
+for CMD in curl nginx haproxy sshd python3 certbot ufw jq nft flock openssl systemctl; do
+  command -v "$CMD" >/dev/null 2>&1 || {
+    echo "Required command was not installed: $CMD"
+    exit 1
+  }
+done
 
 # ==========================================================
 # Existing V2Ray/Xray user preservation
@@ -397,21 +651,30 @@ handle_existing_xray_users_before_ready(){
 
   while true; do
     READ_FAILED=0
-    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-      printf 'Delete existing V2Ray users? (y/n): ' > /dev/tty
-      IFS= read -r ANSWER < /dev/tty || READ_FAILED=1
-    elif [ -t 0 ]; then
-      printf 'Delete existing V2Ray users? (y/n): '
-      IFS= read -r ANSWER || READ_FAILED=1
-    else
-      READ_FAILED=1
-    fi
+    case "$SULTAN_EXISTING_USERS_ACTION" in
+      y|Y|n|N)
+        ANSWER="$SULTAN_EXISTING_USERS_ACTION"
+        echo "Applying the SSH and V2Ray choice selected before installation: $ANSWER"
+        ;;
+      *)
+        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+          drain_pending_tty_input
+          printf 'Delete existing V2Ray users? (y/n): ' > /dev/tty
+          IFS= read -r ANSWER < /dev/tty || READ_FAILED=1
+        elif [ -t 0 ]; then
+          printf 'Delete existing V2Ray users? (y/n): '
+          IFS= read -r ANSWER || READ_FAILED=1
+        else
+          READ_FAILED=1
+        fi
 
-    if [ "$READ_FAILED" -eq 1 ]; then
-      ANSWER="n"
-      echo "n"
-      echo "No interactive input detected; preserving existing V2Ray users."
-    fi
+        if [ "$READ_FAILED" -eq 1 ]; then
+          ANSWER="n"
+          echo "n"
+          echo "No interactive input detected; preserving existing V2Ray users."
+        fi
+        ;;
+    esac
 
     case "$ANSWER" in
       y|Y)
@@ -420,7 +683,8 @@ handle_existing_xray_users_before_ready(){
         mkdir -p "$BACKUP_DIR"
         chmod 700 "$XDB/preinstall-backups" "$BACKUP_DIR" 2>/dev/null || true
         for DBF in "$XDB/vmess-ws.db" "$XDB/vless-ws.db" "$XDB/trojan-ws.db" \
-                   "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db"; do
+                   "$XDB/usage.db" "$XDB/overview.db" "$XDB/user-online.db" "$XDB/online-sessions.db" \
+                   "$XDB/disabled.db"; do
           [ -f "$DBF" ] && cp -a "$DBF" "$BACKUP_DIR/" 2>/dev/null || true
           : > "$DBF"
           chmod 600 "$DBF"
@@ -2041,10 +2305,27 @@ current_sshd_pid(){
 }
 
 current_session_via_ws(){
-  local REMOTE="${SSH_CONNECTION%% *}"
-  case "$REMOTE" in
+  local PEER LOCAL_PORT DEV SSH_PORTS
+  PEER="${SSH_CONNECTION%% *}"
+  LOCAL_PORT="${SSH_CONNECTION##* }"
+  case "$PEER" in
     127.0.0.1|::1|localhost) return 0 ;;
   esac
+  case "$LOCAL_PORT" in
+    80|443|8080|8443|2095|2096) return 0 ;;
+  esac
+  if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]]; then
+    SSH_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u || true)"
+    if [ -n "$SSH_PORTS" ] && ! printf '%s\n' "$SSH_PORTS" | grep -qx "$LOCAL_PORT"; then
+      return 0
+    fi
+  fi
+  if [ -n "$PEER" ]; then
+    DEV="$(ip route get "$PEER" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    case "$DEV" in
+      wg*|tun*|tap*|ppp*|tailscale*|zt*|ipsec*|vpn*) return 0 ;;
+    esac
+  fi
   return 1
 }
 
@@ -2224,8 +2505,18 @@ delete_managed_ssh_user(){
   managed_ssh_user_exists "$U" || { echo "User is not managed by SULTAN."; return 1; }
   UIDN="$(id -u "$U" 2>/dev/null || true)"
   [ -n "$UIDN" ] && loginctl terminate-user "$UIDN" 2>/dev/null || true
+  loginctl disable-linger "$U" 2>/dev/null || true
+  [ -n "$UIDN" ] && systemctl stop "user-${UIDN}.slice" >/dev/null 2>&1 || true
   pkill -KILL -u "$U" 2>/dev/null || true
-  userdel -r "$U" 2>/dev/null || { echo "Failed to delete system user: $U"; return 1; }
+  rm -rf "/run/sultan-login-slots/$U" "/run/user/${UIDN:-0}" 2>/dev/null || true
+  crontab -r -u "$U" >/dev/null 2>&1 || true
+  if ! userdel -f -r "$U" 2>/dev/null; then
+    userdel -r "$U" 2>/dev/null || true
+  fi
+  if id "$U" >/dev/null 2>&1 && command -v deluser >/dev/null 2>&1; then
+    deluser --remove-home "$U" >/dev/null 2>&1 || true
+  fi
+  id "$U" >/dev/null 2>&1 && { echo "Failed to delete system user: $U"; return 1; }
   db_remove_user "$U" || { echo "Failed to update users DB."; return 1; }
   cleanup_managed_user_records "$U"
   quota_sync
@@ -2530,37 +2821,29 @@ CYAN="\e[36m"
 WHITE="\e[97m"
 NC="\e[0m"
 
-# Fast UI mode keeps menu response snappy. Set SULTAN_FAST_UI=0 to restore
-# the old blocking Press-Enter behavior.
-: "${SULTAN_FAST_UI:=1}"
-: "${SULTAN_PAUSE_TIMEOUT:=0.35}"
+# Screen clearing can be fast, but prompts never auto-continue.
+: "${SULTAN_FAST_UI:=0}"
 refresh_screen(){
-  if [ "${SULTAN_FAST_UI:-1}" = "1" ]; then
+  if [ "${SULTAN_FAST_UI:-0}" = "1" ]; then
     printf '[H[2J'
   else
     printf 'c'; printf '[2J[3J[H'; clear
   fi
 }
+drain_pending_tty_input(){
+  [ -r /dev/tty ] || return 0
+  while IFS= read -r -s -n 1 -t 0.03 _ch < /dev/tty; do :; done
+  return 0
+}
 pause(){
   echo ""
   [ "${SULTAN_NONINTERACTIVE:-0}" = "1" ] && return 0
-
-  if [ "${SULTAN_FAST_UI:-1}" = "1" ]; then
-    if [ -r /dev/tty ]; then
-      IFS= read -r -t "${SULTAN_PAUSE_TIMEOUT:-0.35}" -p "Press Enter..." x </dev/tty || true
-    elif [ -t 0 ]; then
-      IFS= read -r -t "${SULTAN_PAUSE_TIMEOUT:-0.35}" -p "Press Enter..." x || true
-    fi
-    echo ""
-    return 0
-  fi
-
-  if [ -r /dev/tty ]; then
-    IFS= read -r -p "Press Enter..." x </dev/tty || true
+  drain_pending_tty_input
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    IFS= read -r -p "Press Enter..." x < /dev/tty || true
   elif [ -t 0 ]; then
     IFS= read -r -p "Press Enter..." x || true
   fi
-
   echo ""
   return 0
 }
@@ -2568,6 +2851,7 @@ pause(){
 pause_wait(){
   echo ""
   [ "${SULTAN_NONINTERACTIVE:-0}" = "1" ] && return 0
+  drain_pending_tty_input
   if [ -r /dev/tty ]; then
     IFS= read -r -p "Press Enter..." x </dev/tty || true
   elif [ -t 0 ]; then
@@ -4853,7 +5137,7 @@ install_web_panel(){
   echo "The website opens the same terminal menu and uses the same data."
   echo "==========================================="
   systemctl --no-pager --full status sultan-web-panel 2>/dev/null | sed -n '1,8p' || true
-  pause
+  pause_wait
 }
 
 web_panel_menu(){
@@ -4879,7 +5163,7 @@ web_panel_menu(){
         box "WEB PANEL STATUS" "Service: $(systemctl is-active sultan-web-panel 2>/dev/null || echo inactive)"
         web_panel_print_urls
         systemctl --no-pager --full status sultan-web-panel 2>/dev/null | sed -n '1,12p' || true
-        pause
+        pause_wait
         ;;
       4)
         refresh_screen
@@ -4890,14 +5174,14 @@ web_panel_menu(){
         web_panel_refresh_nginx || { echo "Failed to reload Nginx/HAProxy for new Web Panel path."; pause; continue; }
         echo "New Web Panel path created."
         web_panel_print_urls
-        pause
+        pause_wait
         ;;
       5) restart_web_panel ;;
       6)
         refresh_screen
         box "WEB PANEL URL" "Use this long private path like 3x-ui."
         web_panel_print_urls
-        pause
+        pause_wait
         ;;
       0) return ;;
       *) echo "Invalid option"; sleep 1 ;;
@@ -8563,11 +8847,28 @@ xray_menu(){
 }
 
 current_session_via_ws(){
-  local PEER="${SSH_CONNECTION%% *}"
+  local PEER LOCAL_PORT DEV SSH_PORTS
+  PEER="${SSH_CONNECTION%% *}"
+  LOCAL_PORT="${SSH_CONNECTION##* }"
   case "$PEER" in
     127.0.0.1|::1|localhost) return 0 ;;
-    *) return 1 ;;
   esac
+  case "$LOCAL_PORT" in
+    80|443|8080|8443|2095|2096) return 0 ;;
+  esac
+  if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]]; then
+    SSH_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u || true)"
+    if [ -n "$SSH_PORTS" ] && ! printf '%s\n' "$SSH_PORTS" | grep -qx "$LOCAL_PORT"; then
+      return 0
+    fi
+  fi
+  if [ -n "$PEER" ]; then
+    DEV="$(ip route get "$PEER" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    case "$DEV" in
+      wg*|tun*|tap*|ppp*|tailscale*|zt*|ipsec*|vpn*) return 0 ;;
+    esac
+  fi
+  return 1
 }
 
 install_ws(){
@@ -8865,89 +9166,74 @@ EOF
 }
 
 install_udp(){
+  local BUILD_ROOT SRC_DIR BUILD_DIR UDP_BIN
+
+  # Games such as PUBG require a real UDPGW protocol endpoint. The previous
+  # Python relay only forwarded every datagram to a DNS server and therefore
+  # could not carry game UDP traffic through an SSH tunnel.
+  apt_retry install -y build-essential cmake git >/dev/null 2>&1 || {
+    echo "Failed to install UDPGW build requirements."
+    return 1
+  }
+
+  BUILD_ROOT="$(mktemp -d /tmp/sultan-badvpn.XXXXXX)" || return 1
+  SRC_DIR="$BUILD_ROOT/badvpn"
+  BUILD_DIR="$SRC_DIR/build"
+  UDP_BIN="$BUILD_DIR/udpgw/badvpn-udpgw"
+
+  if ! git clone --depth 1 https://github.com/ambrop72/badvpn.git "$SRC_DIR" >/dev/null 2>&1; then
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to download the UDPGW source."
+    return 1
+  fi
+
+  mkdir -p "$BUILD_DIR"
+  if ! cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
+      -DBUILD_NOTHING_BY_DEFAULT=1 \
+      -DBUILD_UDPGW=1 \
+      -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; then
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to configure UDPGW."
+    return 1
+  fi
+
+  if ! cmake --build "$BUILD_DIR" --target badvpn-udpgw -- -j"$(nproc 2>/dev/null || echo 1)" >/dev/null 2>&1; then
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to build UDPGW."
+    return 1
+  fi
+
+  [ -x "$UDP_BIN" ] || {
+    rm -rf "$BUILD_ROOT"
+    echo "UDPGW binary was not created."
+    return 1
+  }
+
   groupadd -r sultan-udp 2>/dev/null || true
   id sultan-udp >/dev/null 2>&1 || useradd -r -g sultan-udp -s /usr/sbin/nologin -d /nonexistent sultan-udp
-  cat >/usr/local/bin/sultan-udp-relay <<'PYUDP'
-#!/usr/bin/env python3
-import asyncio
-import os
 
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 7300
-UPSTREAM_HOST = os.environ.get("SULTAN_UDP_UPSTREAM_HOST", "1.1.1.1")
-UPSTREAM_PORT = int(os.environ.get("SULTAN_UDP_UPSTREAM_PORT", "53"))
-TIMEOUT = 15
-
-class Relay(asyncio.DatagramProtocol):
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, client):
-        asyncio.create_task(self.forward(data, client))
-
-    async def forward(self, data, client):
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-
-        class Upstream(asyncio.DatagramProtocol):
-            def connection_made(self, transport):
-                self.transport = transport
-                transport.sendto(data)
-
-            def datagram_received(self, response, address):
-                if not future.done():
-                    future.set_result(response)
-                self.transport.close()
-
-            def error_received(self, error):
-                if not future.done():
-                    future.set_exception(error)
-
-        transport = None
-        try:
-            transport, _ = await loop.create_datagram_endpoint(
-                Upstream,
-                remote_addr=(UPSTREAM_HOST, UPSTREAM_PORT),
-            )
-            response = await asyncio.wait_for(future, TIMEOUT)
-            self.transport.sendto(response, client)
-        except Exception:
-            pass
-        finally:
-            if transport is not None:
-                transport.close()
-
-async def main():
-    loop = asyncio.get_running_loop()
-    transport, _ = await loop.create_datagram_endpoint(
-        Relay,
-        local_addr=(LISTEN_HOST, LISTEN_PORT),
-    )
-    try:
-        await asyncio.Future()
-    finally:
-        transport.close()
-
-asyncio.run(main())
-PYUDP
-
-  chown root:sultan-udp /usr/local/bin/sultan-udp-relay
-  chmod 750 /usr/local/bin/sultan-udp-relay
+  install -o root -g sultan-udp -m 750 "$UDP_BIN" /usr/local/bin/sultan-udp-relay || {
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to install UDPGW."
+    return 1
+  }
+  rm -rf "$BUILD_ROOT"
 
   cat >/etc/systemd/system/udp-custom.service <<'EOF'
 [Unit]
 Description=UDP Custom 7300
-After=network-online.target
-Wants=network-online.target
+After=network-online.target ssh.service
+Wants=network-online.target ssh.service
 
 [Service]
-ExecStart=/usr/local/bin/sultan-udp-relay
+ExecStart=/usr/local/bin/sultan-udp-relay --loglevel warning --listen-addr 127.0.0.1:7300 --max-clients 1024 --max-connections-for-client 256
 Restart=always
 RestartSec=2
 User=sultan-udp
 Group=sultan-udp
 NoNewPrivileges=true
 PrivateTmp=true
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -8965,7 +9251,13 @@ EOF
   systemctl reset-failed udp-custom >/dev/null 2>&1 || true
   systemctl enable udp-custom >/dev/null 2>&1 || true
   checked_restart udp-custom || return 1
-  ufw allow 7300/udp 2>/dev/null || true
+
+  # UDPGW itself accepts a TCP stream carried inside SSH. Keep it bound to
+  # localhost so only authenticated SSH tunnels can use it.
+  if ! ss -ltn 2>/dev/null | awk '$4 ~ /(^|:)7300$/ {found=1} END{exit !found}'; then
+    echo "UDP Custom did not open local port 7300."
+    return 1
+  fi
 }
 
 create_self_signed_cert(){
@@ -10079,6 +10371,7 @@ setup_ready(){
   [ "$D" = "Not Set" ] && D=""
   echo "Current Domain: ${D:-Not Set}"
   ND=""
+  drain_pending_tty_input
   if [ -r /dev/tty ]; then
     read -r -p "Domain [press Enter to keep current]: " ND </dev/tty || true
   else
@@ -11173,6 +11466,15 @@ remove_script(){
 }
 
 case "${1:-}" in
+  --web-panel-refresh)
+    SULTAN_NONINTERACTIVE=1
+    web_panel_ensure_path >/dev/null || exit 1
+    web_panel_write_server || exit 1
+    web_panel_write_service || exit 1
+    web_panel_refresh_nginx || exit 1
+    web_panel_print_urls
+    exit 0
+    ;;
   --ready-install)
     SULTAN_NONINTERACTIVE=1
     setup_ready
@@ -11190,7 +11492,7 @@ PANEL
 
 chmod +x "$PANEL"
 
-echo "[5/6] Enabling services..."
+echo "[5/7] Enabling services..."
 systemctl daemon-reload
 systemctl enable sultan-quota.timer sultan-xray-stats.timer sultan-xray-limit-enforcer.timer >/dev/null 2>&1 || true
 systemctl restart sultan-quota.timer
@@ -11199,8 +11501,8 @@ systemctl restart sultan-xray-limit-enforcer.timer
 systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
 systemctl enable nginx haproxy vnstat fail2ban 2>/dev/null || true
 if sshd -t; then
-  if current_session_via_ws; then
-    echo "Current SSH session uses WebSocket; SSH reload skipped."
+  if current_session_transport_sensitive; then
+    echo "Current SSH session uses a protected transport; SSH reload skipped."
   else
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
   fi
@@ -11225,8 +11527,8 @@ findtime = 10m
 bantime = 1h
 ignoreip = 127.0.0.1/8 ::1 $CURRENT_SSH_IP
 EOF
-if current_session_via_ws; then
-  echo "Current SSH session uses WebSocket; Fail2Ban restart skipped to protect this session."
+if current_session_transport_sensitive; then
+  echo "Current SSH session uses a protected transport; Fail2Ban restart skipped to protect this session."
 else
   systemctl restart fail2ban 2>/dev/null || {
   echo "Fail2Ban restart failed; installation will continue without closing SSH."
@@ -11278,7 +11580,7 @@ if ! handle_existing_xray_users_before_ready; then
   SULTAN_INSTALL_STATUS=1
 fi
 
-echo "[6/6] Ready setup..."
+echo "[6/7] Ready setup..."
 echo "You will be asked for your domain. The installer will continue automatically after setup."
 SULTAN_INSTALL_STATUS="${SULTAN_INSTALL_STATUS:-0}"
 if [ "$SULTAN_INSTALL_STATUS" -eq 0 ] && ! "$PANEL" --ready-install; then
@@ -11290,29 +11592,22 @@ if [ "$SULTAN_INSTALL_STATUS" -eq 0 ] && ! "$PANEL" --ready-install; then
 fi
 
 if [ "$SULTAN_INSTALL_STATUS" -eq 0 ]; then
-  if current_session_via_ws; then
-    echo "Final live WebSocket test skipped now to protect this SSH session."
-  elif ! "$PANEL" --health-check; then
-    echo "Final service and V2Ray WebSocket verification failed."
-    SULTAN_INSTALL_STATUS=1
-  fi
+  echo "Ready setup and its built-in WebSocket verification completed."
 fi
 
-if [ "$SULTAN_INSTALL_STATUS" -eq 0 ]; then
-  echo ""
-  echo "[Before final stage] Checking existing SSH users..."
-  handle_existing_users_before_final || {
-    echo "Existing-user delete/import step failed."
-    SULTAN_INSTALL_STATUS=1
-  }
-fi
 
 if [ "$SULTAN_INSTALL_STATUS" -eq 0 ]; then
   echo ""
   echo "[7/7] Installing final mini package..."
-  if ! SULTAN_MINI_CHAINED=1 bash <(curl -fsSL https://raw.githubusercontent.com/sultanmuhamad736-maker/sultan-vip/main/install-mini.sh); then
+  if ! run_install_mini_chained_safely; then
     echo "Final mini installation failed."
     SULTAN_INSTALL_STATUS=1
+  else
+    echo "Restoring the full Web Panel route after install-mini..."
+    if ! "$PANEL" --web-panel-refresh; then
+      echo "Web Panel route refresh failed. Run: menu -> 21 -> 5"
+      SULTAN_INSTALL_STATUS=1
+    fi
   fi
 fi
 
@@ -11330,6 +11625,40 @@ fi
 echo "Max Login 0 = Unlimited"
 echo "GB Limit  0 = Unlimited"
 echo "Quota check: every 10 seconds"
+if [ "$SULTAN_INSTALL_STATUS" -eq 0 ]; then
+  WEB_PATH="$(head -n1 /etc/sultan/web-panel.path 2>/dev/null | tr -d '\r[:space:]')"
+  WEB_DOMAIN="$(head -n1 "$DOMAIN_FILE" 2>/dev/null | tr -d '\r[:space:]')"
+  WEB_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [ -n "$WEB_PATH" ] && systemctl is-active --quiet sultan-web-panel 2>/dev/null; then
+    echo "-------------------------------------------"
+    echo "WEB PANEL URL"
+    [ -n "$WEB_IP" ] && echo "http://$WEB_IP$WEB_PATH"
+    [ -n "$WEB_DOMAIN" ] && [ "$WEB_DOMAIN" != "Not Set" ] && echo "https://$WEB_DOMAIN$WEB_PATH"
+  else
+    echo "Web Panel browser URL: run menu -> 21 -> 1. The URL will stay visible until you press Enter."
+  fi
+fi
+echo "Installation log: $SULTAN_INSTALL_LOG"
 echo "==========================================="
 
-return "$SULTAN_INSTALL_STATUS" 2>/dev/null || true
+if [ "$SULTAN_INSTALL_STATUS" -eq 0 ]; then
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    drain_pending_tty_input
+    IFS= read -r -p "Press Enter to open the SULTAN menu..." _finish < /dev/tty || true
+    # Enter now opens the panel menu instead of ending the installer process.
+    # Choosing Exit from the menu returns normally to the SSH shell.
+    exec "$PANEL"
+  fi
+  echo "Installation complete. Run: menu"
+  exit 0
+fi
+
+if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  drain_pending_tty_input
+  IFS= read -r -p "Installation failed. Press Enter to return to the SSH shell..." _finish < /dev/tty || true
+fi
+exit 1
+
+fi
+exit 1
+
