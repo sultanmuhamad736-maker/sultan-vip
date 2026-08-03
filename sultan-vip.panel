@@ -1,4 +1,4 @@
-ب٤#!/bin/bash
+#!/bin/bash
 # ==========================================================
 # SULTAN VIP FULL PURPLE MENU INSTALL
 # Full verified installer + full panel + SSL/TLS/SNI/WS/V2Ray WebSocket
@@ -11658,7 +11658,3 @@ if [ -r /dev/tty ] && [ -w /dev/tty ]; then
   IFS= read -r -p "Installation failed. Press Enter to return to the SSH shell..." _finish < /dev/tty || true
 fi
 exit 1
-
-fi
-exit 1
-
