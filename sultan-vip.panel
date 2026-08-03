@@ -27,6 +27,23 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
+# Direct cleanup mode: run the VPN purge without starting or reinstalling the
+# panel. Normal installer/menu behavior is unchanged when this flag is absent.
+if [ "${1:-}" = "--purge-vpn" ]; then
+  PURGE_FUNCTION_FILE="$(mktemp /tmp/sultan-vpn-purge.XXXXXX)" || exit 1
+  sed -n '/^purge_all_vpn_components(){$/,/^remove_script(){$/p' "${BASH_SOURCE[0]}" | sed '$d' > "$PURGE_FUNCTION_FILE"
+  if ! grep -q '^purge_all_vpn_components(){$' "$PURGE_FUNCTION_FILE"; then
+    echo "VPN purge function was not found in this file."
+    rm -f "$PURGE_FUNCTION_FILE"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "$PURGE_FUNCTION_FILE"
+  rm -f "$PURGE_FUNCTION_FILE"
+  purge_all_vpn_components
+  exit 0
+fi
+
 # Keep a persistent installation log without changing interactive input.
 # Prompts still read directly from /dev/tty.
 mkdir -p /var/log
@@ -9166,89 +9183,74 @@ EOF
 }
 
 install_udp(){
+  local BUILD_ROOT SRC_DIR BUILD_DIR UDP_BIN
+
+  # Games such as PUBG require a real UDPGW protocol endpoint. The previous
+  # Python relay only forwarded every datagram to a DNS server and therefore
+  # could not carry game UDP traffic through an SSH tunnel.
+  apt_retry install -y build-essential cmake git >/dev/null 2>&1 || {
+    echo "Failed to install UDPGW build requirements."
+    return 1
+  }
+
+  BUILD_ROOT="$(mktemp -d /tmp/sultan-badvpn.XXXXXX)" || return 1
+  SRC_DIR="$BUILD_ROOT/badvpn"
+  BUILD_DIR="$SRC_DIR/build"
+  UDP_BIN="$BUILD_DIR/udpgw/badvpn-udpgw"
+
+  if ! git clone --depth 1 https://github.com/ambrop72/badvpn.git "$SRC_DIR" >/dev/null 2>&1; then
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to download the UDPGW source."
+    return 1
+  fi
+
+  mkdir -p "$BUILD_DIR"
+  if ! cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
+      -DBUILD_NOTHING_BY_DEFAULT=1 \
+      -DBUILD_UDPGW=1 \
+      -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; then
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to configure UDPGW."
+    return 1
+  fi
+
+  if ! cmake --build "$BUILD_DIR" --target badvpn-udpgw -- -j"$(nproc 2>/dev/null || echo 1)" >/dev/null 2>&1; then
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to build UDPGW."
+    return 1
+  fi
+
+  [ -x "$UDP_BIN" ] || {
+    rm -rf "$BUILD_ROOT"
+    echo "UDPGW binary was not created."
+    return 1
+  }
+
   groupadd -r sultan-udp 2>/dev/null || true
   id sultan-udp >/dev/null 2>&1 || useradd -r -g sultan-udp -s /usr/sbin/nologin -d /nonexistent sultan-udp
-  cat >/usr/local/bin/sultan-udp-relay <<'PYUDP'
-#!/usr/bin/env python3
-import asyncio
-import os
 
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 7300
-UPSTREAM_HOST = os.environ.get("SULTAN_UDP_UPSTREAM_HOST", "1.1.1.1")
-UPSTREAM_PORT = int(os.environ.get("SULTAN_UDP_UPSTREAM_PORT", "53"))
-TIMEOUT = 15
-
-class Relay(asyncio.DatagramProtocol):
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, client):
-        asyncio.create_task(self.forward(data, client))
-
-    async def forward(self, data, client):
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-
-        class Upstream(asyncio.DatagramProtocol):
-            def connection_made(self, transport):
-                self.transport = transport
-                transport.sendto(data)
-
-            def datagram_received(self, response, address):
-                if not future.done():
-                    future.set_result(response)
-                self.transport.close()
-
-            def error_received(self, error):
-                if not future.done():
-                    future.set_exception(error)
-
-        transport = None
-        try:
-            transport, _ = await loop.create_datagram_endpoint(
-                Upstream,
-                remote_addr=(UPSTREAM_HOST, UPSTREAM_PORT),
-            )
-            response = await asyncio.wait_for(future, TIMEOUT)
-            self.transport.sendto(response, client)
-        except Exception:
-            pass
-        finally:
-            if transport is not None:
-                transport.close()
-
-async def main():
-    loop = asyncio.get_running_loop()
-    transport, _ = await loop.create_datagram_endpoint(
-        Relay,
-        local_addr=(LISTEN_HOST, LISTEN_PORT),
-    )
-    try:
-        await asyncio.Future()
-    finally:
-        transport.close()
-
-asyncio.run(main())
-PYUDP
-
-  chown root:sultan-udp /usr/local/bin/sultan-udp-relay
-  chmod 750 /usr/local/bin/sultan-udp-relay
+  install -o root -g sultan-udp -m 750 "$UDP_BIN" /usr/local/bin/sultan-udp-relay || {
+    rm -rf "$BUILD_ROOT"
+    echo "Failed to install UDPGW."
+    return 1
+  }
+  rm -rf "$BUILD_ROOT"
 
   cat >/etc/systemd/system/udp-custom.service <<'EOF'
 [Unit]
 Description=UDP Custom 7300
-After=network-online.target
-Wants=network-online.target
+After=network-online.target ssh.service
+Wants=network-online.target ssh.service
 
 [Service]
-ExecStart=/usr/local/bin/sultan-udp-relay
+ExecStart=/usr/local/bin/sultan-udp-relay --loglevel warning --listen-addr 127.0.0.1:7300 --max-clients 1024 --max-connections-for-client 256
 Restart=always
 RestartSec=2
 User=sultan-udp
 Group=sultan-udp
 NoNewPrivileges=true
 PrivateTmp=true
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -9266,7 +9268,13 @@ EOF
   systemctl reset-failed udp-custom >/dev/null 2>&1 || true
   systemctl enable udp-custom >/dev/null 2>&1 || true
   checked_restart udp-custom || return 1
-  ufw allow 7300/udp 2>/dev/null || true
+
+  # UDPGW itself accepts a TCP stream carried inside SSH. Keep it bound to
+  # localhost so only authenticated SSH tunnels can use it.
+  if ! ss -ltn 2>/dev/null | awk '$4 ~ /(^|:)7300$/ {found=1} END{exit !found}'; then
+    echo "UDP Custom did not open local port 7300."
+    return 1
+  fi
 }
 
 create_self_signed_cert(){
@@ -11413,6 +11421,237 @@ reinstall_all_server_mini(){
   pause
 }
 
+purge_all_vpn_components(){
+  local REPORT VPN_DOMAIN TYPE UNIT PKG DEV TABLE FAMILY NAME CURRENT_DEV RULES_TMP
+  local VPN_MATCH='vpn|openvpn|wireguard|wg-quick|strongswan|charon|ipsec|libreswan|xl2tpd|pptpd|ocserv|softether|vpnserver|vpnbridge|vpnclient|tailscale|zerotier|hysteria|sing-box|v2ray|xray|trojan|shadowsocks|badvpn|udpgw|clash|mihomo|gost|brook|tuic|naiveproxy|headscale|tinc|nebula|openconnect|vpnc|sshuttle|outline|nordvpn|mullvad|protonvpn|surfshark|cloudflare-warp|warp-svc|sultan'
+
+  REPORT="/root/sultan-remove-report-$(date +%Y%m%d-%H%M%S).log"
+  VPN_DOMAIN="$(head -n1 /etc/sultan/domain 2>/dev/null | tr -d '\r[:space:]')"
+  echo "Full VPN cleanup started. Report: $REPORT"
+  printf 'Started: %s\n' "$(date -Is 2>/dev/null || date)" > "$REPORT"
+
+  # Stop and disable every known VPN/tunnel/SULTAN systemd unit, including
+  # units that were not installed by this script.
+  for TYPE in service socket timer path; do
+    while IFS= read -r UNIT; do
+      [ -n "$UNIT" ] || continue
+      echo "systemd: $UNIT" >> "$REPORT"
+      systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+    done < <(
+      {
+        systemctl list-unit-files --type="$TYPE" --no-legend 2>/dev/null | awk '{print $1}'
+        systemctl list-units --all --type="$TYPE" --no-legend 2>/dev/null | awk '{print $1}'
+      } | grep -Ei "$VPN_MATCH" | sort -u
+    )
+  done
+
+  # Stop common standalone tunnel processes left outside systemd.
+  for NAME in openvpn openvpn3 wireguard-go wg-quick charon charon-systemd pluto starter ipsec xl2tpd pptpd ocserv vpnserver vpnbridge vpnclient tailscaled zerotier-one hysteria sing-box v2ray xray trojan ss-server ss-local ss-tunnel sslocal ssserver badvpn-udpgw clash mihomo gost brook tuic-server tuic-client naive headscale tincd nebula openconnect vpnc sshuttle warp-svc; do
+    pkill -TERM -x "$NAME" 2>/dev/null || true
+  done
+  sleep 1
+  for NAME in openvpn openvpn3 wireguard-go wg-quick charon charon-systemd pluto starter ipsec xl2tpd pptpd ocserv vpnserver vpnbridge vpnclient tailscaled zerotier-one hysteria sing-box v2ray xray trojan ss-server ss-local ss-tunnel sslocal ssserver badvpn-udpgw clash mihomo gost brook tuic-server tuic-client naive headscale tincd nebula openconnect vpnc sshuttle warp-svc; do
+    pkill -KILL -x "$NAME" 2>/dev/null || true
+  done
+
+  # Delete VPN containers, images, networks and volumes when Docker/Podman is present.
+  if command -v docker >/dev/null 2>&1; then
+    docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | cut -d'|' -f1 | xargs -r docker rm -f >/dev/null 2>&1 || true
+    docker images --format '{{.ID}}|{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | cut -d'|' -f1 | sort -u | xargs -r docker image rm -f >/dev/null 2>&1 || true
+    docker network ls --format '{{.ID}}|{{.Name}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | cut -d'|' -f1 | xargs -r docker network rm >/dev/null 2>&1 || true
+    docker volume ls --format '{{.Name}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | xargs -r docker volume rm -f >/dev/null 2>&1 || true
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    podman ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | cut -d'|' -f1 | xargs -r podman rm -f >/dev/null 2>&1 || true
+    podman images --format '{{.ID}}|{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | cut -d'|' -f1 | sort -u | xargs -r podman image rm -f >/dev/null 2>&1 || true
+    podman network ls --format '{{.ID}}|{{.Name}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | cut -d'|' -f1 | xargs -r podman network rm -f >/dev/null 2>&1 || true
+    podman volume ls --format '{{.Name}}' 2>/dev/null | grep -Ei "$VPN_MATCH" | xargs -r podman volume rm -f >/dev/null 2>&1 || true
+  fi
+
+  # Remove NetworkManager VPN and WireGuard connection profiles.
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli -t -f UUID,TYPE connection show 2>/dev/null | awk -F: '$2=="vpn" || $2=="wireguard" {print $1}' | while IFS= read -r NAME; do
+      [ -n "$NAME" ] && nmcli connection delete uuid "$NAME" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # Purge all installed packages whose package names identify VPN/tunnel software.
+  mapfile -t VPN_PACKAGES < <(
+    dpkg-query -W -f='${binary:Package}\n' 2>/dev/null |
+      grep -Ei "$VPN_MATCH|network-manager-(l2tp|openconnect|strongswan|vpnc)|cloudflare-warp|warp-cli" |
+      sort -u
+  )
+  if [ "${#VPN_PACKAGES[@]}" -gt 0 ]; then
+    printf 'Packages purged:\n%s\n' "${VPN_PACKAGES[*]}" >> "$REPORT"
+    apt-get purge -y "${VPN_PACKAGES[@]}" >/dev/null 2>&1 || true
+  fi
+
+  if command -v snap >/dev/null 2>&1; then
+    snap list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Ei "$VPN_MATCH" | while IFS= read -r PKG; do
+      [ -n "$PKG" ] && snap remove --purge "$PKG" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # Remove known VPN/tunnel configuration, state, binaries and service leftovers.
+  rm -rf \
+    /etc/openvpn /usr/local/etc/openvpn /var/lib/openvpn /var/log/openvpn* /run/openvpn* \
+    /etc/wireguard /usr/local/etc/wireguard /var/lib/wireguard \
+    /etc/ipsec.conf /etc/ipsec.secrets /etc/ipsec.d /etc/strongswan* /var/lib/strongswan /var/log/strongswan* \
+    /etc/xl2tpd /etc/pptpd.conf /etc/ppp/options.xl2tpd /etc/ppp/options.pptpd \
+    /etc/ocserv /var/lib/ocserv /var/log/ocserv* \
+    /etc/softether /usr/local/vpnserver /opt/vpnserver /var/lib/softether* \
+    /etc/tailscale /var/lib/tailscale /var/cache/tailscale \
+    /etc/zerotier-one /var/lib/zerotier-one \
+    /etc/hysteria /usr/local/etc/hysteria /var/lib/hysteria /var/log/hysteria* \
+    /etc/v2ray /usr/local/etc/v2ray /var/lib/v2ray /var/log/v2ray* \
+    /etc/xray /usr/local/etc/xray /var/lib/xray /var/log/xray* /usr/local/share/xray \
+    /etc/sing-box /usr/local/etc/sing-box /var/lib/sing-box /var/log/sing-box* \
+    /etc/trojan /etc/trojan-go /usr/local/etc/trojan* /var/lib/trojan* /var/log/trojan* \
+    /etc/shadowsocks* /usr/local/etc/shadowsocks* /var/lib/shadowsocks* /var/log/shadowsocks* \
+    /etc/badvpn /var/lib/badvpn /var/log/badvpn* \
+    /etc/clash /root/.config/clash /etc/mihomo /root/.config/mihomo \
+    /etc/headscale /var/lib/headscale /etc/tinc /var/lib/tinc /etc/nebula /var/lib/nebula \
+    /etc/outline /var/lib/outline /opt/outline* \
+    /etc/warp /var/lib/cloudflare-warp /etc/cloudflare-warp \
+    /etc/sultan /var/lib/sultan /var/cache/sultan /var/log/sultan* \
+    2>/dev/null || true
+
+  rm -f \
+    /usr/local/bin/openvpn* /usr/local/sbin/openvpn* /usr/local/bin/wireguard-go /usr/local/bin/wg /usr/local/bin/wg-quick \
+    /usr/local/bin/hysteria* /usr/local/bin/sing-box /usr/local/bin/v2ray /usr/local/bin/xray \
+    /usr/local/bin/trojan* /usr/local/bin/ss-* /usr/local/bin/badvpn* /usr/local/bin/clash* /usr/local/bin/mihomo* \
+    /usr/local/bin/gost* /usr/local/bin/brook* /usr/local/bin/tuic* /usr/local/bin/naive* /usr/local/bin/nebula* \
+    /usr/local/bin/headscale* /usr/local/bin/tailscale* /usr/local/bin/zerotier* \
+    /usr/local/bin/sultan-* /usr/local/sbin/sultan-* /usr/local/bin/menu \
+    2>/dev/null || true
+
+  # Remove all remaining names containing VPN/tunnel product identifiers from
+  # system/configuration trees and user homes. This intentionally includes
+  # components installed outside this script, but avoids virtual filesystems.
+  for NAME in /etc /usr/local /opt /var/lib /var/cache /var/log /root /home; do
+    [ -d "$NAME" ] || continue
+    find "$NAME" -xdev -depth -mindepth 1 \
+      \( -iname '*vpn*' -o -iname '*openvpn*' -o -iname '*wireguard*' -o -iname '*strongswan*' \
+         -o -iname '*ipsec*' -o -iname '*tailscale*' -o -iname '*zerotier*' -o -iname '*hysteria*' \
+         -o -iname '*v2ray*' -o -iname '*xray*' -o -iname '*trojan*' -o -iname '*shadowsocks*' \
+         -o -iname '*badvpn*' -o -iname '*udpgw*' -o -iname '*sing-box*' -o -iname '*softether*' \
+         -o -iname '*sultan*' \) -print0 2>/dev/null |
+      while IFS= read -r -d '' PKG; do
+        [ "$PKG" = "$REPORT" ] && continue
+        printf 'path: %s\n' "$PKG" >> "$REPORT"
+        rm -rf -- "$PKG" 2>/dev/null || true
+      done
+  done
+
+  # Remove matching cron and startup entries, including entries created by
+  # unrelated VPN installers.
+  for PKG in /etc/crontab /etc/rc.local /var/spool/cron/crontabs/* /var/spool/cron/*; do
+    [ -f "$PKG" ] || continue
+    RULES_TMP="$(mktemp)" || continue
+    grep -viE "$VPN_MATCH" "$PKG" > "$RULES_TMP" 2>/dev/null || true
+    cat "$RULES_TMP" > "$PKG" 2>/dev/null || true
+    rm -f "$RULES_TMP"
+  done
+
+  # Remove VPN-specific firewall tables/chains/rules while leaving unrelated
+  # firewall and SSH rules intact.
+  if command -v nft >/dev/null 2>&1; then
+    while read -r TABLE FAMILY NAME; do
+      [ "$TABLE" = "table" ] || continue
+      printf '%s\n' "$NAME" | grep -Eqi "$VPN_MATCH" || continue
+      nft delete table "$FAMILY" "$NAME" >/dev/null 2>&1 || true
+    done < <(nft list tables 2>/dev/null)
+  fi
+  for TABLE in filter nat mangle raw security; do
+    for NAME in ts-input ts-forward ts-postrouting sultan_quota sultan_limits openvpn wireguard vpn; do
+      iptables -t "$TABLE" -D INPUT -j "$NAME" >/dev/null 2>&1 || true
+      iptables -t "$TABLE" -D OUTPUT -j "$NAME" >/dev/null 2>&1 || true
+      iptables -t "$TABLE" -D FORWARD -j "$NAME" >/dev/null 2>&1 || true
+      iptables -t "$TABLE" -D PREROUTING -j "$NAME" >/dev/null 2>&1 || true
+      iptables -t "$TABLE" -D POSTROUTING -j "$NAME" >/dev/null 2>&1 || true
+      iptables -t "$TABLE" -F "$NAME" >/dev/null 2>&1 || true
+      iptables -t "$TABLE" -X "$NAME" >/dev/null 2>&1 || true
+      ip6tables -t "$TABLE" -D INPUT -j "$NAME" >/dev/null 2>&1 || true
+      ip6tables -t "$TABLE" -D OUTPUT -j "$NAME" >/dev/null 2>&1 || true
+      ip6tables -t "$TABLE" -D FORWARD -j "$NAME" >/dev/null 2>&1 || true
+      ip6tables -t "$TABLE" -F "$NAME" >/dev/null 2>&1 || true
+      ip6tables -t "$TABLE" -X "$NAME" >/dev/null 2>&1 || true
+    done
+  done
+  if command -v ufw >/dev/null 2>&1; then
+    for PKG in 1194/tcp 1194/udp 51820/udp 500/udp 4500/udp 1701/udp 1723/tcp 7300/udp 36712/udp 8388/tcp 8388/udp; do
+      ufw --force delete allow "$PKG" >/dev/null 2>&1 || true
+      ufw --force delete deny "$PKG" >/dev/null 2>&1 || true
+    done
+    ufw reload >/dev/null 2>&1 || true
+  fi
+
+  # Remove live VPN interfaces and IPsec state. The interface carrying the
+  # current SSH session is left until reboot so cleanup can finish safely.
+  CURRENT_DEV=""
+  if [ -n "${SSH_CONNECTION%% *}" ]; then
+    CURRENT_DEV="$(ip route get "${SSH_CONNECTION%% *}" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  fi
+  while IFS= read -r DEV; do
+    [ -n "$DEV" ] || continue
+    [ "$DEV" = "$CURRENT_DEV" ] && continue
+    ip link set "$DEV" down >/dev/null 2>&1 || true
+    ip link delete "$DEV" >/dev/null 2>&1 || true
+  done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -Ei '^(tun|tap|wg|vpn|tailscale|zt|ipsec|ppp)')
+  ip xfrm state flush >/dev/null 2>&1 || true
+  ip xfrm policy flush >/dev/null 2>&1 || true
+
+  # Remove VPN/SULTAN service accounts only when they are system or nologin
+  # accounts; normal interactive users are not deleted by name matching.
+  getent passwd | awk -F: '$1!="root" && ($3<1000 || $7 ~ /(nologin|false)$/) {print $1}' | grep -Ei "$VPN_MATCH" | while IFS= read -r NAME; do
+    [ -n "$NAME" ] && userdel -r "$NAME" >/dev/null 2>&1 || true
+  done
+  getent group | awk -F: '{print $1}' | grep -Ei "$VPN_MATCH" | while IFS= read -r NAME; do
+    [ -n "$NAME" ] && groupdel "$NAME" >/dev/null 2>&1 || true
+  done
+
+  # Delete the certificate generated for the panel domain.
+  if [ -n "$VPN_DOMAIN" ] && [[ "$VPN_DOMAIN" != *'/'* ]]; then
+    certbot delete --cert-name "$VPN_DOMAIN" --non-interactive >/dev/null 2>&1 || true
+    rm -rf "/etc/letsencrypt/live/$VPN_DOMAIN" "/etc/letsencrypt/archive/$VPN_DOMAIN"
+    rm -f "/etc/letsencrypt/renewal/$VPN_DOMAIN.conf"
+  fi
+
+  # Delete all SULTAN/VPN systemd leftovers after package removal.
+  find /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /lib/systemd/system /usr/lib/systemd/system \
+    -maxdepth 3 \( -type f -o -type l \) 2>/dev/null |
+    grep -Ei "$VPN_MATCH" | while IFS= read -r PKG; do rm -f -- "$PKG" 2>/dev/null || true; done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+
+  # Remove persistent network tuning added by this and other VPN installers,
+  # then restore conservative Linux TCP defaults immediately.
+  rm -f /etc/sysctl.d/*sultan* /etc/sysctl.d/*vpn* /etc/sysctl.d/*openvpn* /etc/sysctl.d/*wireguard* /etc/sysctl.d/*xray* /etc/sysctl.d/*hysteria* 2>/dev/null || true
+  sed -i -E '/(sultan|vpn|openvpn|wireguard|xray|v2ray|hysteria|badvpn|udpgw|tcp_congestion_control[[:space:]]*=[[:space:]]*bbr|default_qdisc[[:space:]]*=[[:space:]]*fq)/Id' /etc/sysctl.conf 2>/dev/null || true
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw cubic; then
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+  fi
+  sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+  sysctl -w net.core.somaxconn=4096 >/dev/null 2>&1 || true
+  sysctl -w net.core.netdev_max_backlog=1000 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_max_syn_backlog=4096 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_fastopen=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_mtu_probing=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_slow_start_after_idle=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_fin_timeout=60 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_notsent_lowat=4294967295 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_keepalive_time=7200 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_keepalive_intvl=75 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.tcp_keepalive_probes=9 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.ip_local_port_range='32768 60999' >/dev/null 2>&1 || true
+  sysctl --system >/dev/null 2>&1 || true
+
+  printf 'Finished: %s\n' "$(date -Is 2>/dev/null || date)" >> "$REPORT"
+  echo "All detected VPN/tunnel/SULTAN components were removed."
+  echo "Removal report: $REPORT"
+  echo "Reboot the VPS to unload any remaining kernel state."
+}
+
 remove_script(){
   refresh_screen
   read -p "Type YES to remove: " C
@@ -11426,6 +11665,8 @@ remove_script(){
     delete_managed_ssh_user "$U" || echo "Skipped user: $U"
   done < "$TMP_USERS"
   rm -f "$TMP_USERS"
+
+  purge_all_vpn_components
 
   systemctl disable --now sultan-ws udp-custom sultan-quota.timer sultan-quota.service sultan-xray-stats.timer sultan-xray-stats.service sultan-xray-limit-enforcer.timer sultan-xray-limit-enforcer.service xray 2>/dev/null || true
   rm -f /etc/systemd/system/sultan-ws.service
@@ -11667,4 +11908,5 @@ if [ -r /dev/tty ] && [ -w /dev/tty ]; then
   IFS= read -r -p "Installation failed. Press Enter to return to the SSH shell..." _finish < /dev/tty || true
 fi
 exit 1
+
 
