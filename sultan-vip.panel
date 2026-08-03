@@ -9166,74 +9166,89 @@ EOF
 }
 
 install_udp(){
-  local BUILD_ROOT SRC_DIR BUILD_DIR UDP_BIN
-
-  # Games such as PUBG require a real UDPGW protocol endpoint. The previous
-  # Python relay only forwarded every datagram to a DNS server and therefore
-  # could not carry game UDP traffic through an SSH tunnel.
-  apt_retry install -y build-essential cmake git >/dev/null 2>&1 || {
-    echo "Failed to install UDPGW build requirements."
-    return 1
-  }
-
-  BUILD_ROOT="$(mktemp -d /tmp/sultan-badvpn.XXXXXX)" || return 1
-  SRC_DIR="$BUILD_ROOT/badvpn"
-  BUILD_DIR="$SRC_DIR/build"
-  UDP_BIN="$BUILD_DIR/udpgw/badvpn-udpgw"
-
-  if ! git clone --depth 1 https://github.com/ambrop72/badvpn.git "$SRC_DIR" >/dev/null 2>&1; then
-    rm -rf "$BUILD_ROOT"
-    echo "Failed to download the UDPGW source."
-    return 1
-  fi
-
-  mkdir -p "$BUILD_DIR"
-  if ! cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
-      -DBUILD_NOTHING_BY_DEFAULT=1 \
-      -DBUILD_UDPGW=1 \
-      -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1; then
-    rm -rf "$BUILD_ROOT"
-    echo "Failed to configure UDPGW."
-    return 1
-  fi
-
-  if ! cmake --build "$BUILD_DIR" --target badvpn-udpgw -- -j"$(nproc 2>/dev/null || echo 1)" >/dev/null 2>&1; then
-    rm -rf "$BUILD_ROOT"
-    echo "Failed to build UDPGW."
-    return 1
-  fi
-
-  [ -x "$UDP_BIN" ] || {
-    rm -rf "$BUILD_ROOT"
-    echo "UDPGW binary was not created."
-    return 1
-  }
-
   groupadd -r sultan-udp 2>/dev/null || true
   id sultan-udp >/dev/null 2>&1 || useradd -r -g sultan-udp -s /usr/sbin/nologin -d /nonexistent sultan-udp
+  cat >/usr/local/bin/sultan-udp-relay <<'PYUDP'
+#!/usr/bin/env python3
+import asyncio
+import os
 
-  install -o root -g sultan-udp -m 750 "$UDP_BIN" /usr/local/bin/sultan-udp-relay || {
-    rm -rf "$BUILD_ROOT"
-    echo "Failed to install UDPGW."
-    return 1
-  }
-  rm -rf "$BUILD_ROOT"
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = 7300
+UPSTREAM_HOST = os.environ.get("SULTAN_UDP_UPSTREAM_HOST", "1.1.1.1")
+UPSTREAM_PORT = int(os.environ.get("SULTAN_UDP_UPSTREAM_PORT", "53"))
+TIMEOUT = 15
+
+class Relay(asyncio.DatagramProtocol):
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, client):
+        asyncio.create_task(self.forward(data, client))
+
+    async def forward(self, data, client):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        class Upstream(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                self.transport = transport
+                transport.sendto(data)
+
+            def datagram_received(self, response, address):
+                if not future.done():
+                    future.set_result(response)
+                self.transport.close()
+
+            def error_received(self, error):
+                if not future.done():
+                    future.set_exception(error)
+
+        transport = None
+        try:
+            transport, _ = await loop.create_datagram_endpoint(
+                Upstream,
+                remote_addr=(UPSTREAM_HOST, UPSTREAM_PORT),
+            )
+            response = await asyncio.wait_for(future, TIMEOUT)
+            self.transport.sendto(response, client)
+        except Exception:
+            pass
+        finally:
+            if transport is not None:
+                transport.close()
+
+async def main():
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        Relay,
+        local_addr=(LISTEN_HOST, LISTEN_PORT),
+    )
+    try:
+        await asyncio.Future()
+    finally:
+        transport.close()
+
+asyncio.run(main())
+PYUDP
+
+  chown root:sultan-udp /usr/local/bin/sultan-udp-relay
+  chmod 750 /usr/local/bin/sultan-udp-relay
 
   cat >/etc/systemd/system/udp-custom.service <<'EOF'
 [Unit]
 Description=UDP Custom 7300
-After=network-online.target ssh.service
-Wants=network-online.target ssh.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/sultan-udp-relay --loglevel warning --listen-addr 127.0.0.1:7300 --max-clients 1024 --max-connections-for-client 256
+ExecStart=/usr/local/bin/sultan-udp-relay
 Restart=always
 RestartSec=2
 User=sultan-udp
 Group=sultan-udp
 NoNewPrivileges=true
 PrivateTmp=true
-LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -9251,13 +9266,7 @@ EOF
   systemctl reset-failed udp-custom >/dev/null 2>&1 || true
   systemctl enable udp-custom >/dev/null 2>&1 || true
   checked_restart udp-custom || return 1
-
-  # UDPGW itself accepts a TCP stream carried inside SSH. Keep it bound to
-  # localhost so only authenticated SSH tunnels can use it.
-  if ! ss -ltn 2>/dev/null | awk '$4 ~ /(^|:)7300$/ {found=1} END{exit !found}'; then
-    echo "UDP Custom did not open local port 7300."
-    return 1
-  fi
+  ufw allow 7300/udp 2>/dev/null || true
 }
 
 create_self_signed_cert(){
@@ -11658,3 +11667,4 @@ if [ -r /dev/tty ] && [ -w /dev/tty ]; then
   IFS= read -r -p "Installation failed. Press Enter to return to the SSH shell..." _finish < /dev/tty || true
 fi
 exit 1
+
