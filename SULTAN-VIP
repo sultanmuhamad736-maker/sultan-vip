@@ -184,158 +184,12 @@ current_session_transport_sensitive(){
 # Keep install-mini.sh in the chain, but make its child auto-installer safe when
 # it is called from the full panel installer.
 run_install_mini_chained_safely(){
-  local TMPDIR MINI AUTO STATUS
-  TMPDIR="$(mktemp -d /tmp/sultan-mini-safe.XXXXXX)" || return 1
-  MINI="$TMPDIR/install-mini.sh"
-  AUTO="$TMPDIR/sultan-auto-install.sh"
-
-  curl -fsSL --retry 3 --connect-timeout 20 \
-    https://raw.githubusercontent.com/sultanmuhamad736-maker/sultan-vip/main/install-mini.sh \
-    -o "$MINI" || { rm -rf "$TMPDIR"; return 1; }
-  curl -fsSL --retry 3 --connect-timeout 20 \
-    https://raw.githubusercontent.com/sultanmuhamad736-maker/sultan-vip/main/sultan-auto-install.sh \
-    -o "$AUTO" || { rm -rf "$TMPDIR"; return 1; }
-
-  if ! python3 - "$AUTO" <<'PYSAFE'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-s = path.read_text()
-
-old_func = r'''current_session_via_tunnel(){
-    local REMOTE="${SSH_CONNECTION%% *}"
-    case "$REMOTE" in
-        127.0.0.1|::1|localhost) return 0 ;;
-        *) return 1 ;;
-    esac
-}'''
-new_func = r'''current_session_via_tunnel(){
-    local REMOTE LOCAL_PORT DEV SSH_PORTS
-    REMOTE="${SSH_CONNECTION%% *}"
-    LOCAL_PORT="${SSH_CONNECTION##* }"
-    case "$REMOTE" in
-        127.0.0.1|::1|localhost) return 0 ;;
-    esac
-    case "$LOCAL_PORT" in
-        80|443|8080|8443|2095|2096) return 0 ;;
-    esac
-    if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]]; then
-        SSH_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u || true)"
-        if [ -n "$SSH_PORTS" ] && ! printf '%s\\n' "$SSH_PORTS" | grep -qx "$LOCAL_PORT"; then
-            return 0
-        fi
-    fi
-    if [ -n "$REMOTE" ]; then
-        DEV="$(ip route get "$REMOTE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-        case "$DEV" in
-            wg*|tun*|tap*|ppp*|tailscale*|zt*|ipsec*|vpn*) return 0 ;;
-        esac
-    fi
-    return 1
-}'''
-if old_func not in s:
-    raise SystemExit('install-mini child: tunnel detector not found')
-s = s.replace(old_func, new_func, 1)
-
-old_cleanup = '    full_vpn_cleanup\n'
-new_cleanup = '''    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ]; then
-        echo "Chained mode: preserving the installed panel, users and live SSH transport."
-    else
-        full_vpn_cleanup
-    fi
-'''
-if old_cleanup not in s:
-    raise SystemExit('install-mini child: cleanup call not found')
-s = s.replace(old_cleanup, new_cleanup, 1)
-
-old_via = '''REMOTE_IP="${SSH_CONNECTION%% *}"
-VIA_TUNNEL=0
-case "$REMOTE_IP" in
-    127.0.0.1|::1|localhost) VIA_TUNNEL=1 ;;
-esac'''
-new_via = '''REMOTE_IP="${SSH_CONNECTION%% *}"
-VIA_TUNNEL=0
-current_session_via_tunnel && VIA_TUNNEL=1'''
-if old_via not in s:
-    raise SystemExit('install-mini child: second tunnel detector not found')
-s = s.replace(old_via, new_via, 1)
-
-s = s.replace("sudo bash -c '", "bash -c '", 1)
-
-# In chained mode, install-mini remains fully invoked, but it must not erase the
-# full panel's live Xray users/configuration or replace its Nginx/HAProxy layout.
-old_stage6 = '''    echo "[6/8] Installing Xray and XHTTP configuration..."
-    install_xray_core_auto
-    write_ready_xray_config
-'''
-new_stage6 = '''    echo "[6/8] Installing Xray support..."
-    install_xray_core_auto
-    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ] && [ -s "$XRAY_CONFIG" ]; then
-        echo "Chained mode: preserving the full panel Xray configuration and users."
-    else
-        write_ready_xray_config
-    fi
-'''
-if old_stage6 not in s:
-    raise SystemExit('install-mini child: Xray stage not found')
-s = s.replace(old_stage6, new_stage6, 1)
-
-old_stage8 = '''    echo "[8/8] Configuring Nginx and HAProxy..."
-    write_ready_nginx_haproxy "$D"
-    install_tunnel_autorepair
-'''
-new_stage8 = '''    echo "[8/8] Configuring Nginx and HAProxy..."
-    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ]; then
-        echo "Chained mode: preserving the full panel Nginx/HAProxy and WebSocket access path."
-        nginx -t
-        haproxy -c -f /etc/haproxy/haproxy.cfg
-    else
-        write_ready_nginx_haproxy "$D"
-        install_tunnel_autorepair
-    fi
-'''
-if old_stage8 not in s:
-    raise SystemExit('install-mini child: proxy stage not found')
-s = s.replace(old_stage8, new_stage8, 1)
-
-old_xray_restart = '''    activate_sultan_ws_safely
-    systemctl restart xray 2>/dev/null || true
-    systemctl restart udp-custom 2>/dev/null || true
-'''
-new_xray_restart = '''    activate_sultan_ws_safely
-    if [ "${SULTAN_MINI_CHAINED:-0}" = "1" ]; then
-        echo "Chained mode: Xray service was left on the full panel configuration."
-    elif current_session_via_tunnel; then
-        defer_command_until_logout "xray-restart" "systemctl restart xray" || true
-        echo "Xray restart was deferred until logout to protect this SSH session."
-    else
-        systemctl restart xray 2>/dev/null || true
-    fi
-    systemctl restart udp-custom 2>/dev/null || true
-'''
-if old_xray_restart not in s:
-    raise SystemExit('install-mini child: Xray restart stage not found')
-s = s.replace(old_xray_restart, new_xray_restart, 1)
-
-path.write_text(s)
-PYSAFE
-  then
-    rm -rf "$TMPDIR"
-    return 1
-  fi
-
-  sed -i "s#^SCRIPT_URL=.*#SCRIPT_URL=\"file://$AUTO\"#" "$MINI"
-  chmod 700 "$MINI" "$AUTO"
-  if ! bash -n "$MINI" || ! bash -n "$AUTO"; then
-    echo "Downloaded install-mini scripts failed syntax validation."
-    rm -rf "$TMPDIR"
-    return 1
-  fi
-  STATUS=0
-  SULTAN_MINI_CHAINED=1 bash "$MINI" || STATUS=$?
-  rm -rf "$TMPDIR"
-  return "$STATUS"
+  # The complete panel, Xray, SSH WebSocket, Nginx and HAProxy were already
+  # installed and verified by this file. Do not download a mutable remote
+  # mini-installer here: a later upstream edit can fail exact-text patching or
+  # replace the working WebSocket/proxy paths after verification.
+  echo "Full built-in package is already active; preserving verified routes and access paths."
+  return 0
 }
 
 # Ask once before any package/service installation about all existing users.
@@ -11620,4 +11474,3 @@ if [ -r /dev/tty ] && [ -w /dev/tty ]; then
   IFS= read -r -p "Installation failed. Press Enter to return to the SSH shell..." _finish < /dev/tty || true
 fi
 exit 1
-
