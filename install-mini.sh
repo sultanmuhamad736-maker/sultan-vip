@@ -1741,6 +1741,6 @@ echo "You will be asked for your domain. Make sure DNS A record points to this V
 
 echo ""
 echo "==========================================="
-echo "Done. Type: hjgjh"
+echo "Done. Type: menu"
 echo "Port 443 is handled by HAProxy -> Nginx TLS."
 echo "==========================================="
