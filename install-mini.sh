@@ -15,7 +15,7 @@ BASE="/etc/sultan"
 XDB="$BASE/xray"
 DB="$BASE/users.db"
 DOMAIN_FILE="$BASE/domain"
-PANEL="/usr/local/bin/menu"
+PANEL="/usr/local/bin/hjgjh"
 
 mkdir -p "$BASE" "$XDB"
 
@@ -1619,7 +1619,7 @@ case "$b" in
 1)
 refresh_screen
 mkdir -p /root/sultan-backup
-tar -czf /root/sultan-backup/sultan-backup-$(date +%F-%H%M).tar.gz /etc/sultan /usr/local/etc/xray /usr/local/bin/menu 2>/dev/null || true
+tar -czf /root/sultan-backup/sultan-backup-$(date +%F-%H%M).tar.gz /etc/sultan /usr/local/etc/xray /usr/local/bin/hjgjh 2>/dev/null || true
 echo "Backup saved in /root/sultan-backup/"
 pause
 ;;
@@ -1708,7 +1708,7 @@ if [ "$CONFIRM" = "YES" ]; then
     rm -f /etc/systemd/system/sultan-ws.service
     rm -f /etc/systemd/system/udp-custom.service
     rm -rf /etc/sultan
-    rm -f /usr/local/bin/menu
+    rm -f /usr/local/bin/hjgjh
     systemctl daemon-reload
     echo "SULTAN removed successfully."
     exit
@@ -1741,6 +1741,6 @@ echo "You will be asked for your domain. Make sure DNS A record points to this V
 
 echo ""
 echo "==========================================="
-echo "Done. Type: menu"
+echo "Done. Type: hjgjh"
 echo "Port 443 is handled by HAProxy -> Nginx TLS."
 echo "==========================================="
