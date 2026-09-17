@@ -233,7 +233,7 @@ systemctl restart sultan-quota.timer 2>/dev/null
 /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &
 
 # ========================================================
-# 2. تعديل أداة menu (الترقيعات + فحص ملكية البائعين)
+# 2. تعديل أداة menu الأساسية وإضافة فحص الملكية
 # ========================================================
 python3 -c '
 import re
@@ -260,7 +260,7 @@ try:
     
     owner_script = r"""
 echo -e "\e[1;36m=================================================\e[0m"
-echo -e "\e[1;33m🔍 فحص ملكية الحسابات السريع (Admin / Sellers)\e[0m"
+echo -e "\e[1;33m🔍 ملكية الحسابات (Admin / Sellers)\e[0m"
 declare -A s_map
 for file in /etc/sultan/sellers/*_users.txt; do
     [ -e "$file" ] || continue
@@ -272,14 +272,14 @@ while IFS="|" read -r u pass exp quota logins; do
     [ -z "$u" ] && continue
     owner="${s_map[$u]:-Admin}"
     if [ "$owner" != "Admin" ]; then
-        echo -e "👤 User: \e[1;32m$u\e[0m -> By: \e[1;35m$owner\e[0m"
+        echo -e "👤 \e[1;32m$u\e[0m ⬅️  \e[1;35m$owner\e[0m"
         has_sellers=1
     fi
 done < /etc/sultan/users.db
 [ "$has_sellers" -eq 0 ] && echo -e "\e[1;32mجميع المستخدمين تابعين لك (Admin)\e[0m"
 echo -e "\e[1;36m=================================================\e[0m"
 """
-    if "فحص ملكية الحسابات السريع" not in data:
+    if "ملكية الحسابات" not in data:
         data = data.replace("#!/bin/bash\n", "#!/bin/bash\n" + owner_script)
         
     with open("/usr/local/bin/menu", "w") as f: f.write(data)
@@ -287,7 +287,7 @@ except Exception as e: pass
 '
 
 # ========================================================
-# 3. إعداد لوحة الآدمن (Admin Panel) مع نظام الحماية
+# 3. إعداد لوحة الآدمن (Admin Panel) مع نظام الحماية والتفاعل
 # ========================================================
 apt update -y; apt install python3 python3-flask jq bc -y >/dev/null 2>&1
 ufw allow 5000/tcp >/dev/null 2>&1
@@ -404,11 +404,13 @@ def force_sync():
 def add_user():
     data = request.json
     user, password, days, quota, logins = data.get('user'), data.get('password'), data.get('days', '30'), data.get('quota', '0'), data.get('logins', '1')
+    if not quota or str(quota).strip() == "": quota = '0'
     try: float(quota)
     except: return jsonify({"status": "error", "msg": "كمية الجيجات غير صالحة"}), 400
-    os.system(f"useradd -m -s /bin/bash {user}; echo '{user}:{password}' | chpasswd")
+    os.system(f"useradd -m -s /bin/bash {user}")
+    os.system(f"echo '{user}:{password}' | chpasswd")
     exp_date = "Unlimited"
-    if str(days) != "0":
+    if str(days) != "0" and str(days).strip() != "":
         exp_date = subprocess.getoutput(f"date -d '+{days} days' +%Y-%m-%d")
         os.system(f"chage -E {exp_date} {user}")
     else: os.system(f"chage -E -1 {user}")
@@ -423,7 +425,7 @@ def delete_user():
     user = request.json.get('user')
     seller_map = get_sellers_map()
     if user in seller_map:
-        return jsonify({"status": "error", "msg": f"لا يمكنك حذف هذا المستخدم، تابع للبائع: {seller_map[user]}"}), 403
+        return jsonify({"status": "error", "msg": f"هذا المستخدم محمي (تابع للبائع: {seller_map[user]})"}), 403
     os.system(f"pkill -KILL -u {user}; userdel -r {user}")
     users_list = [l.strip() for l in open(DB_FILE) if l.strip() and not l.startswith(f"{user}|")]
     with open(DB_FILE, "w") as f: f.write("\n".join(users_list) + "\n")
@@ -436,7 +438,7 @@ def edit_user():
     target_user, new_pass, new_days, new_quota, new_logins = data.get('user'), data.get('password'), data.get('days'), data.get('quota'), data.get('logins')
     seller_map = get_sellers_map()
     if target_user in seller_map:
-        return jsonify({"status": "error", "msg": f"لا يمكنك تعديل هذا المستخدم، تابع للبائع: {seller_map[target_user]}"}), 403
+        return jsonify({"status": "error", "msg": f"لا يمكنك تعديل هذا المستخدم (تابع للبائع: {seller_map[target_user]})"}), 403
     users_list = []
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
@@ -448,7 +450,8 @@ def edit_user():
                     if new_days and new_days.strip() != "":
                         try:
                             nd = int(new_days)
-                            if nd == 0: parts[2] = "Unlimited"; os.system(f"chage -E -1 {target_user}")
+                            if nd == 0:
+                                parts[2] = "Unlimited"; os.system(f"chage -E -1 {target_user}")
                             else:
                                 base = parts[2] if parts[2] not in ["Unlimited", "0", ""] else subprocess.getoutput("date +%Y-%m-%d")
                                 sign = "-" if nd < 0 else "+"
@@ -587,13 +590,14 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
         </div>
         {% endfor %}
     </div>
+
     <button class="floating-btn" onclick="showStatsModal()">📊 الإحصائيات</button>
-    
+
     <div id="infoModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>User Information</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div id="infoContent" class="info-box"></div><div class="modal-actions"><button class="btn btn-copy" onclick="copyInfoBox()">📋 Copy Text</button></div></div></div>
     <div id="statsModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Server Statistics</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="stats-list"><div class="stat-item"><span>CPU Usage:</span> <span id="st_cpu">{{ server_stats.cpu }}</span></div><div class="stat-item"><span>RAM Usage:</span> <span id="st_ram">{{ server_stats.ram }}</span></div><div class="stat-item"><span>Uptime:</span> <span id="st_uptime">{{ server_stats.uptime }}</span></div><div class="stat-item"><span>Total Traffic:</span> <span id="st_traffic">{{ total_traffic }}</span></div><div class="stat-item"><span>Total Online Users:</span> <span id="st_online">{{ total_online }}</span></div></div></div></div>
     
-    <div id="addModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Add New User (SSH)</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="input-group"><label>Username</label><input type="text" id="add_user" placeholder="e.g. client1"></div><div class="input-group"><label>Password</label><input type="text" id="add_pass" placeholder="Password"></div><div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Expire Days</label><input type="number" id="add_days" value="30"></div><div class="input-group" style="flex:1;"><label>Quota GB (0=Unlimit)</label><input type="number" step="any" id="add_quota" value="0"></div></div><div class="input-group"><label>Max Logins (0=Unlimit)</label><input type="number" id="add_logins" value="1"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveNewUser()">Save</button></div></div></div>
-    <div id="editModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Edit User</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="input-group"><label>Username</label><input type="text" id="edit_user" disabled></div><div class="input-group"><label>New Password</label><input type="text" id="edit_pass" placeholder="Leave empty to keep"></div><div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Add/Deduct Days</label><input type="number" id="edit_days" placeholder="e.g. 5 or -5"></div><div class="input-group" style="flex:1;"><label>Add/Deduct GB</label><input type="number" step="any" id="edit_quota" placeholder="e.g. 1.001 or -0.5"></div></div><div class="input-group"><label>Max Logins</label><input type="number" id="edit_logins" placeholder="Leave empty to keep"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveEditUser()">Save Changes</button></div></div></div>
+    <div id="addModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Add New User (SSH)</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="input-group"><label>Username</label><input type="text" id="add_user" placeholder="e.g. client1"></div><div class="input-group"><label>Password</label><input type="text" id="add_pass" placeholder="Password"></div><div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Expire Days</label><input type="number" id="add_days" value="30"></div><div class="input-group" style="flex:1;"><label>Quota GB (0=Unlimit)</label><input type="number" step="any" id="add_quota" value="0" placeholder="e.g. 1.5"></div></div><div class="input-group"><label>Max Logins (0=Unlimit)</label><input type="number" id="add_logins" value="1"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveNewUser(this)">Save</button></div></div></div>
+    <div id="editModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Edit User</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="input-group"><label>Username</label><input type="text" id="edit_user" disabled></div><div class="input-group"><label>New Password</label><input type="text" id="edit_pass" placeholder="Leave empty to keep"></div><div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Add/Deduct Days</label><input type="number" id="edit_days" placeholder="e.g. 5 or -5"></div><div class="input-group" style="flex:1;"><label>Add/Deduct GB</label><input type="number" step="any" id="edit_quota" placeholder="e.g. 1.001 or -0.5"></div></div><div class="input-group"><label>Max Logins</label><input type="number" id="edit_logins" placeholder="Leave empty to keep"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveEditUser(this)">Save Changes</button></div></div></div>
 
     <script>
         const DOMAIN = "{{ domain }}";
@@ -630,25 +634,27 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
         function showAddModal() { document.getElementById('addModal').style.display = 'flex'; }
         function showEditModal(user) { document.getElementById('edit_user').value = user; document.getElementById('edit_pass').value = ''; document.getElementById('edit_days').value = ''; document.getElementById('edit_quota').value = ''; document.getElementById('edit_logins').value = ''; document.getElementById('editModal').style.display = 'flex'; }
         function closeModals() { document.querySelectorAll('.modal').forEach(m => m.style.display = 'none'); activeUserInfo = {}; }
-        async function saveNewUser() {
+
+        async function saveNewUser(btn) {
             const user = document.getElementById('add_user').value, pass = document.getElementById('add_pass').value, days = document.getElementById('add_days').value, quota = document.getElementById('add_quota').value, logins = document.getElementById('add_logins').value;
             if(!user || !pass) return alert("الرجاء إدخال اسم المستخدم وكلمة المرور");
-            try { let res = await fetch('/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user, password: pass, days, quota, logins }) }); let r = await res.json(); if(r.status == "error") alert(r.msg); else window.location.reload(); } catch(e) { alert("خطأ في الاتصال"); }
+            btn.disabled = true; btn.innerText = "جاري الحفظ...";
+            try { let res = await fetch('/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال بالسيرفر"); btn.disabled = false; btn.innerText = "Save"; }
         }
         async function deleteUser(user) {
             if(!confirm("حذف " + user + "؟")) return;
-            let res = await fetch('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user }) });
-            let r = await res.json(); if(r.status == "error") alert(r.msg); else window.location.reload();
+            await fetch('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user }) }); window.location.reload();
         }
-        async function saveEditUser() {
+        async function saveEditUser(btn) {
             const user = document.getElementById('edit_user').value, pass = document.getElementById('edit_pass').value, days = document.getElementById('edit_days').value, quota = document.getElementById('edit_quota').value, logins = document.getElementById('edit_logins').value;
-            let res = await fetch('/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user, password: pass, days, quota, logins }) });
-            let r = await res.json(); if(r.status == "error") alert(r.msg); else window.location.reload();
+            btn.disabled = true; btn.innerText = "جاري الحفظ...";
+            try { let res = await fetch('/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save Changes"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال بالسيرفر"); btn.disabled = false; btn.innerText = "Save Changes"; }
         }
     </script>
 </body>
 </html>
 HTML_EOF
+
 cat << 'SYS_EOF' > /etc/systemd/system/sultan-panel.service
 [Unit]
 Description=Sultan VIP Web Panel
@@ -665,7 +671,7 @@ SYS_EOF
 systemctl daemon-reload; systemctl restart sultan-panel 2>/dev/null
 
 # ========================================================
-# 4. إعداد أدوات البائعين (sultan) ونظام الموزعين
+# 4. إعداد أدوات البائعين ونظام الموزعين الذكي (Resellers)
 # ========================================================
 cat << 'SULTAN_CMD' > /usr/local/bin/sultan
 #!/bin/bash
@@ -681,7 +687,6 @@ show_menu() {
     echo "3. إدارة البائعين (رابط/يوزر/باسورد)"
     echo "4. حذف بائع (Delete Seller)"
     echo "5. قائمة البائعين (List Sellers)"
-    echo "6. 🔍 فحص ملكية المستخدمين (Users Ownership)"
     echo "0. خروج (Exit)"
     echo "========================================"
     read -p "اختر (Select): " opt
@@ -691,7 +696,6 @@ show_menu() {
         3) manage_sellers ;;
         4) delete_seller ;;
         5) list_sellers ;;
-        6) check_ownership ;;
         0) exit 0 ;;
         *) echo "خيار غير صحيح!"; sleep 2; show_menu ;;
     esac
@@ -876,34 +880,6 @@ list_sellers() {
     read -p "اضغط Enter..."
     show_menu
 }
-check_ownership() {
-    clear
-    echo "--- 🔍 سجل ملكية المستخدمين ---"
-    declare -A s_map
-    for file in /etc/sultan/sellers/*_users.txt; do
-        [ -e "$file" ] || continue
-        s_name=$(basename "$file" _users.txt)
-        while read -r u; do [ -n "$u" ] && s_map["$u"]="$s_name"; done < "$file"
-    done
-    printf "%-20s | %-20s\n" "المستخدم (User)" "المالك (Owner)"
-    echo "------------------------------------------------"
-    has_users=0
-    while IFS='|' read -r u pass exp quota logins; do
-        [ -z "$u" ] && continue
-        owner="${s_map[$u]:-Admin (أنت)}"
-        if [ "$owner" == "Admin (أنت)" ]; then
-            echo -e "\e[1;32m%-20s\e[0m | \e[1;31m%-20s\e[0m" "$u" "$owner"
-        else
-            echo -e "\e[1;32m%-20s\e[0m | \e[1;35m%-20s\e[0m" "$u" "$owner"
-        fi
-        has_users=1
-    done < /etc/sultan/users.db
-    [ "$has_users" -eq 0 ] && echo "لا يوجد مستخدمين حالياً."
-    echo "------------------------------------------------"
-    read -p "اضغط Enter للعودة..."
-    show_menu
-}
-
 show_menu
 SULTAN_CMD
 chmod +x /usr/local/bin/sultan
@@ -1053,6 +1029,7 @@ def api_data(): return jsonify({"users": get_users_data()})
 @app.route('/add', methods=['POST'])
 def add_user():
     user, password, days, quota, logins = request.json.get('user'), request.json.get('password'), request.json.get('days','30'), request.json.get('quota','1'), request.json.get('logins','1')
+    if not quota or str(quota).strip() == "": quota = '1'
     try: req_quota = float(quota)
     except: return jsonify({"status": "error", "msg": "كمية الجيجات غير صالحة"}), 400
     if req_quota <= 0: return jsonify({"status": "error", "msg": "غير مسموح بإنشاء حسابات مفتوحة للموزعين!"}), 400
@@ -1060,7 +1037,7 @@ def add_user():
     if req_quota > (total_gb - used_gb): return jsonify({"status": "error", "msg": f"رصيد غير كافٍ. المتبقي: {total_gb - used_gb:.3f} GB"}), 400
     if os.path.exists(DB_FILE) and user in subprocess.getoutput(f"cat {DB_FILE}"): return jsonify({"status": "error", "msg": "هذا الاسم مستخدم!"}), 400
     os.system(f"useradd -m -s /bin/bash {user}; echo '{user}:{password}' | chpasswd")
-    exp_date = subprocess.getoutput(f"date -d '+{days} days' +%Y-%m-%d") if str(days) != "0" else "Unlimited"
+    exp_date = subprocess.getoutput(f"date -d '+{days} days' +%Y-%m-%d") if str(days) != "0" and str(days).strip() != "" else "Unlimited"
     if exp_date != "Unlimited": os.system(f"chage -E {exp_date} {user}")
     with open(DB_FILE, "a") as f: f.write(f"{user}|{password}|{exp_date}|{req_quota}GB|{logins}\n")
     with open(SELLER_USERS_FILE, "a") as f: f.write(f"{user}\n")
@@ -1136,6 +1113,10 @@ def edit_user():
         for u in users_list: f.write("|".join(u) + "\n")
     os.system("/usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &")
     return jsonify({"status": "success"})
+
+@app.errorhandler(404)
+def page_not_found(e):
+    return redirect('/')
 
 if __name__ == '__main__': app.run(host='0.0.0.0', port=SELLER_PORT)
 APP_EOF
@@ -1238,10 +1219,10 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
             <div class="input-group"><label>Password</label><input type="text" id="add_pass"></div>
             <div style="display:flex; gap:10px;">
                 <div class="input-group" style="flex:1;"><label>Days</label><input type="number" id="add_days" value="30"></div>
-                <div class="input-group" style="flex:1;"><label>Quota (GB)</label><input type="number" step="any" id="add_quota" value="1"></div>
+                <div class="input-group" style="flex:1;"><label>Quota (GB)</label><input type="number" step="any" id="add_quota" value="1" placeholder="e.g. 1.5"></div>
             </div>
             <div class="input-group"><label>Max Logins</label><input type="number" id="add_logins" value="1"></div>
-            <div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveNewUser()">Save</button></div>
+            <div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveNewUser(this)">Save</button></div>
         </div>
     </div>
 
@@ -1255,7 +1236,7 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
                 <div class="input-group" style="flex:1;"><label>Add/Deduct GB</label><input type="number" step="any" id="edit_quota" placeholder="e.g. 1.001 or -0.5"></div>
             </div>
             <div class="input-group"><label>Max Logins</label><input type="number" id="edit_logins" placeholder="Leave empty to keep"></div>
-            <div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveEditUser()">Save Changes</button></div>
+            <div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveEditUser(this)">Save Changes</button></div>
         </div>
     </div>
 
@@ -1280,25 +1261,37 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
             } catch(e) {}
         }, 3000);
 
-        function showInfoModal(u, p, e, q, l) { activeUserInfo = {user: u, pass: p}; document.getElementById('infoContent').innerText = "Username : "+u+"\nPassword : "+p+"\nExpire   : "+e+"\nQuota    : "+q+"\nMax Login: "+l; document.getElementById('infoModal').style.display = 'flex'; }
-        function copyInfoBox() { let el=document.createElement('textarea'); el.value=document.getElementById('infoContent').innerText; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ!"); }
-        function copyConfig(u, p) { let text="User : "+u+"\n\nPassword : "+p+"\n\nSNI : "+DOMAIN+"\n\nPayload :\n\nGET /cdn-cgi/trace HTTP/1.1[crlf]Host:  172.65.90.47[crlf][crlf]CF-RAY / HTTP/1.1[crlf]Host:  "+DOMAIN+"[crlf]Upgrade:  Websocket[crlf]Connection:  Keep-Alive[crlf]User-Agent:  [ua][crlf]Upgrade:  websocket[crlf][crlf]\n\nSNI social :\n www.twitter.com\n or \nwww.snapchat.com\n\nPayload social :\n\nGET / HTTP/1.1[crlf]Host: www.snapchat.com[crlf]Upgrade: websocket[crlf][crlf]\n\nOr\n\nGET / HTTP/1.1[crlf]Host: www.twitter.com[crlf]Upgrade: websocket[crlf][crlf]"; let el=document.createElement('textarea'); el.value=text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ!"); }
-        function showAddModal() { document.getElementById('addModal').style.display = 'flex'; }
-        function showEditModal(u) { document.getElementById('edit_user').value = u; document.getElementById('edit_pass').value = ''; document.getElementById('edit_days').value = ''; document.getElementById('edit_quota').value = ''; document.getElementById('edit_logins').value = ''; document.getElementById('editModal').style.display = 'flex'; }
-        function closeModals() { document.querySelectorAll('.modal').forEach(m => m.style.display = 'none'); }
+        function showInfoModal(user, pass, exp, quota, logins) { activeUserInfo = {user: user, pass: pass}; document.getElementById('infoContent').innerText = "Username : " + user + "\nPassword : " + pass + "\nExpire   : " + exp + "\nQuota    : " + quota + "\nUsed     : ...\nMax Login: " + logins + "\nOnline   : ..."; document.getElementById('infoModal').style.display = 'flex'; }
+        function copyInfoBox() { const el = document.createElement('textarea'); el.value = document.getElementById('infoContent').innerText; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ بنجاح!"); }
         
-        async function saveNewUser() {
-            let u=document.getElementById('add_user').value, p=document.getElementById('add_pass').value, d=document.getElementById('add_days').value, q=document.getElementById('add_quota').value, l=document.getElementById('add_logins').value;
-            if(!u||!p) return alert("الرجاء إدخال اسم المستخدم وكلمة المرور");
-            try { let res=await fetch('/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p,days:d,quota:q,logins:l})}); let r=await res.json(); if(r.status=="error") alert(r.msg); else window.location.reload(); } catch(e) { alert("خطأ في الاتصال"); }
+        function copyConfig(user, pass) {
+            const text = "User : " + user + "\n\nPassword : " + pass + "\n\nSNI : " + DOMAIN + "\n\nPayload :\n\nGET /cdn-cgi/trace HTTP/1.1[crlf]Host:  172.65.90.47[crlf][crlf]CF-RAY / HTTP/1.1[crlf]Host:  " + DOMAIN + "[crlf]Upgrade:  Websocket[crlf]Connection:  Keep-Alive[crlf]User-Agent:  [ua][crlf]Upgrade:  websocket[crlf][crlf]\n\nSNI social :\n www.twitter.com\n or \nwww.snapchat.com\n\nPayload social :\n\nGET / HTTP/1.1[crlf]Host: www.snapchat.com[crlf]Upgrade: websocket[crlf][crlf]\n\nOr\n\nGET / HTTP/1.1[crlf]Host: www.twitter.com[crlf]Upgrade: websocket[crlf][crlf]";
+            const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ بنجاح!");
         }
-        async function deleteUser(u) {
-            if(!confirm("حذف "+u+"؟")) return;
-            let res=await fetch('/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u})}); let r=await res.json(); if(r.status=="error") alert(r.msg); else window.location.reload();
+
+        function showAddModal() { document.getElementById('addModal').style.display = 'flex'; }
+        function showEditModal(user) { document.getElementById('edit_user').value = user; document.getElementById('edit_pass').value = ''; document.getElementById('edit_days').value = ''; document.getElementById('edit_quota').value = ''; document.getElementById('edit_logins').value = ''; document.getElementById('editModal').style.display = 'flex'; }
+        function closeModals() { document.querySelectorAll('.modal').forEach(m => m.style.display = 'none'); activeUserInfo = {}; }
+
+        async function saveNewUser(btn) {
+            const user = document.getElementById('add_user').value, pass = document.getElementById('add_pass').value, days = document.getElementById('add_days').value, quota = document.getElementById('add_quota').value, logins = document.getElementById('add_logins').value;
+            if(!user || !pass) return alert("الرجاء إدخال اسم المستخدم وكلمة المرور");
+            btn.disabled = true; btn.innerText = "جاري الحفظ...";
+            try { let res = await fetch('/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال بالسيرفر! تأكد من صحة البيانات."); btn.disabled = false; btn.innerText = "Save"; }
         }
-        async function saveEditUser() {
-            let u=document.getElementById('edit_user').value, p=document.getElementById('edit_pass').value, d=document.getElementById('edit_days').value, q=document.getElementById('edit_quota').value, l=document.getElementById('edit_logins').value;
-            let res=await fetch('/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p,days:d,quota:q,logins:l})}); let r=await res.json(); if(r.status=="error") alert(r.msg); else window.location.reload();
+        
+        async function deleteUser(user) {
+            if(!confirm("هل أنت متأكد من حذف " + user + "؟")) return;
+            let res = await fetch('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user }) });
+            let r = await res.json();
+            if(r.status == "error") alert(r.msg);
+            else window.location.reload();
+        }
+        
+        async function saveEditUser(btn) {
+            const user = document.getElementById('edit_user').value, pass = document.getElementById('edit_pass').value, days = document.getElementById('edit_days').value, quota = document.getElementById('edit_quota').value, logins = document.getElementById('edit_logins').value;
+            btn.disabled = true; btn.innerText = "جاري الحفظ...";
+            try { let res = await fetch('/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save Changes"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال بالسيرفر"); btn.disabled = false; btn.innerText = "Save Changes"; }
         }
     </script>
 </body>
