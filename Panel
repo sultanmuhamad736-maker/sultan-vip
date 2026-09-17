@@ -1281,4 +1281,3 @@ BANNER_EOF
 chmod +x /etc/profile.d/sultan-banner.sh
 
 echo "🎉 تم الانتهاء بنجاح! السيرفر الآن يعمل بكامل طاقته ومميزاته."
-EOF
