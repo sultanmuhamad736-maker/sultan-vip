@@ -1,0 +1,139 @@
+cat << 'EOF' > sultan_setup.sh
+#!/bin/bash
+
+echo "⏳ جاري إعداد الخوادم، وتحديث الكوتا، وتعديل القائمة..."
+
+# 1. تثبيت الحزم وإعداد BadVPN UDPGW
+apt update && apt install -y git cmake make gcc g++ screen ufw iproute2 tcpdump netcat-openbsd
+
+if ! command -v badvpn-udpgw >/dev/null 2>&1; then
+  rm -rf /usr/local/src/badvpn
+  git clone https://github.com/ambrop72/badvpn.git /usr/local/src/badvpn
+  mkdir -p /usr/local/src/badvpn/build
+  cd /usr/local/src/badvpn/build
+  cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
+  make install
+fi
+
+pkill -f badvpn-udpgw 2>/dev/null || true
+
+cat > /etc/systemd/system/udpgw.service << 'SYSTEMD'
+[Unit]
+Description=BadVPN UDP Gateway
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 0.0.0.0:7300 --max-clients 1000 --max-connections-for-client 50
+Restart=always
+RestartSec=2
+User=root
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD
+
+systemctl daemon-reload
+systemctl enable udpgw
+systemctl restart udpgw
+
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 7300/tcp
+ufw reload
+
+cat > /etc/sysctl.d/99-gaming.conf << 'SYSCTL'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=6
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+SYSCTL
+
+sysctl --system
+
+# 2. تعديل مشكلة الكوتا (650MB) إلى (1GB فعلية)
+SCRIPT_NAME="sultan-vip-v33-real-per-user-login-stats-fixed.sh"
+[ -f "$SCRIPT_NAME" ] && sed -i 's/TOTAL=$((TOTAL + DELTA))/DELTA=$(( DELTA * 65 \/ 100 )); TOTAL=$((TOTAL + DELTA))/g' "$SCRIPT_NAME"
+[ -f "/usr/local/sbin/sultan-quota-sync" ] && sed -i 's/TOTAL=$((TOTAL + DELTA))/DELTA=$(( DELTA * 65 \/ 100 )); TOTAL=$((TOTAL + DELTA))/g' /usr/local/sbin/sultan-quota-sync
+[ -f "/usr/local/sbin/sultan-xray-stats-sync" ] && sed -i 's/TOTAL=$((TOTAL + DELTA))/DELTA=$(( DELTA * 65 \/ 100 )); TOTAL=$((TOTAL + DELTA))/g' /usr/local/sbin/sultan-xray-stats-sync
+[ -f "/usr/local/bin/menu" ] && sed -i 's/TOTAL=$((TOTAL + DELTA))/DELTA=$(( DELTA * 65 \/ 100 )); TOTAL=$((TOTAL + DELTA))/g' /usr/local/bin/menu
+
+systemctl restart sultan-quota.timer 2>/dev/null
+systemctl restart sultan-xray-stats.timer 2>/dev/null
+echo "✅ تم حل مشكلة الكوتا بنجاح (1 جيجا فعلية)."
+
+# 3. تعديل القائمة menu بالبايثون
+python3 -c '
+import re
+
+try:
+    with open("/usr/local/bin/menu", "r") as f:
+        data = f.read()
+
+    new_pause = r"""pause(){
+  echo ""
+  [ "${SULTAN_NONINTERACTIVE:-0}" = "1" ] && return 0
+  while read -r -t 0.1 < /dev/tty; do :; done 2>/dev/null || true
+  while read -r -t 0.1; do :; done 2>/dev/null || true
+  if [ -r /dev/tty ]; then
+    IFS= read -r -p "👉 تمت العملية بنجاح! انسخ معلوماتك، ثم اضغط Enter للعودة..." x </dev/tty || true
+  elif [ -t 0 ]; then
+    IFS= read -r -p "👉 تمت العملية بنجاح! انسخ معلوماتك، ثم اضغط Enter للعودة..." x || true
+  else
+    return 0
+  fi
+  echo ""
+  return 0
+}"""
+    data = re.sub(r"pause\(\)\{.*?\n\}", new_pause, data, flags=re.DOTALL, count=1)
+
+    pattern_ssh = r"(create_ssh_user\(\)\{.*?)(box \"Login Limit\" \"\$LOGIN_TEXT\".*?\n\})"
+    match_ssh = re.search(pattern_ssh, data, re.DOTALL)
+    if match_ssh:
+        new_tail = """box "Login Limit" "$LOGIN_TEXT"
+  stats_small
+  DOMAIN_STR="$(get_domain)"
+  echo ""
+  echo "User : $USER"
+  echo "Password : $PASS"
+  echo ""
+  echo "SNI : $DOMAIN_STR"
+  echo ""
+  echo "Payload :"
+  echo "GET /cdn-cgi/trace HTTP/1.1[crlf]Host:  172.65.90.47[crlf][crlf]CF-RAY / HTTP/1.1[crlf]Host:  $DOMAIN_STR[crlf]Upgrade:  Websocket[crlf]Connection:  Keep-Alive[crlf]User-Agent:  [ua][crlf]Upgrade:  websocket[crlf][crlf]"
+  echo ""
+  echo "SNI social : www.twitter.com or www.snapchat.com"
+  echo ""
+  echo "Payload social :"
+  echo "GET / HTTP/1.1[crlf]Host: www.snapchat.com[crlf]Upgrade: websocket[crlf][crlf]"
+  echo "Or"
+  echo "GET / HTTP/1.1[crlf]Host: www.twitter.com[crlf]Upgrade: websocket[crlf][crlf]"
+  echo "==================================="
+  pause
+}"""
+        data = data[:match_ssh.start(2)] + new_tail + data[match_ssh.end(2):]
+
+    with open("/usr/local/bin/menu", "w") as f:
+        f.write(data)
+    print("✅ تم دمج جميع التعديلات بنجاح في القائمة الخاصة بك يا سلطان!")
+except Exception as e:
+    print("Error:", e)
+'
+
+echo "================================================"
+echo "✅ تمت جميع العمليات بنجاح!"
+systemctl status udpgw --no-pager | head -n 5
+ss -lntp | grep 7300
+EOF
+bash sultan_setup.sh && rm sultan_setup.sh
