@@ -1,13 +1,13 @@
 #!/bin/bash
 # ==========================================================
 # SULTAN VIP SYSTEM - THE LEGENDARY FINAL EDITION 👑
-# All Fixes + Admin Panel + Reseller System + SSH Banner + Full Protection
+# All Fixes + Admin Panel + Resellers + Banner + Suspend/Toggle
 # ==========================================================
 
 echo "🚀 جاري تثبيت وتحديث نظام SULTAN VIP الشامل..."
 
 # ========================================================
-# 1. إرجاع محرك الحساب (v33) لنسخته الأصلية النظيفة
+# 1. محرك الحساب (v33) الأصلي
 # ========================================================
 cat >/usr/local/sbin/sultan-quota-sync <<'QUOTA_SYNC'
 #!/bin/bash
@@ -233,7 +233,7 @@ systemctl restart sultan-quota.timer 2>/dev/null
 /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &
 
 # ========================================================
-# 2. تعديل أداة menu الأساسية وإضافة فحص الملكية
+# 2. أداة menu (الترقيعات + فحص الملكية)
 # ========================================================
 python3 -c '
 import re
@@ -260,7 +260,7 @@ try:
     
     owner_script = r"""
 echo -e "\e[1;36m=================================================\e[0m"
-echo -e "\e[1;33m🔍 ملكية الحسابات (Admin / Sellers)\e[0m"
+echo -e "\e[1;33m🔍 فحص ملكية الحسابات (Admin / Sellers)\e[0m"
 declare -A s_map
 for file in /etc/sultan/sellers/*_users.txt; do
     [ -e "$file" ] || continue
@@ -279,7 +279,7 @@ done < /etc/sultan/users.db
 [ "$has_sellers" -eq 0 ] && echo -e "\e[1;32mجميع المستخدمين تابعين لك (Admin)\e[0m"
 echo -e "\e[1;36m=================================================\e[0m"
 """
-    if "ملكية الحسابات" not in data:
+    if "فحص ملكية الحسابات" not in data:
         data = data.replace("#!/bin/bash\n", "#!/bin/bash\n" + owner_script)
         
     with open("/usr/local/bin/menu", "w") as f: f.write(data)
@@ -287,7 +287,7 @@ except Exception as e: pass
 '
 
 # ========================================================
-# 3. إعداد لوحة الآدمن (Admin Panel) مع نظام الحماية والتفاعل
+# 3. إعداد لوحة الآدمن (Admin Panel) + زر الإيقاف/التشغيل
 # ========================================================
 apt update -y; apt install python3 python3-flask jq bc -y >/dev/null 2>&1
 ufw allow 5000/tcp >/dev/null 2>&1
@@ -353,7 +353,16 @@ def get_sellers_map():
 def get_users_data():
     users = []
     usage_dict = {}
+    shells = {}
     seller_map = get_sellers_map()
+    
+    try:
+        with open("/etc/passwd", "r") as f:
+            for line in f:
+                p = line.strip().split(':')
+                if len(p) >= 7: shells[p[0]] = p[6]
+    except: pass
+
     if os.path.exists(USAGE_FILE):
         with open(USAGE_FILE, "r") as f:
             for line in f:
@@ -361,6 +370,7 @@ def get_users_data():
                 if len(parts) >= 2:
                     try: usage_dict[parts[0]] = int(parts[1])
                     except: pass
+
     total_traffic, total_online = 0, 0
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
@@ -376,12 +386,15 @@ def get_users_data():
                         if os.path.isdir(slot_dir): online_count = len([n for n in os.listdir(slot_dir) if os.path.isfile(os.path.join(slot_dir, n))])
                         total_online += online_count
                         creator = seller_map.get(user, "Admin")
+                        user_shell = shells.get(user, "/bin/bash")
+                        status = "Stopped" if user_shell == "/bin/false" else "Active"
+                        
                         users.append({
                             "user": user, "pass": parts[1], "exp": parts[2],
                             "quota": parts[3], "logins": parts[4],
                             "used_bytes": used_bytes, "used_formatted": format_bytes(used_bytes),
                             "percent": calc_percent(used_bytes, parts[3]), "online": online_count,
-                            "creator": creator
+                            "creator": creator, "status": status
                         })
     return users, format_bytes(total_traffic), total_online
 
@@ -407,6 +420,7 @@ def add_user():
     if not quota or str(quota).strip() == "": quota = '0'
     try: float(quota)
     except: return jsonify({"status": "error", "msg": "كمية الجيجات غير صالحة"}), 400
+    
     os.system(f"useradd -m -s /bin/bash {user}")
     os.system(f"echo '{user}:{password}' | chpasswd")
     exp_date = "Unlimited"
@@ -418,6 +432,20 @@ def add_user():
     login_text = "Unlimited" if str(logins) == "0" else str(logins)
     with open(DB_FILE, "a") as f: f.write(f"{user}|{password}|{exp_date}|{quota_text}|{login_text}\n")
     os.system("/usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &")
+    return jsonify({"status": "success"})
+
+@app.route('/toggle', methods=['POST'])
+def toggle_user():
+    user = request.json.get('user')
+    action = request.json.get('action')
+    seller_map = get_sellers_map()
+    if user in seller_map:
+        return jsonify({"status": "error", "msg": f"لا يمكنك التعديل، تابع للبائع: {seller_map[user]}"}), 403
+    if action == 'stop':
+        os.system(f"usermod -s /bin/false {user}")
+        os.system(f"pkill -KILL -u {user}")
+    else:
+        os.system(f"usermod -s /bin/bash {user}")
     return jsonify({"status": "success"})
 
 @app.route('/delete', methods=['POST'])
@@ -450,8 +478,7 @@ def edit_user():
                     if new_days and new_days.strip() != "":
                         try:
                             nd = int(new_days)
-                            if nd == 0:
-                                parts[2] = "Unlimited"; os.system(f"chage -E -1 {target_user}")
+                            if nd == 0: parts[2] = "Unlimited"; os.system(f"chage -E -1 {target_user}")
                             else:
                                 base = parts[2] if parts[2] not in ["Unlimited", "0", ""] else subprocess.getoutput("date +%Y-%m-%d")
                                 sign = "-" if nd < 0 else "+"
@@ -467,9 +494,7 @@ def edit_user():
                             parts[3] = "Unlimited" if new_q <= 0 else f"{new_q:.3f}GB"
                         except: pass
                     if new_logins and new_logins.strip() != "":
-                        try:
-                            nl = int(new_logins)
-                            parts[4] = "Unlimited" if nl == 0 else str(nl)
+                        try: nl = int(new_logins); parts[4] = "Unlimited" if nl == 0 else str(nl)
                         except: pass
                 if line.strip(): users_list.append(parts)
     with open(DB_FILE, "w") as f:
@@ -519,6 +544,8 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
         .btn-copy { border: 1px solid #34d399; color: #34d399; }
         .btn-edit { border: 1px solid #fbbf24; color: #fbbf24; }
         .btn-del { border: 1px solid #f87171; color: #f87171; }
+        .btn-stop { border: 1px solid #f87171; color: #f87171; }
+        .btn-start { border: 1px solid #34d399; color: #34d399; }
         .floating-btn { position: fixed; bottom: 20px; right: 20px; background-color: #fbbf24; color: #000; padding: 12px 20px; border: none; border-radius: 50px; font-weight: bold; font-size: 16px; cursor: pointer; box-shadow: 0 4px 6px rgba(0,0,0,0.3); z-index: 1000; display: flex; align-items: center; gap: 8px; }
         .floating-btn:hover { background-color: #f59e0b; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); align-items: center; justify-content: center; z-index: 2000;}
@@ -559,7 +586,7 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
             <div class="user-top">
                 <div class="user-title">
                     <span class="badge-ssh">SSH</span>
-                    <span class="username">{{ u.user }}</span>
+                    <span class="username" {% if u.status == 'Stopped' %}style="text-decoration: line-through; color: #f87171;"{% endif %}>{{ u.user }}</span>
                     {% if u.creator == 'Admin' %}
                         <span class="badge-admin">Admin</span>
                     {% else %}
@@ -578,6 +605,13 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
                 </span>
             </div>
             <div class="actions">
+                {% if u.creator == 'Admin' %}
+                    {% if u.status == 'Active' %}
+                        <button class="btn btn-stop" onclick="toggleUser('{{ u.user }}', 'stop')">⏸ إيقاف</button>
+                    {% else %}
+                        <button class="btn btn-start" onclick="toggleUser('{{ u.user }}', 'start')">▶ تشغيل</button>
+                    {% endif %}
+                {% endif %}
                 <button class="btn btn-info" onclick="showInfoModal('{{ u.user }}', '{{ u.pass }}', '{{ u.exp }}', '{{ u.quota }}', '{{ u.logins }}')">ℹ Info</button>
                 <button class="btn btn-copy" onclick="copyConfig('{{ u.user }}', '{{ u.pass }}')">📋 Copy</button>
                 {% if u.creator == 'Admin' %}
@@ -596,7 +630,7 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
     <div id="infoModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>User Information</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div id="infoContent" class="info-box"></div><div class="modal-actions"><button class="btn btn-copy" onclick="copyInfoBox()">📋 Copy Text</button></div></div></div>
     <div id="statsModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Server Statistics</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="stats-list"><div class="stat-item"><span>CPU Usage:</span> <span id="st_cpu">{{ server_stats.cpu }}</span></div><div class="stat-item"><span>RAM Usage:</span> <span id="st_ram">{{ server_stats.ram }}</span></div><div class="stat-item"><span>Uptime:</span> <span id="st_uptime">{{ server_stats.uptime }}</span></div><div class="stat-item"><span>Total Traffic:</span> <span id="st_traffic">{{ total_traffic }}</span></div><div class="stat-item"><span>Total Online Users:</span> <span id="st_online">{{ total_online }}</span></div></div></div></div>
     
-    <div id="addModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Add New User (SSH)</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="input-group"><label>Username</label><input type="text" id="add_user" placeholder="e.g. client1"></div><div class="input-group"><label>Password</label><input type="text" id="add_pass" placeholder="Password"></div><div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Expire Days</label><input type="number" id="add_days" value="30"></div><div class="input-group" style="flex:1;"><label>Quota GB (0=Unlimit)</label><input type="number" step="any" id="add_quota" value="0" placeholder="e.g. 1.5"></div></div><div class="input-group"><label>Max Logins (0=Unlimit)</label><input type="number" id="add_logins" value="1"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveNewUser(this)">Save</button></div></div></div>
+    <div id="addModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Add New User (SSH)</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="input-group"><label>Username</label><input type="text" id="add_user" placeholder="e.g. client1"></div><div class="input-group"><label>Password</label><input type="text" id="add_pass" placeholder="Password"></div><div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Expire Days</label><input type="number" id="add_days" value="30"></div><div class="input-group" style="flex:1;"><label>Quota GB (0=Unlimit)</label><input type="number" step="any" id="add_quota" value="0"></div></div><div class="input-group"><label>Max Logins (0=Unlimit)</label><input type="number" id="add_logins" value="1"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveNewUser(this)">Save</button></div></div></div>
     <div id="editModal" class="modal"><div class="modal-content"><div class="modal-header"><h3>Edit User</h3><span class="close-btn" onclick="closeModals()">&times;</span></div><div class="input-group"><label>Username</label><input type="text" id="edit_user" disabled></div><div class="input-group"><label>New Password</label><input type="text" id="edit_pass" placeholder="Leave empty to keep"></div><div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Add/Deduct Days</label><input type="number" id="edit_days" placeholder="e.g. 5 or -5"></div><div class="input-group" style="flex:1;"><label>Add/Deduct GB</label><input type="number" step="any" id="edit_quota" placeholder="e.g. 1.001 or -0.5"></div></div><div class="input-group"><label>Max Logins</label><input type="number" id="edit_logins" placeholder="Leave empty to keep"></div><div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveEditUser(this)">Save Changes</button></div></div></div>
 
     <script>
@@ -648,26 +682,17 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
         async function saveEditUser(btn) {
             const user = document.getElementById('edit_user').value, pass = document.getElementById('edit_pass').value, days = document.getElementById('edit_days').value, quota = document.getElementById('edit_quota').value, logins = document.getElementById('edit_logins').value;
             btn.disabled = true; btn.innerText = "جاري الحفظ...";
-            try { let res = await fetch('/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save Changes"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال بالسيرفر"); btn.disabled = false; btn.innerText = "Save Changes"; }
+            try { let res = await fetch('/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save Changes"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال"); btn.disabled = false; btn.innerText = "Save Changes"; }
+        }
+        async function toggleUser(user, action) {
+            let actName = action === 'stop' ? 'إيقاف' : 'تشغيل';
+            if(!confirm("هل أنت متأكد من " + actName + " المستخدم " + user + "؟")) return;
+            try { let res = await fetch('/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, action: action }) }); let r = await res.json(); if(r.status == "error") alert(r.msg); else window.location.reload(); } catch(e) { alert("خطأ في الاتصال"); }
         }
     </script>
 </body>
 </html>
 HTML_EOF
-
-cat << 'SYS_EOF' > /etc/systemd/system/sultan-panel.service
-[Unit]
-Description=Sultan VIP Web Panel
-After=network.target
-[Service]
-User=root
-WorkingDirectory=/opt/sultan-panel
-ExecStart=/usr/bin/python3 app.py
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-SYS_EOF
 systemctl daemon-reload; systemctl restart sultan-panel 2>/dev/null
 
 # ========================================================
@@ -982,6 +1007,14 @@ def get_seller_users_list():
 
 def get_users_data():
     users = []
+    shells = {}
+    try:
+        with open("/etc/passwd", "r") as f:
+            for line in f:
+                p = line.strip().split(':')
+                if len(p) >= 7: shells[p[0]] = p[6]
+    except: pass
+
     seller_users = get_seller_users_list()
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
@@ -989,11 +1022,14 @@ def get_users_data():
                 if line.strip():
                     parts = line.strip().split('|')
                     if len(parts) >= 5 and parts[0] in seller_users:
-                        used_bytes = get_user_consumed_gb(parts[0]) * (1024**3)
-                        online = len(os.listdir(f"/run/sultan-login-slots/{parts[0]}")) if os.path.isdir(f"/run/sultan-login-slots/{parts[0]}") else 0
+                        user = parts[0]
+                        used_bytes = get_user_consumed_gb(user) * (1024**3)
+                        online = len(os.listdir(f"/run/sultan-login-slots/{user}")) if os.path.isdir(f"/run/sultan-login-slots/{user}") else 0
+                        user_shell = shells.get(user, "/bin/bash")
+                        status = "Stopped" if user_shell == "/bin/false" else "Active"
                         users.append({
-                            "user": parts[0], "pass": parts[1], "exp": parts[2], "quota": parts[3], "logins": parts[4],
-                            "used_formatted": format_bytes(used_bytes), "percent": calc_percent(used_bytes, parts[3]), "online": online
+                            "user": user, "pass": parts[1], "exp": parts[2], "quota": parts[3], "logins": parts[4],
+                            "used_formatted": format_bytes(used_bytes), "percent": calc_percent(used_bytes, parts[3]), "online": online, "status": status
                         })
     return users
 
@@ -1029,7 +1065,7 @@ def api_data(): return jsonify({"users": get_users_data()})
 @app.route('/add', methods=['POST'])
 def add_user():
     user, password, days, quota, logins = request.json.get('user'), request.json.get('password'), request.json.get('days','30'), request.json.get('quota','1'), request.json.get('logins','1')
-    if not quota or str(quota).strip() == "": quota = '1'
+    if not quota or str(quota).strip() == "": quota = '0'
     try: req_quota = float(quota)
     except: return jsonify({"status": "error", "msg": "كمية الجيجات غير صالحة"}), 400
     if req_quota <= 0: return jsonify({"status": "error", "msg": "غير مسموح بإنشاء حسابات مفتوحة للموزعين!"}), 400
@@ -1044,6 +1080,19 @@ def add_user():
     save_seller_data(total_gb, used_gb + req_quota)
     reset_user_usage(user)
     os.system("/usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &")
+    return jsonify({"status": "success"})
+
+@app.route('/toggle', methods=['POST'])
+def toggle_user():
+    user = request.json.get('user')
+    action = request.json.get('action')
+    if user not in get_seller_users_list():
+        return jsonify({"status": "error", "msg": "لا تملك صلاحية"}), 403
+    if action == 'stop':
+        os.system(f"usermod -s /bin/false {user}")
+        os.system(f"pkill -KILL -u {user}")
+    else:
+        os.system(f"usermod -s /bin/bash {user}")
     return jsonify({"status": "success"})
 
 @app.route('/delete', methods=['POST'])
@@ -1155,6 +1204,8 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
         .btn-copy { border: 1px solid #34d399; color: #34d399; }
         .btn-edit { border: 1px solid #fbbf24; color: #fbbf24; }
         .btn-del { border: 1px solid #f87171; color: #f87171; }
+        .btn-stop { border: 1px solid #f87171; color: #f87171; }
+        .btn-start { border: 1px solid #34d399; color: #34d399; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); align-items: center; justify-content: center; z-index: 2000;}
         .modal-content { background: #1a1d2d; padding: 25px; border-radius: 12px; width: 90%; max-width: 400px; max-height: 90vh; overflow-y: auto;}
         .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
@@ -1171,9 +1222,7 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
     </style>
 </head>
 <body>
-    <div class="header">
-        <div class="logo">SELLER: {{ seller_name }}</div>
-    </div>
+    <div class="header"><div class="logo">SELLER: {{ seller_name }}</div></div>
     <div class="content">
         <div class="stats-header">
             <h2>My Users</h2>
@@ -1187,7 +1236,10 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
         {% for u in users %}
         <div class="user-card">
             <div class="user-top">
-                <div class="user-title"><span class="badge-ssh">SSH</span><span class="username">{{ u.user }}</span></div>
+                <div class="user-title">
+                    <span class="badge-ssh">SSH</span>
+                    <span class="username" {% if u.status == 'Stopped' %}style="text-decoration: line-through; color: #f87171;"{% endif %}>{{ u.user }}</span>
+                </div>
                 <div class="traffic-info">
                     <span id="text_usage_{{ u.user }}">{{ u.used_formatted }} / {{ u.quota }}</span><br>
                     <div class="progress-bg"><div class="progress-bar" id="bar_usage_{{ u.user }}" style="width: {{ u.percent }}%;"></div></div>
@@ -1200,6 +1252,11 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
                 </span>
             </div>
             <div class="actions">
+                {% if u.status == 'Active' %}
+                    <button class="btn btn-stop" onclick="toggleUser('{{ u.user }}', 'stop')">⏸ إيقاف</button>
+                {% else %}
+                    <button class="btn btn-start" onclick="toggleUser('{{ u.user }}', 'start')">▶ تشغيل</button>
+                {% endif %}
                 <button class="btn btn-info" onclick="showInfoModal('{{ u.user }}', '{{ u.pass }}', '{{ u.exp }}', '{{ u.quota }}', '{{ u.logins }}')">ℹ Info</button>
                 <button class="btn btn-copy" onclick="copyConfig('{{ u.user }}', '{{ u.pass }}')">📋 Copy</button>
                 <button class="btn btn-edit" onclick="showEditModal('{{ u.user }}')">✏ Edit</button>
@@ -1217,10 +1274,7 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
             <div class="modal-header"><h3>Add New User</h3><span class="close-btn" onclick="closeModals()">&times;</span></div>
             <div class="input-group"><label>Username</label><input type="text" id="add_user"></div>
             <div class="input-group"><label>Password</label><input type="text" id="add_pass"></div>
-            <div style="display:flex; gap:10px;">
-                <div class="input-group" style="flex:1;"><label>Days</label><input type="number" id="add_days" value="30"></div>
-                <div class="input-group" style="flex:1;"><label>Quota (GB)</label><input type="number" step="any" id="add_quota" value="1" placeholder="e.g. 1.5"></div>
-            </div>
+            <div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Days</label><input type="number" id="add_days" value="30"></div><div class="input-group" style="flex:1;"><label>Quota (GB)</label><input type="number" step="any" id="add_quota" value="1"></div></div>
             <div class="input-group"><label>Max Logins</label><input type="number" id="add_logins" value="1"></div>
             <div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveNewUser(this)">Save</button></div>
         </div>
@@ -1231,10 +1285,7 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
             <div class="modal-header"><h3>Edit User</h3><span class="close-btn" onclick="closeModals()">&times;</span></div>
             <div class="input-group"><label>Username</label><input type="text" id="edit_user" disabled></div>
             <div class="input-group"><label>New Password</label><input type="text" id="edit_pass" placeholder="Leave empty to keep"></div>
-            <div style="display:flex; gap:10px;">
-                <div class="input-group" style="flex:1;"><label>Add/Deduct Days</label><input type="number" id="edit_days" placeholder="e.g. 5 or -5"></div>
-                <div class="input-group" style="flex:1;"><label>Add/Deduct GB</label><input type="number" step="any" id="edit_quota" placeholder="e.g. 1.001 or -0.5"></div>
-            </div>
+            <div style="display:flex; gap:10px;"><div class="input-group" style="flex:1;"><label>Add/Deduct Days</label><input type="number" id="edit_days" placeholder="e.g. 5 or -5"></div><div class="input-group" style="flex:1;"><label>Add/Deduct GB</label><input type="number" step="any" id="edit_quota" placeholder="e.g. 1.001 or -0.5"></div></div>
             <div class="input-group"><label>Max Logins</label><input type="number" id="edit_logins" placeholder="Leave empty to keep"></div>
             <div class="modal-actions"><button class="btn-cancel" onclick="closeModals()">Cancel</button><button class="btn-save" onclick="saveEditUser(this)">Save Changes</button></div>
         </div>
@@ -1261,37 +1312,31 @@ cat << 'HTML_EOF' > /opt/sultan-sellers/seller_index_template.html
             } catch(e) {}
         }, 3000);
 
-        function showInfoModal(user, pass, exp, quota, logins) { activeUserInfo = {user: user, pass: pass}; document.getElementById('infoContent').innerText = "Username : " + user + "\nPassword : " + pass + "\nExpire   : " + exp + "\nQuota    : " + quota + "\nUsed     : ...\nMax Login: " + logins + "\nOnline   : ..."; document.getElementById('infoModal').style.display = 'flex'; }
-        function copyInfoBox() { const el = document.createElement('textarea'); el.value = document.getElementById('infoContent').innerText; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ بنجاح!"); }
-        
-        function copyConfig(user, pass) {
-            const text = "User : " + user + "\n\nPassword : " + pass + "\n\nSNI : " + DOMAIN + "\n\nPayload :\n\nGET /cdn-cgi/trace HTTP/1.1[crlf]Host:  172.65.90.47[crlf][crlf]CF-RAY / HTTP/1.1[crlf]Host:  " + DOMAIN + "[crlf]Upgrade:  Websocket[crlf]Connection:  Keep-Alive[crlf]User-Agent:  [ua][crlf]Upgrade:  websocket[crlf][crlf]\n\nSNI social :\n www.twitter.com\n or \nwww.snapchat.com\n\nPayload social :\n\nGET / HTTP/1.1[crlf]Host: www.snapchat.com[crlf]Upgrade: websocket[crlf][crlf]\n\nOr\n\nGET / HTTP/1.1[crlf]Host: www.twitter.com[crlf]Upgrade: websocket[crlf][crlf]";
-            const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ بنجاح!");
-        }
-
+        function showInfoModal(u, p, e, q, l) { activeUserInfo = {user: u, pass: p}; document.getElementById('infoContent').innerText = "Username : "+u+"\nPassword : "+p+"\nExpire   : "+e+"\nQuota    : "+q+"\nMax Login: "+l; document.getElementById('infoModal').style.display = 'flex'; }
+        function copyInfoBox() { let el=document.createElement('textarea'); el.value=document.getElementById('infoContent').innerText; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ!"); }
+        function copyConfig(u, p) { let text="User : "+u+"\n\nPassword : "+p+"\n\nSNI : "+DOMAIN+"\n\nPayload :\n\nGET /cdn-cgi/trace HTTP/1.1[crlf]Host:  172.65.90.47[crlf][crlf]CF-RAY / HTTP/1.1[crlf]Host:  "+DOMAIN+"[crlf]Upgrade:  Websocket[crlf]Connection:  Keep-Alive[crlf]User-Agent:  [ua][crlf]Upgrade:  websocket[crlf][crlf]\n\nSNI social :\n www.twitter.com\n or \nwww.snapchat.com\n\nPayload social :\n\nGET / HTTP/1.1[crlf]Host: www.snapchat.com[crlf]Upgrade: websocket[crlf][crlf]\n\nOr\n\nGET / HTTP/1.1[crlf]Host: www.twitter.com[crlf]Upgrade: websocket[crlf][crlf]"; let el=document.createElement('textarea'); el.value=text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); alert("تم النسخ!"); }
         function showAddModal() { document.getElementById('addModal').style.display = 'flex'; }
-        function showEditModal(user) { document.getElementById('edit_user').value = user; document.getElementById('edit_pass').value = ''; document.getElementById('edit_days').value = ''; document.getElementById('edit_quota').value = ''; document.getElementById('edit_logins').value = ''; document.getElementById('editModal').style.display = 'flex'; }
-        function closeModals() { document.querySelectorAll('.modal').forEach(m => m.style.display = 'none'); activeUserInfo = {}; }
-
+        function showEditModal(u) { document.getElementById('edit_user').value = u; document.getElementById('edit_pass').value = ''; document.getElementById('edit_days').value = ''; document.getElementById('edit_quota').value = ''; document.getElementById('edit_logins').value = ''; document.getElementById('editModal').style.display = 'flex'; }
+        function closeModals() { document.querySelectorAll('.modal').forEach(m => m.style.display = 'none'); }
         async function saveNewUser(btn) {
-            const user = document.getElementById('add_user').value, pass = document.getElementById('add_pass').value, days = document.getElementById('add_days').value, quota = document.getElementById('add_quota').value, logins = document.getElementById('add_logins').value;
-            if(!user || !pass) return alert("الرجاء إدخال اسم المستخدم وكلمة المرور");
+            let u=document.getElementById('add_user').value, p=document.getElementById('add_pass').value, d=document.getElementById('add_days').value, q=document.getElementById('add_quota').value, l=document.getElementById('add_logins').value;
+            if(!u||!p) return alert("الرجاء إدخال اسم المستخدم وكلمة المرور");
             btn.disabled = true; btn.innerText = "جاري الحفظ...";
-            try { let res = await fetch('/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال بالسيرفر! تأكد من صحة البيانات."); btn.disabled = false; btn.innerText = "Save"; }
+            try { let res=await fetch('/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p,days:d,quota:q,logins:l})}); let r=await res.json(); if(r.status=="error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال"); btn.disabled = false; btn.innerText = "Save"; }
         }
-        
-        async function deleteUser(user) {
-            if(!confirm("هل أنت متأكد من حذف " + user + "؟")) return;
-            let res = await fetch('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user }) });
-            let r = await res.json();
-            if(r.status == "error") alert(r.msg);
-            else window.location.reload();
+        async function deleteUser(u) {
+            if(!confirm("حذف "+u+"؟")) return;
+            let res=await fetch('/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u})}); let r=await res.json(); if(r.status=="error") alert(r.msg); else window.location.reload();
         }
-        
         async function saveEditUser(btn) {
-            const user = document.getElementById('edit_user').value, pass = document.getElementById('edit_pass').value, days = document.getElementById('edit_days').value, quota = document.getElementById('edit_quota').value, logins = document.getElementById('edit_logins').value;
+            let u=document.getElementById('edit_user').value, p=document.getElementById('edit_pass').value, d=document.getElementById('edit_days').value, q=document.getElementById('edit_quota').value, l=document.getElementById('edit_logins').value;
             btn.disabled = true; btn.innerText = "جاري الحفظ...";
-            try { let res = await fetch('/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, password: pass, days: days, quota: quota, logins: logins }) }); let r = await res.json(); if(r.status == "error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save Changes"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال بالسيرفر"); btn.disabled = false; btn.innerText = "Save Changes"; }
+            try { let res=await fetch('/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p,days:d,quota:q,logins:l})}); let r=await res.json(); if(r.status=="error") { alert(r.msg); btn.disabled = false; btn.innerText = "Save Changes"; } else window.location.reload(); } catch(e) { alert("خطأ في الاتصال"); btn.disabled = false; btn.innerText = "Save Changes"; }
+        }
+        async function toggleUser(user, action) {
+            let actName = action === 'stop' ? 'إيقاف' : 'تشغيل';
+            if(!confirm("هل أنت متأكد من " + actName + " المستخدم " + user + "؟")) return;
+            try { let res = await fetch('/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user: user, action: action }) }); let r = await res.json(); if(r.status == "error") alert(r.msg); else window.location.reload(); } catch(e) { alert("خطأ في الاتصال"); }
         }
     </script>
 </body>
