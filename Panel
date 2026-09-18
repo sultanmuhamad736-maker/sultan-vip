@@ -13,7 +13,7 @@ if [ -z "$custom_user" ] || [ -z "$custom_pass" ]; then
     exit 1
 fi
 
-echo "🚀 جاري تثبيت البانل بصلاحياتك المطلقة (بانر HTML متباعد + تحكم كامل + بدون تعليق)..."
+echo "🚀 جاري تثبيت البانل (دقة 1024 + فصل فوري 2s + واجهة 1s + تحكم كامل)..."
 
 # 1. إيقاف إشعارات أوبونتو المزعجة
 chmod -x /etc/update-motd.d/* 2>/dev/null || true
@@ -36,7 +36,7 @@ JSON
 chmod 600 /etc/sultan/admin.json
 
 # ========================================================
-# 3. محرك الحساب السريع (v33) + البانر المتباعد بـ HTML
+# 3. محرك الحساب السريع (v33) + دقة الاستهلاك 1024 + البانر المتباعد
 # ========================================================
 cat >/usr/local/sbin/sultan-quota-sync <<'QUOTA_SYNC'
 #!/bin/bash
@@ -121,14 +121,17 @@ nft_counter_bytes() {
   valid_number "$BYTES" || BYTES=0
   echo "$BYTES"
 }
+
+# دقة 1024 بالملي
 quota_to_bytes() {
   local Q="$1" N
   case "$Q" in
     ""|0|Unlimited|unlimited|UNLIMITED) echo 0 ;;
-    *GB|*gb|*Gb|*gB) N="${Q%??}"; valid_number "$N" && echo $(( $(to_int "$N") * 1024 * 1024 * 1024 )) || echo 0 ;;
-    *) valid_number "$Q" && echo $(( $(to_int "$Q") * 1024 * 1024 * 1024 )) || echo 0 ;;
+    *GB|*gb|*Gb|*gB) N="${Q%??}"; valid_number "$N" && echo $(( $(to_int "$N") * 1073741824 )) || echo 0 ;;
+    *) valid_number "$Q" && echo $(( $(to_int "$Q") * 1073741824 )) || echo 0 ;;
   esac
 }
+
 save_device_usage_one() {
   local U="$1" ID="$2" ADD="$3" TODAY MONTH OLD TOTAL DAYKEY DAYBYTES MONTHKEY MONTHBYTES TMP
   valid_number "$ADD" || ADD=0
@@ -232,6 +235,7 @@ while IFS='|' read -r U PASS EXP QUOTA MAXLOGIN; do
   TOTAL=$((TOTAL + DELTA))
   save_usage "$U" "$TOTAL" "$CUR_IN" "$CUR_OUT" "$CUR_NFT"
   attribute_device_usage "$U" "$DELTA"
+  
   LIMIT="$(quota_to_bytes "$QUOTA")"
   if [ "$LIMIT" -eq 0 ]; then
     WAS_QUOTA_STATE=0
@@ -264,7 +268,7 @@ while IFS='|' read -r U PASS EXP QUOTA MAXLOGIN; do
   fi
 
   # ==========================================
-  # البانر المصمم خصيصاً بتنسيق HTML (متباعد ومرتب)
+  # البانر المتباعد بالـ HTML (بدون رسالة البائع)
   # ==========================================
   USED_GB=$(awk -v b="$TOTAL" 'BEGIN { printf "%.2f", b / 1073741824 }')
   if [[ "$QUOTA" == "Unlimited" || "$QUOTA" == "0" || -z "$QUOTA" ]]; then
@@ -299,15 +303,14 @@ while IFS='|' read -r U PASS EXP QUOTA MAXLOGIN; do
 
   [ "$MAXLOGIN" == "Unlimited" ] || [ "$MAXLOGIN" == "0" ] || [ -z "$MAXLOGIN" ] && MAXLOGIN="Unlimited"
 
-  # أكواد HTML للتباعد والألوان والخط العريض لتطبيق DarkTunnel
-  cat << HTMLBANNER > "$BANNERS_DIR/$U.txt"
-<br><br>
-<font color="white">👤 <b>المستخدم :</b> $U</font><br><br><br>
-<font color="white">📅 <b>الانتهاء :</b> $EXP_STR</font><br><br><br>
-<font color="white">📊 <b>البيانات :</b> GB $QUOTA_GB / $USED_GB</font><br><br><br>
-<font color="white">💾 <b>المتبقي  :</b> GB $REM_GB</font><br><br><br>
-<font color="white">🔗 <b>الجلسات  :</b> $MAXLOGIN / $ACTIVE</font><br><br>
-HTMLBANNER
+  {
+    printf "\r\n\r\n"
+    printf "<font color=\"white\">👤 <b>المستخدم :</b> %s</font><br><br><br>\r\n" "$U"
+    printf "<font color=\"white\">📅 <b>الانتهاء :</b> %s</font><br><br><br>\r\n" "$EXP_STR"
+    printf "<font color=\"white\">📊 <b>البيانات :</b> GB %s / %s</font><br><br><br>\r\n" "$QUOTA_GB" "$USED_GB"
+    printf "<font color=\"white\">💾 <b>المتبقي  :</b> GB %s</font><br><br><br>\r\n" "$REM_GB"
+    printf "<font color=\"white\">🔗 <b>الجلسات  :</b> %s / %s</font><br><br>\r\n" "$MAXLOGIN" "$ACTIVE"
+  } > "$BANNERS_DIR/$U.txt"
 
   echo "Match User $U" >> "$NEW_CONF"
   echo "    Banner $BANNERS_DIR/$U.txt" >> "$NEW_CONF"
@@ -324,15 +327,44 @@ if ! cmp -s "$NEW_CONF" "$SSHD_CONF" 2>/dev/null; then
 else
     rm -f "$NEW_CONF"
 fi
-
 QUOTA_SYNC
+
 chmod 700 /usr/local/sbin/sultan-quota-sync
 chown root:root /usr/local/sbin/sultan-quota-sync
+
+# تسريع الفحص ليصبح كل ثانيتين (2s) لضمان الفصل الفوري
+cat >/etc/systemd/system/sultan-quota.timer <<'EOF'
+[Unit]
+Description=SULTAN quota checker
+
+[Timer]
+OnBootSec=2s
+OnUnitActiveSec=2s
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+cat >/etc/systemd/system/sultan-quota.service <<'EOF'
+[Unit]
+Description=SULTAN per-user SSH bandwidth quota
+After=network-online.target systemd-logind.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sultan-quota-sync
+EOF
+
+systemctl daemon-reload
+systemctl enable sultan-quota.timer >/dev/null 2>&1 || true
 systemctl restart sultan-quota.timer 2>/dev/null
 /usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &
 
+
 # ========================================================
-# 4. تطبيق Python (الآدمن له كافة الصلاحيات على الكل)
+# 4. تطبيق Python (الآدمن له كافة الصلاحيات على الكل) + دقة 1024
 # ========================================================
 cat << 'APP_EOF' > /opt/sultan-panel/app.py
 import os, subprocess, json
@@ -353,6 +385,7 @@ def get_admin_creds():
             except: pass
     return {"username": "sultan", "password": "1100"}
 
+# دقة 1024 للميجا والجيجا
 def format_bytes(b):
     try: b = float(b)
     except: return "0.00 B"
@@ -366,7 +399,7 @@ def calc_percent(used, quota_str):
     if quota_str in ["Unlimited", "0", ""]: return 0
     try:
         gb = float(quota_str.upper().replace("GB", "").strip())
-        total_bytes = gb * 1024 * 1024 * 1024
+        total_bytes = gb * 1073741824
         if total_bytes == 0: return 0
         p = (used / total_bytes) * 100
         return min(p, 100)
@@ -446,6 +479,30 @@ def get_users_data():
                         })
     return users, format_bytes(total_traffic), total_online
 
+def reset_user_usage(username):
+    uid = subprocess.getoutput(f"id -u {username}").strip()
+    if not uid.isdigit(): return
+    cur_in = subprocess.getoutput(f"systemctl show 'user-{uid}.slice' -p IPIngressBytes --value 2>/dev/null").strip()
+    cur_out = subprocess.getoutput(f"systemctl show 'user-{uid}.slice' -p IPEgressBytes --value 2>/dev/null").strip()
+    cur_nft = subprocess.getoutput(f"nft -j list counter inet sultan_quota u_{uid}_out 2>/dev/null | jq -r '.. | objects | select(has(\"bytes\")) | .bytes' 2>/dev/null | head -n1").strip()
+    
+    if not cur_in.isdigit(): cur_in = "0"
+    if not cur_out.isdigit(): cur_out = "0"
+    if not cur_nft.isdigit(): cur_nft = "0"
+    
+    lines = []
+    if os.path.exists(USAGE_FILE):
+        with open(USAGE_FILE, "r") as f:
+            lines = [l for l in f if not l.startswith(f"{username}|")]
+    lines.append(f"{username}|0|{cur_in}|{cur_out}|{cur_nft}\n")
+    with open(USAGE_FILE, "w") as f: f.writelines(lines)
+
+def delete_user_records(username):
+    for db in [USAGE_FILE, "/etc/sultan/limits/blocked.db", "/etc/sultan/limits/quota-locked.db"]:
+        if os.path.exists(db):
+            with open(db, "r") as f: clean_lines = [l for l in f if not l.startswith(f"{username}|") and l.strip() != username]
+            with open(db, "w") as f: f.writelines(clean_lines)
+
 @app.before_request
 def require_login():
     if request.endpoint not in ['login', 'static'] and not session.get('logged_in'):
@@ -513,10 +570,10 @@ def add_user():
 
     with open(DB_FILE, "a") as f: f.write(f"{user}|{password}|{exp_date}|{quota_text}|{login_text}\n")
     
+    reset_user_usage(user)
     os.system("/usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &")
     return jsonify({"status": "success"})
 
-# لا يوجد أي قيود على الآدمن: يمديك تحذف وتعدل وتوقف أي يوزر في السيرفر!
 @app.route('/delete', methods=['POST'])
 def delete_user():
     if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
@@ -532,6 +589,7 @@ def delete_user():
     with open(DB_FILE, "w") as f:
         for u in users_list: f.write(f"{u}\n")
             
+    delete_user_records(user)
     os.system("/usr/local/sbin/sultan-quota-sync >/dev/null 2>&1 &")
     return jsonify({"status": "success"})
 
@@ -634,7 +692,7 @@ cat << 'LOGIN_HTML' > /opt/sultan-panel/templates/login.html
 LOGIN_HTML
 
 # ========================================================
-# 6. الواجهة الرئيسية للآدمن (حفظ حقوق البائع شكلياً + كل الصلاحيات للآدمن)
+# 6. الواجهة الرئيسية
 # ========================================================
 cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
 <!DOCTYPE html>
@@ -664,7 +722,6 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
         .user-top { display: flex; justify-content: space-between; margin-bottom: 15px; }
         .user-title { display: flex; gap: 15px; align-items: center; }
         .badge-ssh { background-color: #334155; padding: 5px 12px; border-radius: 20px; font-size: 12px; }
-        .badge-admin { background-color: #f87171; padding: 3px 8px; border-radius: 12px; font-size: 10px; font-weight: bold; }
         .badge-creator { background-color: #8b5cf6; padding: 3px 8px; border-radius: 12px; font-size: 10px; font-weight: bold; }
         .username { font-size: 18px; font-weight: bold; }
         .traffic-info { text-align: right; font-size: 12px; color: #cbd5e1; width: 40%;}
@@ -723,7 +780,7 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
             {% for u in users %}
             <div class="user-card" id="card_{{ u.user }}">
                 <div class="user-top">
-                    <!-- اسم البائع مكتوب بجوار اليوزر لحفظ الحقوق شكلياً فقط -->
+                    <!-- إظهار اسم البائع شكلياً فقط -->
                     <div class="user-title">
                         <span class="badge-ssh">SSH</span>
                         <span class="username" id="uname_{{ u.user }}" {% if u.status == 'Stopped' %}style="text-decoration: line-through; color: #f87171;"{% endif %}>{{ u.user }}</span>
@@ -809,7 +866,8 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
                 });
             } catch(e) {}
         }
-        setInterval(updateDataSilently, 3000);
+        // تحديث الواجهة كل ثانية (1000ms)
+        setInterval(updateDataSilently, 1000);
 
         async function forceSync(btn) { btn.innerText = "جاري المسح..."; await fetch('/force_sync', { method: 'POST' }); btn.innerText = "🔄 مسح المتجاوزين"; }
         function showInfoModal(user, pass, exp, quota, logins) { activeUserInfo = { user, pass }; document.getElementById('infoContent').innerText = "Username : " + user + "\nPassword : " + pass + "\nExpire   : " + exp + "\nQuota    : " + quota + "\nUsed     : ...\nMax Login: " + logins + "\nOnline   : ..."; document.getElementById('infoModal').style.display = 'flex'; }
@@ -820,7 +878,7 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
             const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el);
         }
 
-        // دالة NPV الدقيقة والمضبوطة
+        // دالة NPV الدقيقة والمضبوطة (Host + Payload + Default TLS)
         function copyNpv(user, pass) {
             const config = {
                 "sshConfigType": "SSH-TLS-Payload",
@@ -915,7 +973,7 @@ SYS_EOF
 systemctl daemon-reload
 systemctl restart sultan-panel
 
-echo "✅ تم التثبيت الأسطوري! البانر HTML متباعد وفخم، NPV مضبوط، والآدمن يتحكم بكل السيرفر 👑"
+echo "✅ تم التثبيت الأسطوري! البانر متباعد، NPV مضبوط، والآدمن يتحكم بكل السيرفر 👑"
 EOF
 
 bash sultan_the_boss.sh
