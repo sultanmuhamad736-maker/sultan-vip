@@ -1,12 +1,13 @@
-cat << 'EOF' > sultan_the_boss.sh
+cat << 'EOF'> sultan_the_boss.sh
 #!/bin/bash
 
 clear
 echo "========================================"
 echo "    👑 إعداد بيانات دخول الآدمن للبانل 👑"
 echo "========================================"
-read -p "أدخل يوزر الآدمن (Username): " custom_user
-read -p "أدخل باسورد الآدمن (Password): " custom_pass
+# هنا ضفنا إجبار القراءة من الكيبورد فقط عشان ما يضغط إنتر من نفسه
+read -p "أدخل يوزر الآدمن (Username): " custom_user </dev/tty
+read -p "أدخل باسورد الآدمن (Password): " custom_pass </dev/tty
 
 if [ -z "$custom_user" ] || [ -z "$custom_pass" ]; then
     echo "❌ يجب إدخال اليوزر والباسورد!"
@@ -692,7 +693,7 @@ cat << 'LOGIN_HTML' > /opt/sultan-panel/templates/login.html
 LOGIN_HTML
 
 # ========================================================
-# 6. الواجهة الرئيسية
+# 6. الواجهة الرئيسية للآدمن (حفظ حقوق البائع شكلياً + كل الصلاحيات للآدمن)
 # ========================================================
 cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
 <!DOCTYPE html>
@@ -722,6 +723,7 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
         .user-top { display: flex; justify-content: space-between; margin-bottom: 15px; }
         .user-title { display: flex; gap: 15px; align-items: center; }
         .badge-ssh { background-color: #334155; padding: 5px 12px; border-radius: 20px; font-size: 12px; }
+        .badge-admin { background-color: #f87171; padding: 3px 8px; border-radius: 12px; font-size: 10px; font-weight: bold; }
         .badge-creator { background-color: #8b5cf6; padding: 3px 8px; border-radius: 12px; font-size: 10px; font-weight: bold; }
         .username { font-size: 18px; font-weight: bold; }
         .traffic-info { text-align: right; font-size: 12px; color: #cbd5e1; width: 40%;}
@@ -866,7 +868,8 @@ cat << 'HTML_EOF' > /opt/sultan-panel/templates/index.html
                 });
             } catch(e) {}
         }
-        // تحديث الواجهة كل ثانية (1000ms)
+        
+        // واجهة البانل تتحدث كل ثانية واحدة بدون إزعاج 
         setInterval(updateDataSilently, 1000);
 
         async function forceSync(btn) { btn.innerText = "جاري المسح..."; await fetch('/force_sync', { method: 'POST' }); btn.innerText = "🔄 مسح المتجاوزين"; }
@@ -973,7 +976,7 @@ SYS_EOF
 systemctl daemon-reload
 systemctl restart sultan-panel
 
-echo "✅ تم التثبيت الأسطوري! البانر متباعد، NPV مضبوط، والآدمن يتحكم بكل السيرفر 👑"
+echo "✅ تم التثبيت الأسطوري! دقة 1024 مفعلة ومقاساتك مضبوطة بالملي 👑"
 EOF
 
 bash sultan_the_boss.sh
