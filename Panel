@@ -12,9 +12,6 @@ if [ -z "$custom_user" ] || [ -z "$custom_pass" ]; then
     echo "❌ يجب إدخال اليوزر والباسورد!"
     exit 1
 fi
-
-
-
 cat << 'EOF' > Panel.sh
 #!/bin/bash
 # ==========================================================
