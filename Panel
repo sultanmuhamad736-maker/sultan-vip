@@ -3,7 +3,8 @@ cat << 'EOF' > Panel.sh
 # ==========================================================
 # SULTAN VIP SYSTEM - THE LEGENDARY FINAL EDITION 👑
 # No Annoying Alerts + Anti-Double Click + 1024 Math + Fixed Seller Login
-# NEW: Seller Expiry + Traffic Display (Rem/Used) + Auto-Refund Quota
+# NEW: Seller Expiry + Traffic Display (Rem/Used) + Auto-Refund Quota + 100% Zero-Start Fix
+# SUPER FIX: High Precision Decimal Quota (e.g. 0.001GB) Enforcement
 # ==========================================================
 
 clear
@@ -28,7 +29,7 @@ sed -i '/sultan-banner/d' /etc/bash.bashrc 2>/dev/null || true
 
 export DEBIAN_FRONTEND=noninteractive
 apt update -y
-apt install python3 python3-flask jq bc -y >/dev/null 2>&1
+apt install python3 python3-flask jq bc awk -y >/dev/null 2>&1
 ufw allow 5000/tcp >/dev/null 2>&1
 
 mkdir -p /opt/sultan-panel/templates
@@ -127,14 +128,19 @@ nft_counter_bytes() {
   valid_number "$BYTES" || BYTES=0
   echo "$BYTES"
 }
+
+# 👑 الحل الجذري للأرقام العشرية: استخدام awk للحساب بدلاً من Bash
 quota_to_bytes() {
   local Q="$1" N
   case "$Q" in
     ""|0|Unlimited|unlimited|UNLIMITED) echo 0 ;;
-    *GB|*gb|*Gb|*gB) N="${Q%??}"; valid_number "$N" && echo $(( $(to_int "$N") * 1073741824 )) || echo 0 ;;
-    *) valid_number "$Q" && echo $(( $(to_int "$Q") * 1073741824 )) || echo 0 ;;
+    *)
+      N=$(echo "$Q" | sed 's/GB//gi' | tr -d ' ')
+      awk -v q="$N" 'BEGIN { printf "%.0f", q * 1073741824 }' 2>/dev/null || echo 0
+      ;;
   esac
 }
+
 save_device_usage_one() {
   local U="$1" ID="$2" ADD="$3" TODAY MONTH OLD TOTAL DAYKEY DAYBYTES MONTHKEY MONTHBYTES TMP
   valid_number "$ADD" || ADD=0
@@ -219,6 +225,13 @@ while IFS='|' read -r U PASS EXP QUOTA MAXLOGIN; do
   CUR_OUT="${COUNTERS##*|}"
   CUR_NFT="$(nft_counter_bytes "$UIDN")"
   OLD="$(awk -F'|' -v u="$U" '$1==u{print;exit}' "$USAGE")"
+  
+  # 👑 الحل الجذري لتصفير المستخدمين الجدد
+  if [ -z "$OLD" ]; then
+    save_usage "$U" "0" "$CUR_IN" "$CUR_OUT" "$CUR_NFT"
+    continue
+  fi
+
   TOTAL="$(printf '%s\n' "$OLD" | awk -F'|' '{print $2}')"
   LAST_IN="$(printf '%s\n' "$OLD" | awk -F'|' '{print $3}')"
   LAST_OUT="$(printf '%s\n' "$OLD" | awk -F'|' '{print $4}')"
@@ -479,12 +492,13 @@ def get_users_data():
 def reset_user_usage(username):
     uid = subprocess.getoutput(f"id -u {username}").strip()
     if uid.isdigit():
-        os.system(f"nft delete counter inet sultan_quota u_{uid}_out 2>/dev/null")
+        os.system(f"systemctl set-property --runtime user-{uid}.slice IPAccounting=no 2>/dev/null")
         os.system(f"systemctl stop user-{uid}.slice 2>/dev/null")
+        os.system(f"systemctl reset-failed user-{uid}.slice 2>/dev/null")
+        os.system(f"nft delete counter inet sultan_quota u_{uid}_out 2>/dev/null")
     lines = []
     if os.path.exists(USAGE_FILE):
         with open(USAGE_FILE, "r") as f: lines = [l for l in f if not l.startswith(f"{username}|")]
-    lines.append(f"{username}|0|0|0|0\n")
     with open(USAGE_FILE, "w") as f: f.writelines(lines)
 
 def delete_user_records(username):
@@ -580,8 +594,10 @@ def delete_user():
     uid = subprocess.getoutput(f"id -u {user}").strip()
     os.system(f"pkill -KILL -u {user}")
     if uid.isdigit():
+        os.system(f"systemctl set-property --runtime user-{uid}.slice IPAccounting=no 2>/dev/null")
         os.system(f"nft delete counter inet sultan_quota u_{uid}_out 2>/dev/null")
         os.system(f"systemctl stop user-{uid}.slice 2>/dev/null")
+        os.system(f"systemctl reset-failed user-{uid}.slice 2>/dev/null")
     os.system(f"userdel -r {user}")
     
     users_list = []
@@ -1288,12 +1304,13 @@ def get_users_data():
 def reset_user_usage(username):
     uid = subprocess.getoutput(f"id -u {username}").strip()
     if uid.isdigit():
-        os.system(f"nft delete counter inet sultan_quota u_{uid}_out 2>/dev/null")
+        os.system(f"systemctl set-property --runtime user-{uid}.slice IPAccounting=no 2>/dev/null")
         os.system(f"systemctl stop user-{uid}.slice 2>/dev/null")
+        os.system(f"systemctl reset-failed user-{uid}.slice 2>/dev/null")
+        os.system(f"nft delete counter inet sultan_quota u_{uid}_out 2>/dev/null")
     lines = []
     if os.path.exists(USAGE_FILE):
         with open(USAGE_FILE, "r") as f: lines = [l for l in f if not l.startswith(f"{username}|")]
-    lines.append(f"{username}|0|0|0|0\n")
     with open(USAGE_FILE, "w") as f: f.writelines(lines)
 
 def delete_user_records(username):
@@ -1350,8 +1367,10 @@ def delete_user():
     uid = subprocess.getoutput(f"id -u {user}").strip()
     os.system(f"pkill -KILL -u {user}")
     if uid.isdigit():
+        os.system(f"systemctl set-property --runtime user-{uid}.slice IPAccounting=no 2>/dev/null")
         os.system(f"nft delete counter inet sultan_quota u_{uid}_out 2>/dev/null")
         os.system(f"systemctl stop user-{uid}.slice 2>/dev/null")
+        os.system(f"systemctl reset-failed user-{uid}.slice 2>/dev/null")
     os.system(f"userdel -r {user}")
     
     # ارجاع الجيجات غير المستهلكة (Refund)
@@ -1721,7 +1740,7 @@ fi
 BANNER_EOF
 chmod +x /etc/profile.d/sultan-banner.sh
 
-echo "🎉 تم الانتهاء بنجاح! السيرفر الآن يعمل بالنسخة الذهبية (مع صلاحية البائع وإرجاع الرصيد)."
+echo "🎉 تم الانتهاء بنجاح! السيرفر الآن يعمل بالنسخة الذهبية الخالية من أخطاء الذاكرة المؤقتة، مع دقة 100% للكسور العشرية."
 EOF
 
 bash Panel.sh
