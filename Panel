@@ -1,3 +1,22 @@
+cat << 'EOF' > Panel.sh
+#!/bin/bash
+# ==========================================================
+# SULTAN VIP SYSTEM - THE LEGENDARY FINAL EDITION 👑
+# No Annoying Alerts + Anti-Double Click + 1024 Math + Fixed Seller Login
+# NEW: Seller Expiry + Traffic Display (Rem/Used) + Auto-Refund Quota
+# ==========================================================
+
+clear
+echo "========================================"
+echo "    👑 إعداد بيانات دخول الآدمن للبانل 👑"
+echo "========================================"
+read -p "أدخل يوزر الآدمن (Username): " custom_user
+read -p "أدخل باسورد الآدمن (Password): " custom_pass
+
+if [ -z "$custom_user" ] || [ -z "$custom_pass" ]; then
+    echo "❌ يجب إدخال اليوزر والباسورد!"
+    exit 1
+fi
 
 echo "🚀 جاري تثبيت وتحديث نظام SULTAN VIP الشامل..."
 
