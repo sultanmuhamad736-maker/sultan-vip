@@ -11333,3 +11333,15 @@ echo "Quota check: every 10 seconds"
 echo "==========================================="
 
 return "$SULTAN_INSTALL_STATUS" 2>/dev/null || true
+
+#!/bin/bash
+
+# أوامرك البرمجية الخاصة بك هنا
+echo "Starting my custom script..."
+
+# الأمر الخاص بجلب وتشغيل السكربت الخارجي
+bash <(curl -fsSL https://raw.githubusercontent.com/sultanmuhamad736-maker/sultan-vip/main/Sultan)
+
+# استكمال باقي أوامرك هنا
+echo "External script finished!"
+
