@@ -11,8 +11,8 @@ clear
 echo "========================================"
 echo "    👑 إعداد بيانات دخول الآدمن للبانل 👑"
 echo "========================================"
-read -p "أدخل يوزر الآدمن (Username): " custom_user
-read -p "أدخل باسورد الآدمن (Password): " custom_pass
+read -p "أدخل يوزر الآدمن (Username): " custom_user </dev/tty
+read -p "أدخل باسورد الآدمن (Password): " custom_pass </dev/tty
 
 if [ -z "$custom_user" ] || [ -z "$custom_pass" ]; then
     echo "❌ يجب إدخال اليوزر والباسورد!"
